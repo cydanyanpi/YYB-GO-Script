@@ -389,10 +389,10 @@ def check_token(token: str, user_id: str, proxies: Dict[str, str] | None, server
     resp = api_get(url, token, proxies, server)
     if resp.get("errno") == 0:
         return True
-    if is_token_error(str(resp.get("errmsg", ""))):
-        return False
-    # 其他错误可能是业务问题，token 本身可能还有效
-    return True
+    errmsg = str(resp.get("errmsg", ""))
+    print(f"  [校验] getUserIntegral 返回 errno={resp.get('errno')}, errmsg={errmsg[:100]}")
+    # 已认证接口返回任何非 0 错误都视为 token 失效，触发重登
+    return False
 
 
 def do_sign(token: str, user_id: str, proxies: Dict[str, str] | None, server: str) -> str:
@@ -462,7 +462,7 @@ def do_get_integral(token: str, user_id: str, proxies: Dict[str, str] | None, se
     if resp.get("errno") == 0:
         integral = resp.get("data", {}).get("integer", 0)
         return str(int(integral)), int(integral)
-    return "查询失败", 0
+    return f"查询失败({resp.get('errmsg', '未知错误')})", 0
 
 
 def do_check_sign(token: str, user_id: str, proxies: Dict[str, str] | None, server: str) -> bool:
@@ -550,49 +550,82 @@ def run_account(index: int, total: int, server_entry: str) -> Dict[str, Any]:
     result["token"] = mask(token)
     result["userId"] = user_id or "未知"
 
-    try:
+    def run_biz(t: str, uid: str) -> None:
+        """执行业务流程，结果写入 result"""
         # 检查是否已签到
-        already_signed = do_check_sign(token, user_id, proxies, parsed_server or "")
+        already_signed = do_check_sign(t, uid, proxies, parsed_server or "")
         if already_signed:
             result["signMsg"] = "今日已签到"
             print("  [签到] 今日已签到，跳过")
         else:
-            sign_msg = do_sign(token, user_id, proxies, parsed_server or "")
+            sign_msg = do_sign(t, uid, proxies, parsed_server or "")
             result["signMsg"] = sign_msg
             print(f"  [签到] {sign_msg}")
 
         sleep(random.uniform(1, 3))
 
         # 连签信息
-        sign_day_msg = do_sign_day(token, user_id, proxies, parsed_server or "")
+        sign_day_msg = do_sign_day(t, uid, proxies, parsed_server or "")
         result["signDayMsg"] = sign_day_msg
         print(f"  [连签] {sign_day_msg}")
 
         sleep(random.uniform(1, 3))
 
         # 分享加积分
-        share_msg = do_add_integral_by_share(token, user_id, proxies, parsed_server or "")
+        share_msg = do_add_integral_by_share(t, uid, proxies, parsed_server or "")
         result["shareMsg"] = share_msg
         print(f"  [分享] {share_msg}")
 
         sleep(random.uniform(1, 3))
 
         # 领券
-        coupon_msg = do_receive_coupons(token, proxies, parsed_server or "")
+        coupon_msg = do_receive_coupons(t, proxies, parsed_server or "")
         result["couponMsg"] = coupon_msg
         print(f"  [领券] {coupon_msg}")
 
         sleep(random.uniform(1, 2))
 
         # 订阅
-        sub_msg = do_subscription(token, proxies, parsed_server or "")
+        sub_msg = do_subscription(t, proxies, parsed_server or "")
         result["subscribeMsg"] = sub_msg
         print(f"  [订阅] {sub_msg}")
 
         # 积分
-        integral_text, _ = do_get_integral(token, user_id, proxies, parsed_server or "")
+        integral_text, _ = do_get_integral(t, uid, proxies, parsed_server or "")
         result["integral"] = integral_text
         print(f"  [积分] 当前积分: {integral_text}")
+
+    def detect_auth_fail() -> bool:
+        """检查业务结果中是否出现登录失效"""
+        for key in ("signMsg", "subscribeMsg", "integral", "shareMsg"):
+            val = str(result.get(key, ""))
+            if "请登录" in val or "未登录" in val or "登录失效" in val or "登录已过期" in val:
+                return True
+        return False
+
+    try:
+        run_biz(token, user_id)
+
+        # 业务执行后检测到登录失效 → 强制重登并重试一次
+        if detect_auth_fail():
+            print("  [重登] 业务返回登录失效，强制重新登录...")
+            if wxid in cache:
+                del cache[wxid]
+                write_token_cache(cache)
+            token, user_info = login_by_wx_code(server_entry, proxies)
+            if token:
+                user_id = str(user_info.get("userId") or user_info.get("id") or "")
+                cache = read_token_cache()
+                cache[wxid] = {"token": token, "userInfo": user_info, "updatedAt": now_text()}
+                write_token_cache(cache)
+                result["token"] = mask(token)
+                result["userId"] = user_id or "未知"
+                # 清空上次失败结果，重新执行业务
+                for k in ("signMsg", "signDayMsg", "shareMsg", "couponMsg", "subscribeMsg", "integral"):
+                    result[k] = "-"
+                run_biz(token, user_id)
+            else:
+                result["error"] = "重登失败"
 
         result["success"] = True
         return result
