@@ -84,7 +84,7 @@ USER_AGENT = (
 
 # Token 缓存
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "zbs_token_cache.json")
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "zbs_token_cache.json")
 
 
 def now_text() -> str:
