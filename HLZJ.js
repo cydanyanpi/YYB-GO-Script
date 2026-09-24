@@ -337,11 +337,23 @@ const bizRequest = async (url, method, extraHeaders = {}, bodyData = {}, userId 
     // 兼容 Brotli(br) 压缩响应：node/axios 默认不解压 br
     const enc = (resp.headers || {})['content-encoding'] || '';
     if (/br/i.test(enc) || Buffer.isBuffer(body)) {
-        try {
-            const buf = Buffer.isBuffer(body) ? body : Buffer.from(body);
-            body = zlib.brotliDecompressSync(buf).toString('utf-8');
-        } catch (e) {
-            console.log(`⚠️ [解压] brotli 解压失败: ${e.message}`);
+        const buf = Buffer.isBuffer(body) ? body : Buffer.from(body);
+        if (buf.length > 5 && buf[0] === 0x8b) {
+            try {
+                // 真 brotli
+                body = zlib.brotliDecompressSync(buf).toString('utf-8');
+            } catch {
+                // 伪 brotli：3字节魔数 + 明文JSON + 1字节结束符
+                let sub = buf.subarray(3);
+                if (sub.length && sub[sub.length - 1] === 0x03) sub = sub.subarray(0, sub.length - 1);
+                body = sub.toString('utf-8');
+            }
+        } else {
+            try {
+                body = zlib.brotliDecompressSync(buf).toString('utf-8');
+            } catch (e) {
+                console.log(`⚠️ [解压] brotli 解压失败: ${e.message}`);
+            }
         }
     }
     // 兼容非 application/json 的响应：字符串时强制解析
