@@ -332,13 +332,18 @@ const bizRequest = async (url, method, extraHeaders = {}, bodyData = {}, userId 
     if (cookieStore.current?.authorization) headers.Authorization = cookieStore.current.authorization;
     const data = /^(post|put)$/i.test(method) ? createSignedBody(bodyData, userId) : bodyData;
     const resp = await requestWithProxy({ method, url, headers, data }, currentProxyConfig(), cookieStore.current?.server || '');
-    return resp.data;
+    let body = resp.data;
+    // 兼容非 application/json 的响应：字符串时强制解析
+    if (typeof body === 'string') {
+        try { body = JSON.parse(body); } catch { /* 保持原样 */ }
+    }
+    return body;
 };
 
 const authorizedLogin = async (unionId, inviteUserId = '78630') => {
     const res = await bizRequest(`${BASE_URL}/server/api/authorized-login`, 'post', {},
         { union_id: unionId, invite_user_id: inviteUserId });
-    if (res.code !== 200) throw new Error(`授权登录失败: ${res.message}`);
+    if (res.code !== 200) throw new Error(`授权登录失败: ${res.message || JSON.stringify(res).slice(0, 200)}`);
     return res.data;
 };
 
