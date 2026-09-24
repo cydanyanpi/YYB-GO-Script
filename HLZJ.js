@@ -24,6 +24,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 
 // ========== 配置 ==========
 const HLZJ_APPID = 'wx315431cc3b5e930f';
@@ -333,6 +334,16 @@ const bizRequest = async (url, method, extraHeaders = {}, bodyData = {}, userId 
     const data = /^(post|put)$/i.test(method) ? createSignedBody(bodyData, userId) : bodyData;
     const resp = await requestWithProxy({ method, url, headers, data }, currentProxyConfig(), cookieStore.current?.server || '');
     let body = resp.data;
+    // 兼容 Brotli(br) 压缩响应：node/axios 默认不解压 br
+    const enc = (resp.headers || {})['content-encoding'] || '';
+    if (/br/i.test(enc) || Buffer.isBuffer(body)) {
+        try {
+            const buf = Buffer.isBuffer(body) ? body : Buffer.from(body);
+            body = zlib.brotliDecompressSync(buf).toString('utf-8');
+        } catch (e) {
+            console.log(`⚠️ [解压] brotli 解压失败: ${e.message}`);
+        }
+    }
     // 兼容非 application/json 的响应：字符串时强制解析
     if (typeof body === 'string') {
         try { body = JSON.parse(body); } catch { /* 保持原样 */ }
