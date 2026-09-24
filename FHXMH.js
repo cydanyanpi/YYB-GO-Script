@@ -1,6 +1,26 @@
 // name: 飞鹤星妈会
 // cron: 8 15,3 * * *
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "fhxmh_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
 // ====================== YYB Go 账号（环境变量 YYB_SERVER = 地址@微信账号标识，多行） ======================
 const SERVERS = (process.env.YYB_SERVER || "")
     .split(/\r?\n/)
@@ -132,6 +152,15 @@ class FeiheMom {
     }
 
     async login() {
+        // 尝试缓存（不过期）
+        const cache = readTokenCache();
+        const cached = cache[this.server] || {};
+        if (cached.accessToken) {
+            this.token = cached.accessToken;
+            console.log(`💾 使用缓存token`);
+            return `token=${this.token.slice(0, 8)}***`;
+        }
+
         const code = await getWxCode(this.server);
         const res = await request({
             method: "POST",
@@ -143,6 +172,11 @@ class FeiheMom {
         const token = res.data?.data?.tokenInfo?.accessToken || res.data?.data?.accessToken || "";
         if (res.status !== 200 || !token) throw new Error(`登录失败 HTTP ${res.status}: ${short(res.data)}`);
         this.token = token;
+
+        const c = readTokenCache();
+        c[this.server] = { accessToken: token };
+        writeTokenCache(c);
+
         return `token=${token.slice(0, 8)}***`;
     }
 
@@ -186,13 +220,24 @@ class FeiheMom {
 
 async function runAccount(openid, index) {
     console.log(`\n========== ${APP.name} 账号[${index}] ${openid} ==========`);
-    const runner = new FeiheMom(openid);
-    try {
-        console.log(`登录：${await runner.login()}`);
-        console.log(`查询：${await runner.query()}`);
-        console.log(`签到：${await runner.sign()}`);
-    } catch (e) {
-        console.log(`执行失败：${e.message || e}`);
+    let usedCache = !!(readTokenCache()[openid] || {}).accessToken;
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const runner = new FeiheMom(openid);
+        try {
+            console.log(`登录：${await runner.login()}`);
+            console.log(`查询：${await runner.query()}`);
+            console.log(`签到：${await runner.sign()}`);
+            return;
+        } catch (e) {
+            if (attempt === 0 && usedCache) {
+                console.log(`⚠️ 缓存token失效，清除缓存重新登录...`);
+                const c = readTokenCache();
+                delete c[openid];
+                writeTokenCache(c);
+                continue;
+            }
+            console.log(`执行失败：${e.message || e}`);
+        }
     }
 }
 
