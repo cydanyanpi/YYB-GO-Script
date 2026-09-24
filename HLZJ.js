@@ -49,7 +49,7 @@ const REQUEST_TIMEOUT = 30000;
 
 const CONVERT_URL = 'https://wxa-tp.ezrpro.com/myvip/Base/User/WxAppOnLoginNew';
 const BASE_URL = 'https://gmdevpro.hlzjppgl.cn';
-const COOKIE_FILE = path.join(__dirname, 'hlzjcookie.json');
+const COOKIE_FILE = path.join(__dirname, 'token_caches', 'hlzj_token_cache.json');
 const SIGNATURE_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 
 // 通用工具
@@ -93,7 +93,10 @@ const loadCookie = () => {
     try { if (fs.existsSync(COOKIE_FILE)) cookieStore = JSON.parse(fs.readFileSync(COOKIE_FILE, 'utf8')); }
     catch { cookieStore = {}; }
 };
-const saveCookie = () => fs.writeFileSync(COOKIE_FILE, JSON.stringify(cookieStore, null, 2));
+const saveCookie = () => {
+    fs.mkdirSync(path.dirname(COOKIE_FILE), { recursive: true });
+    fs.writeFileSync(COOKIE_FILE, JSON.stringify(cookieStore, null, 2));
+};
 
 // ========== 品赞代理（移植自铛铛一下） ==========
 const directAxios = async (config) => {
@@ -229,6 +232,7 @@ const sendPushPlus = async (title, content) => {
 // ========== 铛铛一下四端口本地 code 服务（替换原 8000 服务） ==========
 const parseYybEntry = (raw) => {
     raw = raw.trim();
+    if (raw.includes('#')) raw = raw.split('#', 1)[0].trim();
     if (!raw.includes('@')) {
         console.log(`❌ YYB_SERVER 格式应为 地址@微信账号标识，当前值：${raw}`);
         return { server: '', ref: '' };
@@ -251,7 +255,11 @@ const getCode = async (entry) => {
     try {
         const resp = await directAxios({ method: 'POST', url, data: { ref, app_id: HLZJ_APPID }, timeout: 20000 });
         const data = resp.data;
-        const code = ((data.data || {}).result || {}).code;
+        let result = (data.data || {}).result;
+        if (typeof result === 'string') {
+            try { result = JSON.parse(result); } catch { result = {}; }
+        }
+        const code = (result || {}).code;
         if (data.code !== 0 || !code) {
             console.log(`❌ [授权] 取码失败: ${jsonPreview(data)}`);
             return null;
@@ -446,8 +454,9 @@ const runAccount = async (index, total, server) => {
         error: '',
     };
 
+    const remark = server.includes('#') ? server.split('#')[1].trim() : '';
     console.log(`\n┌${'─'.repeat(50)}┐`);
-    console.log(`│ 🧩 账号 ${index} / ${total}`.padEnd(54) + '│');
+    console.log(`│ 🧩 账号 ${index} / ${total}${remark ? `（${remark}）` : ''}`.padEnd(54) + '│');
     console.log(`│ 🌍 来源 ${server}`.padEnd(54) + '│');
     console.log(`└${'─'.repeat(50)}┘`);
 
