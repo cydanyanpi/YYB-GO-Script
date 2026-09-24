@@ -76,6 +76,29 @@ SUPPORTED_TASK_TYPES = {"SIGN", "BROWSE", "SHARE"}
 FRIEND_TASK_TYPE = "FRIEND_STEAL_ENERGY"
 FRIEND_STATUS_CLAIMABLE = "0"
 
+# ============ Token 缓存 ============
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "qh_token_cache.json")
+
+
+def read_token_cache():
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache):
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"  [缓存] 写入失败: {exc}")
+
 
 # ============ YYB Go 解析 ============
 
@@ -503,14 +526,44 @@ def main():
     print(f"✅ 读取到 {len(servers)} 个 YYB Go 账号")
 
     all_logs = []
+    cache = read_token_cache()
     for index, server_entry in enumerate(servers, 1):
         wid = ""
         open_id = ""
         print(f"\n===== 开始处理账号 {index} =====")
         try:
-            wid, open_id = resolve_identity(server_entry)
-            print(f"  登录成功：wid={wid}，openId={short_open_id(open_id)}")
-            logs = process_user(wid, open_id, index)
+            _, ref = parse_yyb_entry(server_entry)
+            used_cache = False
+            cached = cache.get(ref) or {}
+            if cached.get("wid") and cached.get("openId"):
+                wid = cached["wid"]
+                open_id = cached["openId"]
+                used_cache = True
+                print(f"  [缓存] 使用缓存身份: wid={wid}, openId={short_open_id(open_id)}")
+
+            if not wid:
+                wid, open_id = resolve_identity(server_entry)
+                cache = read_token_cache()
+                cache[ref] = {"wid": wid, "openId": open_id}
+                write_token_cache(cache)
+                print(f"  登录成功：wid={wid}，openId={short_open_id(open_id)}")
+
+            try:
+                logs = process_user(wid, open_id, index)
+            except Exception:
+                if used_cache:
+                    print("  [重登] 缓存身份失效，重新登录...")
+                    cache = read_token_cache()
+                    if ref in cache:
+                        del cache[ref]
+                        write_token_cache(cache)
+                    wid, open_id = resolve_identity(server_entry)
+                    cache = read_token_cache()
+                    cache[ref] = {"wid": wid, "openId": open_id}
+                    write_token_cache(cache)
+                    logs = process_user(wid, open_id, index)
+                else:
+                    raise
         except Exception as exc:
             logs = [
                 f"账号{index}（wid={wid}，openId={short_open_id(open_id) or '-'}）",
