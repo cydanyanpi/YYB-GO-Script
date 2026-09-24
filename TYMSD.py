@@ -81,6 +81,29 @@ ENABLE_DIRECT_FALLBACK = True
 REQUEST_TIMEOUT = 30
 
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "tymsd_token_cache.json")
+
+
+def read_token_cache() -> dict:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"  [缓存] 写入失败: {exc}")
+
+
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -495,38 +518,85 @@ def run_account(index: int, total: int, server_entry: str) -> dict:
     delay = random.randint(2, 6)
     sleep(delay)
 
-    code = get_wx_code(server_entry)
-    if not code:
-        result["error"] = "获取 code 失败"
-        return result
+    code = None
+    token = None
+    wid = None
+    used_cache = False
 
-    token, wid, raw = login_by_code(parsed_server, code, proxies)
+    # 尝试缓存（不过期，服务端拒绝时自动重登）
+    cache = read_token_cache()
+    cached = cache.get(wxid) or {}
+    if cached.get("token"):
+        token = cached["token"]
+        wid = cached.get("wid")
+        used_cache = True
+        print(f"  [缓存] 使用缓存token: {mask(token)}")
+
     if not token:
-        result["error"] = f"登录失败: {json_preview(raw)}"
-        return result
+        code = get_wx_code(server_entry)
+        if not code:
+            result["error"] = "获取 code 失败"
+            return result
+
+        token, wid, raw = login_by_code(parsed_server, code, proxies)
+        if not token:
+            result["error"] = f"登录失败: {json_preview(raw)}"
+            return result
+
+        cache = read_token_cache()
+        cache[wxid] = {"token": token, "wid": wid, "updatedAt": now_text()}
+        write_token_cache(cache)
 
     result["token"] = mask(token)
     result["wid"] = str(wid or "-")
 
-    # 签到
-    sign_result = sign_in(parsed_server, token, wid, proxies)
-    if sign_result["already_signed"]:
-        result["sign_msg"] = f"今日已签到: {sign_result['message']}"
-    elif sign_result["success"]:
-        result["sign_msg"] = f"签到成功: {sign_result['message']}"
-    else:
-        result["sign_msg"] = sign_result["message"]
+    # 执行业务，若缓存token失效则自动重登重试
+    for attempt in range(2):
+        if attempt == 1:
+            print("  [重登] 缓存token失效，重新登录...")
+            cache = read_token_cache()
+            if wxid in cache:
+                del cache[wxid]
+                write_token_cache(cache)
+            code = get_wx_code(server_entry)
+            if not code:
+                result["error"] = "重新登录获取code失败"
+                return result
+            token, wid, raw = login_by_code(parsed_server, code, proxies)
+            if not token:
+                result["error"] = f"重新登录失败: {json_preview(raw)}"
+                return result
+            cache = read_token_cache()
+            cache[wxid] = {"token": token, "wid": wid, "updatedAt": now_text()}
+            write_token_cache(cache)
+            result["token"] = mask(token)
+            result["wid"] = str(wid or "-")
 
-    # 积分
-    pts = query_points(parsed_server, token, wid, proxies)
-    if pts["success"]:
-        result["points_msg"] = f"可用: {pts['available']} / 总计: {pts['total']}"
-    else:
-        result["points_msg"] = "积分查询失败"
+        # 签到
+        sign_result = sign_in(parsed_server, token, wid, proxies)
 
-    # 明细
-    det = query_point_details(parsed_server, token, wid, proxies)
-    result["details_msg"] = det.get("message", "-")
+        # 首次用缓存失败 → 判定为token失效，重登重试
+        if attempt == 0 and used_cache and not sign_result["success"] and not sign_result["already_signed"]:
+            continue
+
+        if sign_result["already_signed"]:
+            result["sign_msg"] = f"今日已签到: {sign_result['message']}"
+        elif sign_result["success"]:
+            result["sign_msg"] = f"签到成功: {sign_result['message']}"
+        else:
+            result["sign_msg"] = sign_result["message"]
+
+        # 积分
+        pts = query_points(parsed_server, token, wid, proxies)
+        if pts["success"]:
+            result["points_msg"] = f"可用: {pts['available']} / 总计: {pts['total']}"
+        else:
+            result["points_msg"] = "积分查询失败"
+
+        # 明细
+        det = query_point_details(parsed_server, token, wid, proxies)
+        result["details_msg"] = det.get("message", "-")
+        break
 
     result["success"] = True
     return result
