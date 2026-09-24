@@ -70,6 +70,29 @@ USER_AGENT = (
 )
 
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "hezj_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"  [缓存] 写入失败: {exc}")
+
+
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -321,126 +344,111 @@ def run_account(index: int, total: int, server_entry: str) -> Dict[str, Any]:
     result["proxyStatus"] = "使用专属代理" if proxies else "使用直连"
     result["proxyIp"] = proxy_ip or "-"
 
-    code = get_wx_code(server_entry)
-    if not code:
-        result["error"] = "获取 code 失败"
-        return result
-
     client_id = f"{int(time.time() * 1000)}{random_string(12)}"
 
-    try:
-        # 1. jscode2session 登录
-        ts = int(time.time() * 1000)
-        path = "/api-gw/oauthserver/applet/v1/jscode2session"
-        headers = build_headers("", client_id, path, {"code": code}, ts)
-        headers["accessToken"] = ""
-        headers["accountToken"] = ""
-        headers["ak"] = ""
+    # 尝试缓存（不过期，业务失败自动重登）
+    cache = read_token_cache()
+    cached = cache.get(wxid) or {}
+    token = cached.get("accountToken", "")
+    used_cache = bool(token)
+    if token:
+        print(f"  [缓存] 使用缓存token: {mask(token)}")
 
-        resp = request_with_proxy(
-            "POST", f"{API_HOST}{path}",
-            headers=headers,
-            json_data={"code": code},
-            proxies=proxies, server=parsed_server,
-        )
+    for attempt in range(2):
+        if attempt == 1 or not token:
+            if attempt == 1:
+                print("  [重登] token失效，重新登录...")
+                cache = read_token_cache()
+                if wxid in cache:
+                    del cache[wxid]
+                    write_token_cache(cache)
+            code = get_wx_code(server_entry)
+            if not code:
+                result["error"] = "获取 code 失败"
+                return result
+            try:
+                ts = int(time.time() * 1000)
+                path = "/api-gw/oauthserver/applet/v1/jscode2session"
+                headers = build_headers("", client_id, path, {"code": code}, ts)
+                headers["accessToken"] = ""
+                headers["accountToken"] = ""
+                headers["ak"] = ""
+                resp = request_with_proxy("POST", f"{API_HOST}{path}", headers=headers, json_data={"code": code}, proxies=proxies, server=parsed_server)
+                login_data = resp.json() if hasattr(resp, "json") else {}
+                if login_data.get("retCode") != "00000":
+                    result["error"] = f"登录失败: {login_data.get('retInfo', json_preview(login_data))}"
+                    return result
+                token_info = login_data.get("data", {}).get("tokenInfo", login_data.get("data", {}))
+                token = token_info.get("accountToken", "")
+                if not token:
+                    result["error"] = "登录未返回 accountToken"
+                    return result
+                cache = read_token_cache()
+                cache[wxid] = {"accountToken": token}
+                write_token_cache(cache)
+            except Exception as exc:
+                result["error"] = f"登录异常: {exc}"
+                return result
+
         try:
-            login_data = resp.json()
-        except Exception:
-            login_data = {}
-        print(f"  [登录] 响应: {json_preview(login_data)}")
+            result["token"] = mask(token)
 
-        if login_data.get("retCode") != "00000":
-            result["error"] = f"登录失败: {login_data.get('retInfo', json_preview(login_data))}"
-            return result
+            # 查询用户信息
+            ts = int(time.time() * 1000)
+            path = "/api-gw/oauthserver/applet/v1/userinfo/query"
+            headers = build_headers(token, client_id, path, {"accountToken": token}, ts)
+            headers["accessToken"] = ""
+            headers["accountToken"] = ""
+            headers["ak"] = ""
+            resp = request_with_proxy("POST", f"{API_HOST}{path}", headers=headers, json_data={"accountToken": token}, proxies=proxies, server=parsed_server)
+            user_data = resp.json() if hasattr(resp, "json") else {}
 
-        token_info = login_data.get("data", {}).get("tokenInfo", login_data.get("data", {}))
-        token = token_info.get("accountToken", "")
-        if not token:
-            result["error"] = "登录未返回 accountToken"
-            return result
+            if user_data.get("retCode") != "00000":
+                if attempt == 0 and used_cache:
+                    print(f"  [校验] 用户信息查询失败({user_data.get('retInfo', '')})，判定token失效")
+                    continue
+                result["userInfo"] = f"查询失败: {user_data.get('retInfo', '')}"
+            else:
+                user_info = user_data.get("data", {}).get("userinfo", {})
+                name = user_info.get("nickName", user_info.get("nickname", "未知"))
+                phone = user_info.get("mobile", user_info.get("phoneNumber", ""))
+                result["userInfo"] = f"{name} {mask_phone(phone)}" if phone else name
+                print(f"  [用户] {result['userInfo']}")
 
-        result["token"] = mask(token)
-        print(f"  [登录] 成功: {mask(token)}")
+            # 查询积分
+            ts = int(time.time() * 1000)
+            path = "/zjapi/zjBaseServer/signDetail/getUserPointsAndWallet"
+            resp = request_with_proxy("POST", f"{API_HOST}{path}", headers=build_headers(token, client_id, path, {}, ts), json_data={}, proxies=proxies, server=parsed_server)
+            point_data = resp.json() if hasattr(resp, "json") else {}
+            if point_data.get("retCode") == "00000":
+                pd = point_data.get("data", {})
+                result["points"] = str(pd.get("haiBeiTotal", "未知"))
+                result["wallet"] = str(pd.get("wallet", "未知"))
+                print(f"  [积分] 海贝:{result['points']} 红包:{result['wallet']}")
+            else:
+                result["points"] = "查询失败"
+                result["wallet"] = "查询失败"
 
-        # 2. 查询用户信息
-        ts = int(time.time() * 1000)
-        path = "/api-gw/oauthserver/applet/v1/userinfo/query"
-        headers = build_headers(token, client_id, path, {"accountToken": token}, ts)
-        headers["accessToken"] = ""
-        headers["accountToken"] = ""
-        headers["ak"] = ""
+            # 签到
+            ts = int(time.time() * 1000)
+            path = "/api-gw/zjBaseServer/daily/sign"
+            resp = request_with_proxy("POST", f"{API_HOST}{path}", headers=build_headers(token, client_id, path, {}, ts), json_data={}, proxies=proxies, server=parsed_server)
+            sign_data = resp.json() if hasattr(resp, "json") else {}
+            if sign_data.get("retCode") == "00000":
+                sd = sign_data.get("data", {})
+                result["signDay"] = str(sd.get("totalSignDay", "未知"))
+                print(f"  [签到] 已签到 {result['signDay']} 天")
+                result["success"] = True
+            else:
+                result["error"] = f"签到失败: {sign_data.get('retInfo', '')}"
+                print(f"  [签到] {result['error']}")
 
-        resp = request_with_proxy(
-            "POST", f"{API_HOST}{path}",
-            headers=headers,
-            json_data={"accountToken": token},
-            proxies=proxies, server=parsed_server,
-        )
-        try:
-            user_data = resp.json()
-        except Exception:
-            user_data = {}
+            break
 
-        if user_data.get("retCode") != "00000":
-            result["userInfo"] = f"查询失败: {user_data.get('retInfo', '')}"
-        else:
-            user_info = user_data.get("data", {}).get("userinfo", {})
-            name = user_info.get("nickName", user_info.get("nickname", "未知"))
-            phone = user_info.get("mobile", user_info.get("phoneNumber", ""))
-            result["userInfo"] = f"{name} {mask_phone(phone)}" if phone else name
-            print(f"  [用户] {result['userInfo']}")
-
-        # 3. 查询积分
-        ts = int(time.time() * 1000)
-        path = "/zjapi/zjBaseServer/signDetail/getUserPointsAndWallet"
-
-        resp = request_with_proxy(
-            "POST", f"{API_HOST}{path}",
-            headers=build_headers(token, client_id, path, {}, ts),
-            json_data={},
-            proxies=proxies, server=parsed_server,
-        )
-        try:
-            point_data = resp.json()
-        except Exception:
-            point_data = {}
-
-        if point_data.get("retCode") == "00000":
-            pd = point_data.get("data", {})
-            result["points"] = str(pd.get("haiBeiTotal", "未知"))
-            result["wallet"] = str(pd.get("wallet", "未知"))
-            print(f"  [积分] 海贝:{result['points']} 红包:{result['wallet']}")
-        else:
-            result["points"] = "查询失败"
-            result["wallet"] = "查询失败"
-
-        # 4. 签到
-        ts = int(time.time() * 1000)
-        path = "/api-gw/zjBaseServer/daily/sign"
-
-        resp = request_with_proxy(
-            "POST", f"{API_HOST}{path}",
-            headers=build_headers(token, client_id, path, {}, ts),
-            json_data={},
-            proxies=proxies, server=parsed_server,
-        )
-        try:
-            sign_data = resp.json()
-        except Exception:
-            sign_data = {}
-
-        if sign_data.get("retCode") == "00000":
-            sd = sign_data.get("data", {})
-            result["signDay"] = str(sd.get("totalSignDay", "未知"))
-            print(f"  [签到] 已签到 {result['signDay']} 天")
-            result["success"] = True
-        else:
-            result["error"] = f"签到失败: {sign_data.get('retInfo', '')}"
-            print(f"  [签到] {result['error']}")
-
-    except Exception as exc:
-        result["error"] = f"{exc}"
-        print(f"  [账号] 执行异常: {exc}")
+        except Exception as exc:
+            result["error"] = f"{exc}"
+            print(f"  [账号] 执行异常: {exc}")
+            break
 
     return result
 
