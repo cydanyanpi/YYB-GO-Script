@@ -66,6 +66,29 @@ UA = (
 )
 
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "hxek_token_cache.json")
+
+
+def read_token_cache() -> dict:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"  [缓存] 写入失败: {exc}")
+
+
 def sleep(seconds: float) -> None:
     time.sleep(seconds)
 
@@ -430,22 +453,63 @@ def run_account(index: int, total: int, server_entry: str) -> dict:
     delay = random.randint(2, 6)
     sleep(delay)
 
-    code = get_wx_code(server_entry)
-    if not code:
-        result["error"] = "获取 code 失败"
-        return result
+    member_id = None
+    used_cache = False
 
-    member_id, raw = login_by_code(parsed_server, code, proxies)
+    # 尝试缓存（不过期，签到失败自动重登重试）
+    cache = read_token_cache()
+    cached = cache.get(wxid) or {}
+    if cached.get("memberId"):
+        member_id = cached["memberId"]
+        used_cache = True
+        print(f"  [缓存] 使用缓存memberId: {mask_member_id(member_id)}")
+
     if not member_id:
-        result["error"] = "登录失败或未识别 memberId"
-        return result
+        code = get_wx_code(server_entry)
+        if not code:
+            result["error"] = "获取 code 失败"
+            return result
+
+        member_id, raw = login_by_code(parsed_server, code, proxies)
+        if not member_id:
+            result["error"] = "登录失败或未识别 memberId"
+            return result
+
+        cache = read_token_cache()
+        cache[wxid] = {"memberId": member_id}
+        write_token_cache(cache)
 
     result["member_id"] = mask_member_id(member_id)
 
-    sign_result = sign_once(parsed_server, member_id, proxies)
-    result["success"] = bool(sign_result["success"])
-    result["sign_msg"] = sign_result["message"]
-    result["points"] = sign_result["points"]
+    for attempt in range(2):
+        if attempt == 1:
+            print("  [重登] memberId失效，重新获取...")
+            cache = read_token_cache()
+            if wxid in cache:
+                del cache[wxid]
+                write_token_cache(cache)
+            code = get_wx_code(server_entry)
+            if not code:
+                result["error"] = "重新获取code失败"
+                return result
+            member_id, raw = login_by_code(parsed_server, code, proxies)
+            if not member_id:
+                result["error"] = "重新登录失败"
+                return result
+            cache = read_token_cache()
+            cache[wxid] = {"memberId": member_id}
+            write_token_cache(cache)
+            result["member_id"] = mask_member_id(member_id)
+
+        sign_result = sign_once(parsed_server, member_id, proxies)
+
+        if attempt == 0 and used_cache and not sign_result["success"]:
+            continue
+
+        result["success"] = bool(sign_result["success"])
+        result["sign_msg"] = sign_result["message"]
+        result["points"] = sign_result["points"]
+        break
 
     if result["success"]:
         print(f"  [签到] {result['sign_msg']}，积分余额 {result['points']}")
