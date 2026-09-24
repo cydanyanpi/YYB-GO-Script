@@ -50,7 +50,8 @@ MINI_APP_ID = "wxcf4266fbc9463132"
 PAGE_VERSION = "256"
 API_BASE = "https://bbs-api.iqoo.com/api/"
 SIGN_SECRET = "2618194b0ebb620055e19cf9811d3c13"
-TOKEN_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iqoocookie.json")
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(_SCRIPT_DIR, "token_caches", "iqoo_token_cache.json")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -130,6 +131,7 @@ def read_token_cache():
 
 def write_token_cache(cache):
     try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
         with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -335,8 +337,10 @@ def build_notify(results):
 # ==================== 8088 code服务 ====================
 
 def parse_yyb_entry(raw):
-    """解析 YYB_SERVER 条目：地址@微信账号标识 → (server, ref)"""
+    """解析 YYB_SERVER 条目：地址@微信账号标识[#备注] → (server, ref)"""
     raw = raw.strip()
+    if "#" in raw:
+        raw = raw.split("#", 1)[0].strip()
     if "@" not in raw:
         log(f"❌ YYB_SERVER 格式应为 地址@微信账号标识，当前值：{raw}")
         return "", ""
@@ -366,7 +370,13 @@ def get_code(entry):
         )
         data = response.json()
 
-        code = ((data.get("data") or {}).get("result") or {}).get("code")
+        result = (data.get("data") or {}).get("result")
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:
+                result = {}
+        code = (result or {}).get("code")
         if data.get("code") != 0 or not code:
             log(f"[授权] 取码失败: {json_preview(data)}")
             return None
@@ -809,8 +819,9 @@ def main():
     results = []
 
     for server in SERVERS:
+        remark = server.split("#", 1)[1].strip() if "#" in server else ""
         log(f"\n{'=' * 50}")
-        log(f"  开始处理: {server}")
+        log(f"  开始处理: {remark or server}")
         log(f"{'=' * 50}")
 
         proxies, proxy_ip = get_valid_proxy(server)
