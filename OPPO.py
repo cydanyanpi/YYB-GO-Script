@@ -73,7 +73,8 @@ UA = (
 )
 
 # ---- 缓存文件路径 ----
-CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oppocookie.json")
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_FILE = os.path.join(_SCRIPT_DIR, "token_caches", "oppo_token_cache.json")
 
 # ---- 脚本行为开关 ----
 SIMULATE_WAIT = True          # 是否真实等待浏览秒数
@@ -312,8 +313,10 @@ def request_with_proxy(
 # 本地 code 服务（铛铛一下同款接口）
 # =============================================================================
 def parse_yyb_entry(raw: str) -> Tuple[str, str]:
-    """解析 YYB_SERVER 条目：地址@微信账号标识 → (server, ref)"""
+    """解析 YYB_SERVER 条目：地址@微信账号标识[#备注] → (server, ref)"""
     raw = raw.strip()
+    if "#" in raw:
+        raw = raw.split("#", 1)[0].strip()
     if "@" not in raw:
         log(f"❌ YYB_SERVER 格式应为 地址@微信账号标识，当前值：{raw}")
         return "", ""
@@ -343,7 +346,13 @@ def get_code(entry: str) -> Optional[str]:
         )
         data = response.json()
 
-        code = ((data.get("data") or {}).get("result") or {}).get("code")
+        result = (data.get("data") or {}).get("result")
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:
+                result = {}
+        code = (result or {}).get("code")
         if data.get("code") != 0 or not code:
             log(f"❌ [授权] 取码失败: {json_preview(data)}")
             return None
@@ -455,6 +464,7 @@ def load_cache() -> Dict[str, Any]:
 
 def save_cache(cache: Dict[str, Any]) -> None:
     try:
+        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -792,7 +802,8 @@ def send_pushplus(title: str, content: str) -> None:
 # =============================================================================
 def run_account(server: str, sign_act_id: str, task_act_id: str,
                 cache: dict, index: int) -> dict:
-    nickname = f"账号{index}"
+    remark = server.split("#", 1)[1].strip() if "#" in server else ""
+    nickname = remark or f"账号{index}"
     log_blank()
     log(f"👤 账号【{index}】> 【{nickname}】来源 {server}")
 
