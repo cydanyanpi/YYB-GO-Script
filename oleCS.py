@@ -10,7 +10,8 @@ import time
 # ================= 配置 =================
 APP_ID = "wx6c61aaeba1551439"
 BASE_URL = "https://ole-app.crvole.com.cn"
-COOKIE_FILE = "olecookie.json"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+COOKIE_FILE = os.path.join(_SCRIPT_DIR, "token_caches", "ole_token_cache.json")
 
 # 定位经纬度，用于自动匹配对应门店
 LOCATION = "119.17437689887153,26.149126519097223"
@@ -39,25 +40,32 @@ def load_cookie():
 
 
 def save_cookie(data):
+    os.makedirs(os.path.dirname(COOKIE_FILE), exist_ok=True)
     with open(COOKIE_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 # ================= YYB_SERVER 环境变量解析 =================
 def parse_yyb_go():
-    """解析 YYB_SERVER 环境变量，格式：地址@微信账号标识，多行换行"""
+    """解析 YYB_SERVER 环境变量，格式：地址@微信账号标识[#备注]，多行换行"""
     raw = os.getenv("YYB_SERVER", "")
     accounts = []
     for idx, line in enumerate(raw.splitlines(), 1):
         value = str(line or "").strip()
         if not value:
             continue
-        at_index = value.find("@")
+        remark = ""
+        body = value
+        if "#" in body:
+            body, remark = body.split("#", 1)
+            remark = remark.strip()
+        body = body.strip()
+        at_index = body.find("@")
         if at_index == -1:
             print(f"  [YYB_SERVER 第{idx}行] 格式错误，缺少 @ 分隔符：{value}")
             continue
-        server = value[:at_index].strip()
-        ref = value[at_index + 1 :].strip()
+        server = body[:at_index].strip()
+        ref = body[at_index + 1 :].strip()
         # 去掉 http:// 或 https:// 前缀
         if server.startswith("http://"):
             server = server[7:]
@@ -69,7 +77,7 @@ def parse_yyb_go():
             continue
         accounts.append(
             {
-                "name": f"YYB_SERVER账号{idx}",
+                "name": remark or f"账号{idx}",
                 "ref": ref,
                 "server": server,
             }
@@ -101,6 +109,11 @@ def get_code(account):
 
         wxdata = res.get("data", {})
         result = wxdata.get("result", {})
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:
+                result = {}
         code = result.get("code")
 
         if not code:
@@ -247,7 +260,7 @@ def main():
 
     for idx, account in enumerate(accounts, 1):
         try:
-            aid = str(idx)
+            aid = str(account["ref"])
             nickname = account.get("name", aid)
             print(f"\n账号: {nickname}")
 
