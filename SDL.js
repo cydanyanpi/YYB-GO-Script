@@ -1,9 +1,29 @@
 // name: 三得利
 // cron: 48 8,20 * * *
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
 const { SocksProxyAgent } = require('socks-proxy-agent');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const { HttpProxyAgent } = require('http-proxy-agent');
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "sdl_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
 
 // 强制全局禁用系统代理环境变量，避免干扰
 delete process.env.HTTP_PROXY;
@@ -423,55 +443,80 @@ async function runAccount(server, globalProxyAgent) {
         console.log(`⏳ [${server}] 启动延迟 ${startDelay / 1000}s`);
         await sleep(startDelay);
 
-        // 1️⃣ 获取code
-        let code = await getCode(server);
-        if (!code) {
-            result.error = "获取code失败";
-            console.log(`❌ [${server}] 获取code失败`);
-            return result;
+        let token = null;
+        let usedCache = false;
+
+        // 尝试缓存（不过期，签到失败自动重登）
+        const cache = readTokenCache();
+        const cached = cache[server] || {};
+        if (cached.access_token) {
+            token = cached.access_token;
+            usedCache = true;
+            console.log(`💾 [${server}] 使用缓存token`);
         }
 
-        // 2️⃣ 登录获取token
-        let login = await wxLogin(code, UA, proxyAgent, server);
-        if (!login || login.code != 200) {
-            result.error = login?.msg || "登录失败";
-            console.log(`❌ [${server}] 登录失败：${login?.msg || "未知错误"}`);
-            return result;
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (attempt === 1 || !token) {
+                if (attempt === 1) {
+                    console.log(`🔄 [${server}] token失效，重新登录...`);
+                    const c = readTokenCache();
+                    delete c[server];
+                    writeTokenCache(c);
+                }
+                let code = await getCode(server);
+                if (!code) {
+                    result.error = "获取code失败";
+                    return result;
+                }
+                let login = await wxLogin(code, UA, proxyAgent, server);
+                if (!login || login.code != 200) {
+                    result.error = login?.msg || "登录失败";
+                    return result;
+                }
+                token = login.data.tokenInfo.access_token;
+                console.log(`✅ [${server}] 登录成功`);
+                const c = readTokenCache();
+                c[server] = { access_token: token };
+                writeTokenCache(c);
+            }
+
+            await sleep(random(3000, 8000));
+
+            // 签到
+            let sign = await commonPost('/coupon/auth/signIn', {"miniappId":159}, token, UA, proxyAgent, server);
+            if (sign?.code == 200) {
+                result.signMsg = `签到成功：${sign.data.integralToastText}`;
+                console.log(`✅ [${server}] 签到成功：${sign.data.integralToastText}`);
+            } else if (attempt === 0 && usedCache) {
+                console.log(`⚠️ [${server}] 签到返回: ${sign?.msg}，判定token失效`);
+                continue;
+            } else {
+                result.signMsg = `签到失败：${sign?.msg || "未知错误"}`;
+                console.log(`❌ [${server}] 签到失败：${sign?.msg || "未知错误"}`);
+            }
+
+            await sleep(random(2000, 5000));
+
+            // 收藏
+            let save = await commonPost('/user/auth/user/collect/record/save', {"sceneValue":"1104"}, token, UA, proxyAgent, server);
+            if (save?.code == 200) {
+                result.collectMsg = `收藏成功：${save.data.integralToastText}`;
+                console.log(`✅ [${server}] 收藏成功：${save.data.integralToastText}`);
+            } else {
+                result.collectMsg = `收藏失败：${save?.msg || "未知错误"}`;
+                console.log(`❌ [${server}] 收藏失败：${save?.msg || "未知错误"}`);
+            }
+            await sleep(random(2000, 5000));
+
+            // 查询积分
+            let info = await commonPost('/user/member/info', {}, token, UA, proxyAgent, server);
+            result.score = info?.data?.currentScore || 0;
+            console.log(`🎯 [${server}] 当前积分：${result.score}`);
+
+            result.success = true;
+            console.log(`✅ [${server}] 账号执行完成`);
+            break;
         }
-
-        let token = login.data.tokenInfo.access_token;
-        console.log(`✅ [${server}] 登录成功`);
-        await sleep(random(3000, 8000));
-
-        // 3️⃣ 签到
-        let sign = await commonPost('/coupon/auth/signIn', {"miniappId":159}, token, UA, proxyAgent, server);
-        if (sign?.code == 200) {
-            result.signMsg = `签到成功：${sign.data.integralToastText}`;
-            console.log(`✅ [${server}] 签到成功：${sign.data.integralToastText}`);
-        } else {
-            result.signMsg = `签到失败：${sign?.msg || "未知错误"}`;
-            console.log(`❌ [${server}] 签到失败：${sign?.msg || "未知错误"}`);
-        }
-        await sleep(random(2000, 5000));
-
-        // 4️⃣ 收藏
-        let save = await commonPost('/user/auth/user/collect/record/save', {"sceneValue":"1104"}, token, UA, proxyAgent, server);
-        if (save?.code == 200) {
-            result.collectMsg = `收藏成功：${save.data.integralToastText}`;
-            console.log(`✅ [${server}] 收藏成功：${save.data.integralToastText}`);
-        } else {
-            result.collectMsg = `收藏失败：${save?.msg || "未知错误"}`;
-            console.log(`❌ [${server}] 收藏失败：${save?.msg || "未知错误"}`);
-        }
-        await sleep(random(2000, 5000));
-
-        // 5️⃣ 查询积分
-        let info = await commonPost('/user/member/info', {}, token, UA, proxyAgent, server);
-        result.score = info?.data?.currentScore || 0;
-        console.log(`🎯 [${server}] 当前积分：${result.score}`);
-
-        result.success = true;
-        console.log(`✅ [${server}] 账号执行完成`);
 
     } catch (e) {
         result.error = e.message;
