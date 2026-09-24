@@ -58,7 +58,8 @@ print(f"✅ 读取到 {len(SERVERS)} 个 YYB Go 账号")
 print("-" * 50)
 
 # Token 缓存
-TOKEN_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wrncookie.json")
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(_SCRIPT_DIR, "token_caches", "wrn_token_cache.json")
 
 # 推送
 WRN_PUSH_KEY = os.getenv("WRN_PUSH_KEY", "")
@@ -102,6 +103,8 @@ def parse_yyb_go_entry(raw_value):
     raw_value = (raw_value or "").strip()
     if not raw_value:
         return None, None
+    if "#" in raw_value:
+        raw_value = raw_value.split("#", 1)[0].strip()
     if "@" not in raw_value:
         print(f"❌ YYB_SERVER 格式应为 地址@微信账号标识，当前值：{raw_value}")
         return None, None
@@ -127,7 +130,13 @@ def get_wx_login_code(server_entry: str) -> str | None:
         resp = requests.post(url, json={"ref": ref, "app_id": APPID}, timeout=20,
                              proxies={"http": None, "https": None})
         data = resp.json()
-        code = (((data.get("data") or {}).get("result") or {}).get("code"))
+        result = (data.get("data") or {}).get("result")
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:
+                result = {}
+        code = (result or {}).get("code")
         if data.get("code") == 0 and code:
             print(f"[{parsed_server}] 获取 login code 成功")
             return code
@@ -148,7 +157,13 @@ def get_wx_phone_code(server_entry: str) -> str | None:
         resp = requests.post(url, json={"ref": ref, "app_id": APPID}, timeout=20,
                              proxies={"http": None, "https": None})
         data = resp.json()
-        code = (((data.get("data") or {}).get("result") or {}).get("code"))
+        result = (data.get("data") or {}).get("result")
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:
+                result = {}
+        code = (result or {}).get("code")
         if data.get("code") == 0 and code:
             print(f"[{parsed_server}] 获取手机号 code 成功")
             return code
@@ -174,6 +189,7 @@ def load_token_cache():
 
 def save_token_cache(cache):
     try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
         with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
     except Exception as e:
