@@ -67,7 +67,7 @@ def get_wx_code(server_entry: str) -> str | None:
 
 # ========== Token 缓存（按账号隔离） ==========
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "yili_qqx_token_cache.json")
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "yili_qqx_token_cache.json")
 
 
 def read_token_cache():

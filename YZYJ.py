@@ -69,6 +69,30 @@ ENABLE_DIRECT_FALLBACK = True
 REQUEST_TIMEOUT = 30
 
 
+# ============ Token 缓存 ============
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "yzyj_token_cache.json")
+
+
+def read_token_cache() -> dict:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"  [缓存] 写入失败: {exc}")
+
+
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -407,44 +431,68 @@ def run_account(index: int, total: int, server_entry: str) -> dict:
     delay = random.randint(2, 6)
     sleep(delay)
 
-    code = get_wx_code(server_entry)
-    if not code:
-        result["error"] = "获取 code 失败"
-        return result
+    # 尝试缓存 token（不过期，业务失败自动重登）
+    cache = read_token_cache()
+    cached = cache.get(wxid) or {}
+    token = cached.get("token", "")
+    used_cache = bool(token)
 
-    token, raw_login = login_by_code(parsed_server, code, proxies)
-    if not token:
-        result["error"] = f"登录失败: {json_preview(raw_login)}"
-        return result
+    for attempt in range(2):
+        if attempt == 1 or not token:
+            if attempt == 1:
+                print("  [重登] token 失效，清除缓存重新登录...")
+                cache = read_token_cache()
+                if wxid in cache:
+                    del cache[wxid]
+                    write_token_cache(cache)
+            code = get_wx_code(server_entry)
+            if not code:
+                result["error"] = "获取 code 失败"
+                return result
+            token, raw_login = login_by_code(parsed_server, code, proxies)
+            if not token:
+                result["error"] = f"登录失败: {json_preview(raw_login)}"
+                return result
+            cache = read_token_cache()
+            cache[wxid] = {"token": token}
+            write_token_cache(cache)
 
-    result["token"] = mask(token)
+        result["token"] = mask(token)
 
-    try:
-        sleep(random.randint(1, 3))
-        print("  [签到] 检查签到状态...")
-        is_signed, sign_data = check_sign_status(parsed_server, token, proxies)
+        try:
+            sleep(random.randint(1, 3))
+            print("  [签到] 检查签到状态...")
+            is_signed, sign_data = check_sign_status(parsed_server, token, proxies)
 
-        if is_signed:
-            result["sign_msg"] = "今日已签到"
-            print("  [签到] 今日已签到")
-        else:
-            print("  [签到] 未签到，开始签到...")
-            sign_ok, sign_msg, earned = submit_signin(parsed_server, token, proxies)
-            result["sign_msg"] = sign_msg
-            result["earned"] = str(earned)
-            if sign_ok:
-                print(f"  [签到] {sign_msg}")
+            # 用缓存 token 时，签到状态查询未返回有效数据 -> 判定 token 失效，重登重试
+            if used_cache and attempt == 0 and not sign_data:
+                print("  [校验] 签到状态查询未返回数据，判定 token 失效")
+                token = ""
+                continue
+
+            if is_signed:
+                result["sign_msg"] = "今日已签到"
+                print("  [签到] 今日已签到")
             else:
-                print(f"  [签到] {sign_msg}")
+                print("  [签到] 未签到，开始签到...")
+                sign_ok, sign_msg, earned = submit_signin(parsed_server, token, proxies)
+                result["sign_msg"] = sign_msg
+                result["earned"] = str(earned)
+                if sign_ok:
+                    print(f"  [签到] {sign_msg}")
+                else:
+                    print(f"  [签到] {sign_msg}")
 
-        sleep(random.randint(1, 3))
-        result["success"] = True
-        return result
+            sleep(random.randint(1, 3))
+            result["success"] = True
+            return result
 
-    except Exception as exc:
-        result["error"] = traceback.format_exc().strip()
-        print(f"  [账号] 执行失败: {exc}")
-        return result
+        except Exception as exc:
+            result["error"] = traceback.format_exc().strip()
+            print(f"  [账号] 执行失败: {exc}")
+            return result
+
+    return result
 
 
 def build_notify(results: list) -> str:

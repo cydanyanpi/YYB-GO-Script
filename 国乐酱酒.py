@@ -4,6 +4,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import json
 import time
 import requests
 from datetime import datetime
@@ -23,6 +24,30 @@ if not SERVERS:
     print("格式：地址@微信账号标识，多账号换行分隔")
     exit(1)
 print(f"✅ 读取到 {len(SERVERS)} 个 YYB Go 账号")
+
+
+# ============ Token 缓存 ============
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "guoyue_token_cache.json")
+
+
+def read_token_cache():
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache):
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"  [缓存] 写入失败: {e}")
 
 
 def parse_yyb_go_entry(raw_value: str):
@@ -143,12 +168,36 @@ def run_account(entry: str) -> bool:
 
     time.sleep(1.5)
 
-    token = code_login(entry)
-    if not token:
-        print("❌ 登录失败，跳过")
-        return False
+    cache = read_token_cache()
+    cached = cache.get(wxid) or {}
+    token = cached.get("authorization", "")
 
-    sign_result = daily_sign(token)
+    def do_login():
+        t = code_login(entry)
+        if t:
+            c = read_token_cache()
+            c[wxid] = {"authorization": t}
+            write_token_cache(c)
+            print("  [缓存] 新登录 token 已写入缓存")
+        return t
+
+    if token:
+        print(f"  [缓存] 使用缓存 token: {token[:12]}...")
+        pt = get_points(token)
+        if not pt.get("success"):
+            print("  [重登] 缓存 token 已失效，清除缓存重新登录...")
+            cache = read_token_cache()
+            cache.pop(wxid, None)
+            write_token_cache(cache)
+            token = ""
+
+    if not token:
+        token = do_login()
+        if not token:
+            print("❌ 登录失败，跳过")
+            return False
+
+    daily_sign(token)
     get_points(token)
     time.sleep(1)
     return True
