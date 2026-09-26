@@ -1,7 +1,27 @@
 // name: 腾讯地图
 // cron: 0 8,20 * * *
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
 const crypto = require("crypto");
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "txdt_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
 // ====================== YYB Go 账号（环境变量 YYB_SERVER = 地址@微信账号标识，多行） ======================
 const SERVERS = (process.env.YYB_SERVER || "")
     .split(/\r?\n/)
@@ -284,7 +304,11 @@ class TencentMap {
             },
             data,
         });
-        if (status !== 200 || Number(body?.code) !== 0) throw new Error(`${apiPath} HTTP ${status}: ${short(body)}`);
+        if (status !== 200 || Number(body?.code) !== 0) {
+            const err = new Error(`${apiPath} HTTP ${status}: ${short(body)}`);
+            err.authFail = true;
+            throw err;
+        }
         return body.data || {};
     }
 
@@ -350,13 +374,47 @@ class TencentMap {
 
     async run() {
         console.log(`\n========== ${APP.name} 账号[${this.index}] ${this.account.remark || this.openid} ==========`);
-        await this.miniLogin();
-        await this.queryUser();
-        await this.queryBalance("签到前现金余额");
-        await this.queryAssets();
-        await this.checkin();
-        await this.queryBalance("签到后现金余额");
-        await this.queryCalendar("签到后");
+
+        // 尝试缓存（不过期，业务失败自动重登）
+        let usedCache = false;
+        const cache = readTokenCache();
+        const cached = cache[this.server] || {};
+        if (cached.user_id && cached.openid) {
+            this.loginInfo = { ...cached, appId: APP.appid };
+            usedCache = true;
+            console.log(`💾 登录：使用缓存 userId=${cached.user_id} openid=${cached.openid}`);
+        }
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                if (attempt === 1 || !this.loginInfo.user_id) {
+                    if (attempt === 1) {
+                        console.log("🔄 登录凭据失效，重新登录...");
+                        const c = readTokenCache();
+                        delete c[this.server];
+                        writeTokenCache(c);
+                    }
+                    await this.miniLogin();
+                    const c = readTokenCache();
+                    c[this.server] = { ...this.loginInfo };
+                    writeTokenCache(c);
+                }
+                await this.queryUser();
+                await this.queryBalance("签到前现金余额");
+                await this.queryAssets();
+                await this.checkin();
+                await this.queryBalance("签到后现金余额");
+                await this.queryCalendar("签到后");
+                break;
+            } catch (e) {
+                console.log(`账号[${this.index}] 执行失败：${e.message || e}`);
+                if (usedCache && attempt === 0 && e.authFail) {
+                    console.log("⚠️ 登录凭据失效，准备重登");
+                    continue;
+                }
+                break;
+            }
+        }
     }
 }
 

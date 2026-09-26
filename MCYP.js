@@ -37,7 +37,8 @@ const AES_KEY_HEX = '0f9f8b1e791f754d2ded9dfb38a4b628';
 const AES_IV_HEX = '31323334353637383930313233343535';
 const SIGN_PREFIX = '#storeexpress1.0#ffe232&t%4df!67sx55eas#';
 const LOGIN_URL = 'https://cdn-storeexpress.miniso.com/wechat/login';
-const CACHE_FILE = path.join(__dirname, 'mcypcookie.json');
+const TOKEN_CACHE_DIR = path.join(__dirname, 'token_caches');
+const CACHE_FILE = path.join(TOKEN_CACHE_DIR, 'mcyp_token_cache.json');
 const DEFAULT_STORE_ID = 'Z6XV';
 
 // ====================== 工具函数 ======================
@@ -66,20 +67,19 @@ function calcStoreExpressSign(time, nonce) {
     return CryptoJS.MD5(str).toString().toUpperCase();
 }
 
-function loadCache() {
+function readTokenCache() {
     try {
-        if (fs.existsSync(CACHE_FILE)) {
-            const data = fs.readFileSync(CACHE_FILE, 'utf-8');
-            return JSON.parse(data);
-        }
+        if (!fs.existsSync(CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(CACHE_FILE, 'utf-8')) || {};
     } catch (e) {
         console.log('读取缓存文件失败，将重新获取token');
+        return {};
     }
-    return {};
 }
 
-function saveCache(cache) {
+function writeTokenCache(cache) {
     try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
         fs.writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2), 'utf-8');
     } catch (e) {
         console.log('写入缓存文件失败:', e.message);
@@ -570,10 +570,11 @@ async function main() {
     console.log('│ 名创优品小程序签到 │');
     console.log('└─────────────────────────────┘');
 
-    const cache = loadCache();
+    const cache = readTokenCache();
 
     for (let i = 0; i < SERVERS.length; i++) {
-        const { server, ref } = parseYybGoEntry(SERVERS[i]);
+        const entry = SERVERS[i];
+        const { server, ref } = parseYybGoEntry(entry);
         if (!server || !ref) {
             console.log(`✗ YYB_SERVER 第${i + 1}行格式无效，跳过`);
             continue;
@@ -581,7 +582,7 @@ async function main() {
 
         console.log(`\n┌─ 账号${i + 1} (${ref}) ──────────┐`);
 
-        let userInfo = cache[ref];
+        let userInfo = cache[entry];
         let needRefresh = !userInfo || !userInfo.skey;
 
         if (needRefresh) {
@@ -592,26 +593,27 @@ async function main() {
                 console.log('└────────────────────────────┘');
                 continue;
             }
-            cache[ref] = { ...userInfo, updateTime: Date.now() };
-            saveCache(cache);
+            cache[entry] = { ...userInfo };
+            writeTokenCache(cache);
             console.log('✓ token获取成功，已更新缓存');
         } else {
-            console.log('→ 使用本地缓存token');
+            console.log('💾 使用缓存token');
         }
 
         const bot = new MinisoBot(userInfo);
         const testResult = await bot.getVirtualCoinInfo();
 
         if (!testResult) {
-            console.log('→ token已失效，重新获取...');
+            console.log('🔄 token已失效，清除缓存重新获取...');
+            delete cache[entry];
             userInfo = await refreshAccountToken(server, ref);
             if (!userInfo) {
                 console.log('✗ token刷新失败，跳过此账号');
                 console.log('└────────────────────────────┘');
                 continue;
             }
-            cache[ref] = { ...userInfo, updateTime: Date.now() };
-            saveCache(cache);
+            cache[entry] = { ...userInfo };
+            writeTokenCache(cache);
             console.log('✓ token刷新成功，重新执行');
             const newBot = new MinisoBot(userInfo);
             await newBot.executeAllTasks();
@@ -629,7 +631,7 @@ async function main() {
         console.log('└────────────────────────────┘');
     }
 
-    saveCache(cache);
+    writeTokenCache(cache);
     console.log('\n┌─────────────────────────────┐');
     console.log('│ 所有账户任务处理完成 │');
     console.log('└─────────────────────────────┘');

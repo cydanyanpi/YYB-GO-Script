@@ -1,6 +1,27 @@
 // name: 谷雨会员+
 // cron: 30 9 * * 1
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "gyhy_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
+
 /* __YYB_SERVER_DOLLAR_SHIM__ */
 if (typeof $ === 'undefined') {
   const __path = require('path');
@@ -95,16 +116,49 @@ class Task {
     async run() {
         //随机延迟5-30s 模拟人工操作
         await await sleep(Math.floor(Math.random() * 20 + 5) * 1000);
-        let code = await getCode(this.server)
-        if (code) {
-            await this.getUserToken(code)
+
+        // 尝试缓存（不过期，鉴权失败自动重登）
+        const cache = readTokenCache();
+        const cached = cache[this.server] || {};
+        let usedCache = false;
+        if (cached.token) {
+            this.token = cached.token;
+            usedCache = true;
+            console.log(`💾 账号[${this.index}] 使用缓存token`);
         }
-        if (!this.token) {
-            console.log(`账号[${this.index}] 获取用户Token失败❌`)
-            return
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (attempt === 1 || !this.token) {
+                if (attempt === 1) {
+                    console.log(`🔄 账号[${this.index}] token失效，重新登录...`);
+                    const c = readTokenCache();
+                    delete c[this.server];
+                    writeTokenCache(c);
+                }
+                this.token = null;
+                let code = await getCode(this.server)
+                if (code) {
+                    await this.getUserToken(code)
+                }
+                if (!this.token) {
+                    console.log(`账号[${this.index}] 获取用户Token失败❌`)
+                    return
+                }
+                const c = readTokenCache();
+                c[this.server] = { token: this.token };
+                writeTokenCache(c);
+            }
+
+            const signOk = await this.signIn();
+            await this.getUserPoints();
+
+            // 缓存token签到失败（鉴权失效）→ 重登重试一次
+            if (usedCache && attempt === 0 && !signOk) {
+                console.log(`⚠️ 账号[${this.index}] 签到返回失败，判定token失效`);
+                continue;
+            }
+            break;
         }
-        await this.signIn()
-        await this.getUserPoints()
     }
     async getUserToken(code) {
         let data = JSON.stringify({
@@ -222,8 +276,10 @@ class Task {
         if (result?.success) {
             //打印签到结果
             console.log(`🌸账号[${this.index}]` + `签到成功`);
+            return true;
         } else {
             console.log(`🌸账号[${this.index}] 签到-失败:${result.msg}❌`)
+            return false;
         }
 
     }

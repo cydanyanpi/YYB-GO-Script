@@ -85,6 +85,30 @@ VISIT_PAGE_WAIT_SECONDS = 10
 VISIT_PAGE_DAILY_LIMIT = 2
 
 
+# ==================== Token 缓存（不过期，失效自动重登） ====================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "qqhyjlb_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"⚠️ [缓存] 写入失败: {exc}")
+
+
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -516,15 +540,43 @@ def run_account(index: int, total: int, server_entry: str) -> Dict[str, Any]:
     print(f"  [延迟] 启动延迟 {delay}s")
     sleep(delay)
 
-    code = get_wx_code(server_entry)
-    if not code:
-        result["error"] = "获取 code 失败"
-        return result
+    cache = read_token_cache()
+    cached = cache.get(wxid) or {}
+    token = cached.get("token", "")
+    uid = str(cached.get("uid", ""))
+    used_cache = bool(token and uid)
+    if token:
+        print(f"💾 [缓存] 使用缓存token: {mask(token)}")
 
-    token, uid, raw_login = login_by_code(parsed_server, code, proxies)
-    if not token or not uid:
-        result["error"] = f"登录失败: {json_preview(raw_login)}"
-        return result
+    for attempt in range(2):
+        if attempt == 1 or not token:
+            if attempt == 1:
+                print("🔄 [重登] token失效，重新登录")
+                cache = read_token_cache()
+                if wxid in cache:
+                    del cache[wxid]
+                    write_token_cache(cache)
+            code = get_wx_code(server_entry)
+            if not code:
+                result["error"] = "获取 code 失败"
+                return result
+            token, uid, raw_login = login_by_code(parsed_server, code, proxies)
+            if not token or not uid:
+                result["error"] = f"登录失败: {json_preview(raw_login)}"
+                return result
+            cache = read_token_cache()
+            cache[wxid] = {"token": token, "uid": uid}
+            write_token_cache(cache)
+            print(f"✅ [登录] 登录成功：uid: {mask_uid(uid)}")
+
+        probe = api_post(parsed_server, SIGN_URL, token, uid, proxies)
+        probe_msg = str(probe.get("message", ""))
+        probe_ok = probe.get("success", False) or probe.get("status", "1") == "0"
+        auth_like = any(k in probe_msg for k in ("登录", "未登录", "授权", "失效"))
+        if not probe_ok and auth_like and attempt == 0 and used_cache:
+            print(f"🔄 [重登] 缓存token失效：{probe_msg}")
+            continue
+        break
 
     result["token"] = mask(token)
     result["uid"] = uid

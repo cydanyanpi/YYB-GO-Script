@@ -83,6 +83,29 @@ USER_AGENT = (
 
 REFERER = f"https://servicewechat.com/{APPID}/1319/page-frame.html"
 
+# ============ Token 缓存 ============
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "thyc_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"  [缓存] 写入失败: {exc}")
+
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -522,61 +545,103 @@ def run_account(index: int, total: int, server: str) -> Dict[str, Any]:
     print(f"⏳ [延迟] 启动延迟 {delay}s")
     sleep(delay)
 
-    code = get_code(server)
-    if not code:
-        result["error"] = "获取 code 失败"
-        return result
+    parsed_server, ref = parse_yyb_go_entry(server)
 
-    user_session, nick_name, raw_login = login_by_code(server, code, proxies)
-    if not user_session:
-        result["error"] = f"登录失败: {json_preview(raw_login)}"
-        return result
+    # 尝试读取缓存的 userSession（不过期，业务失败自动重登）
+    cache = read_token_cache()
+    cached = cache.get(ref) or {}
+    user_session = cached.get("userSession", "")
+    nick_name = cached.get("nickName", "")
+
+    def do_login():
+        nonlocal user_session, nick_name
+        code = get_code(server)
+        if not code:
+            result["error"] = "\u83b7\u53d6 code \u5931\u8d25"
+            return False
+        us, nn, raw_login = login_by_code(server, code, proxies)
+        if not us:
+            result["error"] = f"\u767b\u5f55\u5931\u8d25: {json_preview(raw_login)}"
+            return False
+        user_session = us
+        nick_name = nn
+        cache[ref] = {"userSession": user_session, "nickName": nick_name}
+        write_token_cache(cache)
+        print("  [\u7f13\u5b58] \u65b0\u767b\u5f55 session \u5df2\u5199\u5165\u7f13\u5b58")
+        return True
+
+    if user_session:
+        print(f"  [\u7f13\u5b58] \u4f7f\u7528\u7f13\u5b58 session: {mask(user_session)}")
+    else:
+        if not do_login():
+            return result
 
     result["nickname"] = nick_name
     result["session"] = mask(user_session)
 
-    try:
-        print("📊 [积分] 查询签到前积分和状态...")
+    def exec_biz():
+        """执行签到业务，返回 (是否成功, 错误信息)。失败同时写 result。"""
+        print("\U0001f4ca [\u79ef\u5206] \u67e5\u8be2\u7b7e\u5230\u524d\u79ef\u5206\u548c\u72b6\u6001...")
         sign_status, before_integral, raw_info = get_sign_info(server, user_session, proxies)
 
         if sign_status is None:
-            result["error"] = f"查询签到状态失败: {json_preview(raw_info)}"
-            return result
+            return False, f"\u67e5\u8be2\u7b7e\u5230\u72b6\u6001\u5931\u8d25: {json_preview(raw_info)}"
 
         result["beforeIntegral"] = str(before_integral)
 
         if sign_status:
-            result["signMsg"] = "今日已签到"
+            result["signMsg"] = "\u4eca\u65e5\u5df2\u7b7e\u5230"
             result["afterIntegral"] = str(before_integral)
             result["earnedIntegral"] = "0"
-            print("✅ [签到] 今日已签到")
+            print("\u2705 [\u7b7e\u5230] \u4eca\u65e5\u5df2\u7b7e\u5230")
         else:
-            print("📝 [签到] 未签到，开始签到...")
+            print("\U0001f4dd [\u7b7e\u5230] \u672a\u7b7e\u5230\uff0c\u5f00\u59cb\u7b7e\u5230...")
             sign_ok, sign_msg, reward_integral, _ = submit_signin(server, user_session, proxies)
             result["signMsg"] = sign_msg
             result["earnedIntegral"] = str(reward_integral)
 
             if sign_ok:
-                print(f"✅ [签到] {sign_msg}")
+                print(f"\u2705 [\u7b7e\u5230] {sign_msg}")
             else:
-                print(f"⚠️ [签到] {sign_msg}")
-                result["error"] = sign_msg
-                return result
+                print(f"\u26a0\ufe0f [\u7b7e\u5230] {sign_msg}")
+                return False, sign_msg
 
             sleep(random.randint(1, 2))
-            print("📊 [积分] 查询签到后积分...")
+            print("\U0001f4ca [\u79ef\u5206] \u67e5\u8be2\u7b7e\u5230\u540e\u79ef\u5206...")
             _, after_integral, raw_after = get_sign_info(server, user_session, proxies)
             result["afterIntegral"] = str(after_integral)
 
             if reward_integral == 0:
                 result["earnedIntegral"] = str(after_integral - before_integral)
+        return True, ""
+
+    try:
+        ok, err = exec_biz()
+
+        # 业务首次失败（用缓存 token 时判定为鉴权失效）-> 清缓存重登重试一次
+        if not ok:
+            print("  [\u91cd\u767b] \u4e1a\u52a1\u5931\u8d25\uff0c\u5224\u5b9a\u767b\u5f55\u6001\u5931\u6548\uff0c\u6e05\u9664\u7f13\u5b58\u91cd\u65b0\u767b\u5f55...")
+            if ref in cache:
+                del cache[ref]
+                write_token_cache(cache)
+            if do_login():
+                result["nickname"] = nick_name
+                result["session"] = mask(user_session)
+                # \u91cd\u7f6e\u4e0a\u6b21\u5931\u8d25\u7ed3\u6790
+                for k in ("signMsg", "beforeIntegral", "afterIntegral", "earnedIntegral"):
+                    result[k] = "0" if k in ("beforeIntegral", "afterIntegral", "earnedIntegral") else "-"
+                ok, err = exec_biz()
+
+        if not ok:
+            result["error"] = err
+            return result
 
         result["success"] = True
         return result
 
     except Exception as exc:
         result["error"] = traceback.format_exc().strip()
-        print(f"❌ [账号] 执行失败: {exc}")
+        print(f"\u274c [\u8d26\u53f7] \u6267\u884c\u5931\u8d25: {exc}")
         return result
 
 

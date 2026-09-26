@@ -118,6 +118,34 @@ USER_AGENT = (
 )
 
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "dsl_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"  [缓存] 写入失败: {exc}")
+
+
+def is_auth_fail_msg(msg: Any) -> bool:
+    import re
+    return bool(re.search(r'登录|未登录|授权|token|失效|过期|登录态|请重新|身份|凭证|mini_token', str(msg), re.IGNORECASE))
+
+
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -681,361 +709,387 @@ def run_account(index: int, total: int, server_entry: str) -> Dict[str, Any]:
     print(f"⏳ [延迟] 启动延迟 {delay}s")
     sleep(delay)
 
-    code = get_code(server_entry)
-    if not code:
-        result["error"] = "获取 code 失败"
-        return result
+    # 尝试缓存 mini_token + mobile（不过期，业务鉴权失败自动重登）
+    cache = read_token_cache()
+    cached = cache.get(wxid) or {}
+    mini_token = cached.get("mini_token", "")
+    mobile = cached.get("mobile", "")
+    used_cache = bool(mini_token)
+    if mini_token:
+        print(f"  [缓存] 使用缓存mini_token: {mask(mini_token)}")
 
-    mini_token, raw_login = login_by_code(parsed_server, code, proxies)
-    if not mini_token:
-        result["error"] = f"登录失败: {json_preview(raw_login)}"
-        return result
+    for relogin_attempt in range(2):
+        if relogin_attempt == 1 or not mini_token:
+            if relogin_attempt == 1:
+                print("  [重登] mini_token失效，重新登录...")
+                cache = read_token_cache()
+                if wxid in cache:
+                    del cache[wxid]
+                    write_token_cache(cache)
+            code = get_code(server_entry)
+            if not code:
+                result["error"] = "获取 code 失败"
+                return result
 
-    result["miniToken"] = mask(mini_token)
+            mini_token, raw_login = login_by_code(parsed_server, code, proxies)
+            if not mini_token:
+                result["error"] = f"登录失败: {json_preview(raw_login)}"
+                return result
 
-    mobile = extract_mobile(raw_login) or ""
-    if mobile:
-        print(f"📱 [用户] 手机号: {mask(mobile)}")
-    else:
-        print(f"⚠️ [用户] 未获取到手机号")
+            mobile = extract_mobile(raw_login) or ""
+            cache = read_token_cache()
+            cache[wxid] = {"mini_token": mini_token, "mobile": mobile}
+            write_token_cache(cache)
 
-    try:
-        # 等级信息
-        level_info_resp = api_get(
-            parsed_server,
-            f"{USER_LEVEL_INFO_URL}?mini_token={mini_token}&activityId={ACTIVITY_ID}",
-            mini_token, proxies,
-        )
-        if level_info_resp.get("resp_code") == "0000":
-            datas = level_info_resp.get("datas", {})
-            level = datas.get("level", 0)
-            level_name = datas.get("levelName", "未知")
-            drip_total = to_int(datas.get("dripTotal"))
-            watering_times = to_int(datas.get("wateringTimes"))
-            tips = datas.get("tips", "")
-            result["dripNum"] = drip_total
-            result["levelInfo"] = f"等级{level}({level_name}) 水滴{drip_total} 浇水{watering_times}次"
-            print(f"✅ [等级] {result['levelInfo']}")
-            print(f"💡 [提示] {tips}")
+        result["miniToken"] = mask(mini_token)
+
+        if mobile:
+            print(f"📱 [用户] 手机号: {mask(mobile)}")
         else:
-            result["levelInfo"] = level_info_resp.get("resp_msg") or "获取等级信息失败"
-            print(f"⚠️ [等级] {result['levelInfo']}")
+            print(f"⚠️ [用户] 未获取到手机号")
 
-        sleep(2)
+        try:
+            # 等级信息
+            level_info_resp = api_get(
+                parsed_server,
+                f"{USER_LEVEL_INFO_URL}?mini_token={mini_token}&activityId={ACTIVITY_ID}",
+                mini_token, proxies,
+            )
+            if level_info_resp.get("resp_code") == "0000":
+                datas = level_info_resp.get("datas", {})
+                level = datas.get("level", 0)
+                level_name = datas.get("levelName", "未知")
+                drip_total = to_int(datas.get("dripTotal"))
+                watering_times = to_int(datas.get("wateringTimes"))
+                tips = datas.get("tips", "")
+                result["dripNum"] = drip_total
+                result["levelInfo"] = f"等级{level}({level_name}) 水滴{drip_total} 浇水{watering_times}次"
+                print(f"✅ [等级] {result['levelInfo']}")
+                print(f"💡 [提示] {tips}")
+            else:
+                l_msg = level_info_resp.get("resp_msg") or "获取等级信息失败"
+                if relogin_attempt == 0 and used_cache and is_auth_fail_msg(l_msg):
+                    print(f"  [重登] 等级信息鉴权失败({l_msg})，重新登录...")
+                    mini_token = None
+                    continue
+                result["levelInfo"] = l_msg
+                print(f"⚠️ [等级] {result['levelInfo']}")
 
-        # 积分商城签到
-        print("🎁 [积分] 开始积分商城签到...")
-        user_info = {"phone": mobile, "mobile": mobile}
-        integral_sign_result = process_integral_sign(parsed_server, mini_token, user_info, proxies)
-        if integral_sign_result["success"]:
-            print(f"✅ [积分] {integral_sign_result['message']}")
-        else:
-            print(f"⚠️ [积分] {integral_sign_result['message']}")
-        result["integralSignMsg"] = integral_sign_result["message"]
+            sleep(2)
 
-        sleep(2)
+            # 积分商城签到
+            print("🎁 [积分] 开始积分商城签到...")
+            user_info = {"phone": mobile, "mobile": mobile}
+            integral_sign_result = process_integral_sign(parsed_server, mini_token, user_info, proxies)
+            if integral_sign_result["success"]:
+                print(f"✅ [积分] {integral_sign_result['message']}")
+            else:
+                print(f"⚠️ [积分] {integral_sign_result['message']}")
+            result["integralSignMsg"] = integral_sign_result["message"]
 
-        # 优惠券领取
-        print("🎁 [优惠券] 开始领取优惠券...")
-        coupon_claim_result = claim_coupons(parsed_server, mini_token, proxies)
-        if coupon_claim_result[0]:
-            print(f"✅ [优惠券] {coupon_claim_result[1]}")
-        else:
-            print(f"⚠️ [优惠券] {coupon_claim_result[1]}")
-        result["couponClaimMsg"] = coupon_claim_result[1]
+            sleep(2)
 
-        sleep(2)
+            # 优惠券领取
+            print("🎁 [优惠券] 开始领取优惠券...")
+            coupon_claim_result = claim_coupons(parsed_server, mini_token, proxies)
+            if coupon_claim_result[0]:
+                print(f"✅ [优惠券] {coupon_claim_result[1]}")
+            else:
+                print(f"⚠️ [优惠券] {coupon_claim_result[1]}")
+            result["couponClaimMsg"] = coupon_claim_result[1]
 
-        # 签到任务
-        print("🔍 [签到] 获取任务列表...")
-        user_tasks_resp = api_get(
-            parsed_server,
-            f"{USER_TASKS_URL}?mini_token={mini_token}&activityId={ACTIVITY_ID}",
-            mini_token, proxies,
-        )
+            sleep(2)
 
-        current_sign_task_id = DAILY_SIGN_TASK_ID
-        if user_tasks_resp.get("resp_code") == "0000":
-            tasks = user_tasks_resp.get("datas", {}).get("userTaskInfos", [])
-            if tasks:
-                for task in tasks:
-                    task_name = task.get("showTaskName", "")
-                    task_type = task.get("taskType", "")
-                    task_id = task.get("taskId", "")
-                    if task_type == 6 or "签到" in task_name:
-                        current_sign_task_id = task_id
-                        print(f"🎯 [签到] 找到签到任务: {task_name} (ID: {task_id})")
+            # 签到任务
+            print("🔍 [签到] 获取任务列表...")
+            user_tasks_resp = api_get(
+                parsed_server,
+                f"{USER_TASKS_URL}?mini_token={mini_token}&activityId={ACTIVITY_ID}",
+                mini_token, proxies,
+            )
+
+            current_sign_task_id = DAILY_SIGN_TASK_ID
+            if user_tasks_resp.get("resp_code") == "0000":
+                tasks = user_tasks_resp.get("datas", {}).get("userTaskInfos", [])
+                if tasks:
+                    for task in tasks:
+                        task_name = task.get("showTaskName", "")
+                        task_type = task.get("taskType", "")
+                        task_id = task.get("taskId", "")
+                        if task_type == 6 or "签到" in task_name:
+                            current_sign_task_id = task_id
+                            print(f"🎯 [签到] 找到签到任务: {task_name} (ID: {task_id})")
+                            break
+
+            # 检查今日签到状态
+            drip_water_resp = api_get(
+                parsed_server,
+                f"{USER_DRIP_WATER_URL}?mini_token={mini_token}&activityId={ACTIVITY_ID}&pageNo=1&pageSize=20",
+                mini_token, proxies,
+            )
+
+            has_today_sign_record = False
+            if drip_water_resp.get("resp_code") == "0000":
+                results_list = drip_water_resp.get("datas", {}).get("results", [])
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                for record in results_list:
+                    if today_str in record.get("recordTime", "") and "签到" in record.get("waterName", ""):
+                        has_today_sign_record = True
+                        print(f"✅ [签到] 今日已签到")
                         break
 
-        # 检查今日签到状态
-        drip_water_resp = api_get(
-            parsed_server,
-            f"{USER_DRIP_WATER_URL}?mini_token={mini_token}&activityId={ACTIVITY_ID}&pageNo=1&pageSize=20",
-            mini_token, proxies,
-        )
-
-        has_today_sign_record = False
-        if drip_water_resp.get("resp_code") == "0000":
-            results_list = drip_water_resp.get("datas", {}).get("results", [])
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            for record in results_list:
-                if today_str in record.get("recordTime", "") and "签到" in record.get("waterName", ""):
-                    has_today_sign_record = True
-                    print(f"✅ [签到] 今日已签到")
-                    break
-
-        if not has_today_sign_record:
-            print("🎯 [签到] 开始执行每日签到...")
-            sign_success = False
-            sign_msg = "签到失败"
-            for attempt in range(1, 4):
-                try:
-                    sign_task_resp = api_post(
-                        parsed_server,
-                        f"{ADD_TASK_RECORD_URL}?mini_token={mini_token}",
-                        mini_token, proxies,
-                        {"activityId": ACTIVITY_ID, "taskId": current_sign_task_id, "storeNo": STORE_NO, "mini_token": mini_token},
-                    )
-                    if sign_task_resp and sign_task_resp.get("resp_code") == "0000":
-                        datas = sign_task_resp.get("datas")
-                        if datas and isinstance(datas, dict):
-                            award_num = datas.get("awardNum", 0)
-                            if award_num > 0:
-                                result["signDripMsg"] = f"签到成功，+{award_num}水滴"
-                                sign_success = True
-                                sign_msg = result["signDripMsg"]
-                                print(f"✅ [签到] 第 {attempt} 次签到成功，奖励 {award_num} 水滴")
-                                break
-                        # datas为null或award为0，检查水滴明细确认
-                        sleep(2)
-                        check_resp = api_get(
+            if not has_today_sign_record:
+                print("🎯 [签到] 开始执行每日签到...")
+                sign_success = False
+                sign_msg = "签到失败"
+                for attempt in range(1, 4):
+                    try:
+                        sign_task_resp = api_post(
                             parsed_server,
-                            f"{USER_DRIP_WATER_URL}?mini_token={mini_token}&activityId={ACTIVITY_ID}&pageNo=1&pageSize=20",
+                            f"{ADD_TASK_RECORD_URL}?mini_token={mini_token}",
                             mini_token, proxies,
+                            {"activityId": ACTIVITY_ID, "taskId": current_sign_task_id, "storeNo": STORE_NO, "mini_token": mini_token},
                         )
-                        if check_resp.get("resp_code") == "0000":
-                            for record in check_resp.get("datas", {}).get("results", []):
-                                if today_str in record.get("recordTime", "") and "签到" in record.get("waterName", ""):
-                                    drip_num = record.get("dripNum", 0)
-                                    result["signDripMsg"] = f"签到成功，+{drip_num}水滴"
+                        if sign_task_resp and sign_task_resp.get("resp_code") == "0000":
+                            datas = sign_task_resp.get("datas")
+                            if datas and isinstance(datas, dict):
+                                award_num = datas.get("awardNum", 0)
+                                if award_num > 0:
+                                    result["signDripMsg"] = f"签到成功，+{award_num}水滴"
                                     sign_success = True
                                     sign_msg = result["signDripMsg"]
-                                    print(f"✅ [签到] 水滴明细确认签到成功")
+                                    print(f"✅ [签到] 第 {attempt} 次签到成功，奖励 {award_num} 水滴")
                                     break
-                        if sign_success:
-                            break
-                    else:
-                        error_msg = sign_task_resp.get('resp_msg') if sign_task_resp else "响应为空"
-                        print(f"⚠️ [签到] 第 {attempt} 次签到失败：{error_msg}")
-                except Exception as exc:
-                    print(f"❌ [签到] 第 {attempt} 次签到异常: {exc}")
-                if attempt < 3:
-                    sleep(3)
-            if not sign_success:
-                result["signDripMsg"] = sign_msg
-        else:
-            result["signDripMsg"] = "今日已签到"
-
-        sleep(2)
-
-        # 水滴收集
-        print("🎯 [水滴] 开始执行水滴收集...")
-        total_collected_drip = 0
-        for loop_num in range(1, 3):
-            new_drip_resp = api_get(
-                parsed_server,
-                f"{USER_NEW_DRIP_URL}?mini_token={mini_token}&activityId={ACTIVITY_ID}",
-                mini_token, proxies,
-            )
-            if new_drip_resp.get("resp_code") == "0000":
-                new_drip_list = new_drip_resp.get("datas", [])
-                if new_drip_list:
-                    loop_total_drip = sum(to_int(item.get("dripNum", 0)) for item in new_drip_list)
-                    all_drip_record_ids = []
-                    for drip_item in new_drip_list:
-                        drip_record_ids = drip_item.get("dripRecordIds", [])
-                        all_drip_record_ids.extend(drip_record_ids)
-                    if all_drip_record_ids:
-                        get_drip_resp = api_post(
-                            parsed_server,
-                            f"{GET_DRIP_URL}?mini_token={mini_token}",
-                            mini_token, proxies,
-                            {"dripRecordIds": all_drip_record_ids, "mini_token": mini_token},
-                        )
-                        if get_drip_resp.get("resp_code") == "0000":
-                            total_collected_drip += loop_total_drip
-                            print(f"✅ [水滴] 第 {loop_num} 次成功领取 {loop_total_drip} 水滴")
-            if loop_num < 2:
-                sleep(3)
-
-        if total_collected_drip > 0:
-            result["signDripMsg"] += f"，领取{total_collected_drip}水滴"
-
-        sleep(2)
-
-        # 浇水
-        print("🔍 [浇水] 检查当前水滴数量...")
-        current_level_info_resp = api_get(
-            parsed_server,
-            f"{USER_LEVEL_INFO_URL}?mini_token={mini_token}&activityId={ACTIVITY_ID}",
-            mini_token, proxies,
-        )
-        current_drip_total = 0
-        if current_level_info_resp.get("resp_code") == "0000":
-            current_drip_total = to_int(current_level_info_resp.get("datas", {}).get("dripTotal"))
-            print(f"💧 [浇水] 当前水滴数量: {current_drip_total}")
-
-        watering_count = 0
-        upgrade_happened = False
-        while current_drip_total >= 20:
-            watering_count += 1
-            watering_resp = api_post(
-                parsed_server,
-                f"{WATERING_URL}?mini_token={mini_token}",
-                mini_token, proxies,
-                {"activityId": ACTIVITY_ID, "dripNum": 20, "storeNo": STORE_NO, "mini_token": mini_token},
-            )
-            if watering_resp.get("resp_code") == "0000":
-                datas = watering_resp.get("datas", {})
-                upgrade = datas.get("upgrade", False)
-                if upgrade:
-                    upgrade_happened = True
-                    print(f"🎉 [浇水] 第 {watering_count} 次浇水成功，人参升级")
-                else:
-                    print(f"✅ [浇水] 第 {watering_count} 次浇水成功")
-                current_drip_total -= 20
-                if current_drip_total >= 20:
-                    sleep(2)
-            else:
-                print(f"⚠️ [浇水] 第 {watering_count} 次浇水失败：{watering_resp.get('resp_msg')}")
-                break
-
-        if watering_count > 0:
-            result["wateringMsg"] = f"浇水{watering_count}次" + ("，人参升级" if upgrade_happened else "成功")
-        else:
-            result["wateringMsg"] = f"水滴不足20，当前{current_drip_total}，跳过浇水"
-            print(f"⏭️ [浇水] {result['wateringMsg']}")
-
-        sleep(2)
-
-        # 浏览任务
-        user_tasks_resp = api_get(
-            parsed_server,
-            f"{USER_TASKS_URL}?activityId={ACTIVITY_ID}&storeNo={STORE_NO}&type=1&mini_token={mini_token}",
-            mini_token, proxies,
-        )
-        browse_task_results = []
-        if user_tasks_resp.get("resp_code") == "0000":
-            user_task_infos = user_tasks_resp.get("datas", {}).get("userTaskInfos", [])
-            for task in BROWSE_TASKS:
-                for task_info in user_task_infos:
-                    if task_info.get("taskId") == task["id"]:
-                        complete_num = to_int(task_info.get("completeNum", 0))
-                        time_drip_num = to_int(task_info.get("timeDripNum", 0))
-                        show_task_name = task_info.get("showTaskName", task["name"])
-                        if complete_num < time_drip_num:
-                            try:
-                                params = task["params"].copy()
-                                params["mini_token"] = mini_token
-                                url = f"{task['url']}?{'&'.join([f'{k}={v}' for k, v in params.items()])}"
-                                request_with_proxy("GET", url, headers=common_headers(), proxies=proxies, server=parsed_server)
-                                sleep(2)
-                                add_task_resp = api_post(
-                                    parsed_server,
-                                    f"{ADD_TASK_RECORD_URL}?mini_token={mini_token}",
-                                    mini_token, proxies,
-                                    {"activityId": ACTIVITY_ID, "taskId": task["id"], "storeNo": STORE_NO, "mini_token": mini_token},
-                                )
-                                if add_task_resp.get("resp_code") == "0000":
-                                    print(f"✅ [浏览] {show_task_name} 任务添加成功")
-                                sleep(3)
-                                browse_task_results.append(show_task_name)
-                            except Exception as exc:
-                                print(f"⚠️ [浏览] {show_task_name} 失败: {exc}")
+                            # datas为null或award为0，检查水滴明细确认
+                            sleep(2)
+                            check_resp = api_get(
+                                parsed_server,
+                                f"{USER_DRIP_WATER_URL}?mini_token={mini_token}&activityId={ACTIVITY_ID}&pageNo=1&pageSize=20",
+                                mini_token, proxies,
+                            )
+                            if check_resp.get("resp_code") == "0000":
+                                for record in check_resp.get("datas", {}).get("results", []):
+                                    if today_str in record.get("recordTime", "") and "签到" in record.get("waterName", ""):
+                                        drip_num = record.get("dripNum", 0)
+                                        result["signDripMsg"] = f"签到成功，+{drip_num}水滴"
+                                        sign_success = True
+                                        sign_msg = result["signDripMsg"]
+                                        print(f"✅ [签到] 水滴明细确认签到成功")
+                                        break
+                            if sign_success:
+                                break
                         else:
-                            print(f"✅ [浏览] {show_task_name} 今日已完成")
-                        break
-            if browse_task_results:
-                result["browseTasksMsg"] = f"完成浏览: {', '.join(browse_task_results)}"
+                            error_msg = sign_task_resp.get('resp_msg') if sign_task_resp else "响应为空"
+                            print(f"⚠️ [签到] 第 {attempt} 次签到失败：{error_msg}")
+                    except Exception as exc:
+                        print(f"❌ [签到] 第 {attempt} 次签到异常: {exc}")
+                    if attempt < 3:
+                        sleep(3)
+                if not sign_success:
+                    result["signDripMsg"] = sign_msg
             else:
-                result["browseTasksMsg"] = "所有浏览任务已完成"
-        else:
-            result["browseTasksMsg"] = "获取任务列表失败"
+                result["signDripMsg"] = "今日已签到"
 
-        # 浏览任务后收集水滴
-        if browse_task_results:
-            sleep(5)
+            sleep(2)
+
+            # 水滴收集
+            print("🎯 [水滴] 开始执行水滴收集...")
+            total_collected_drip = 0
             for loop_num in range(1, 3):
-                new_drip_after = api_get(
+                new_drip_resp = api_get(
                     parsed_server,
                     f"{USER_NEW_DRIP_URL}?mini_token={mini_token}&activityId={ACTIVITY_ID}",
                     mini_token, proxies,
                 )
-                if new_drip_after.get("resp_code") == "0000":
-                    new_drip_list_after = new_drip_after.get("datas", [])
-                    if new_drip_list_after:
-                        all_ids = []
-                        for item in new_drip_list_after:
-                            all_ids.extend(item.get("dripRecordIds", []))
-                        if all_ids:
-                            api_post(
+                if new_drip_resp.get("resp_code") == "0000":
+                    new_drip_list = new_drip_resp.get("datas", [])
+                    if new_drip_list:
+                        loop_total_drip = sum(to_int(item.get("dripNum", 0)) for item in new_drip_list)
+                        all_drip_record_ids = []
+                        for drip_item in new_drip_list:
+                            drip_record_ids = drip_item.get("dripRecordIds", [])
+                            all_drip_record_ids.extend(drip_record_ids)
+                        if all_drip_record_ids:
+                            get_drip_resp = api_post(
                                 parsed_server,
                                 f"{GET_DRIP_URL}?mini_token={mini_token}",
                                 mini_token, proxies,
-                                {"dripRecordIds": all_ids, "mini_token": mini_token},
+                                {"dripRecordIds": all_drip_record_ids, "mini_token": mini_token},
                             )
+                            if get_drip_resp.get("resp_code") == "0000":
+                                total_collected_drip += loop_total_drip
+                                print(f"✅ [水滴] 第 {loop_num} 次成功领取 {loop_total_drip} 水滴")
                 if loop_num < 2:
                     sleep(3)
 
-        sleep(2)
+            if total_collected_drip > 0:
+                result["signDripMsg"] += f"，领取{total_collected_drip}水滴"
 
-        # 最终等级信息
-        final_level_info_resp = api_get(
-            parsed_server,
-            f"{USER_LEVEL_INFO_URL}?mini_token={mini_token}&activityId={ACTIVITY_ID}",
-            mini_token, proxies,
-        )
-        if final_level_info_resp.get("resp_code") == "0000":
-            datas = final_level_info_resp.get("datas", {})
-            level = datas.get("level", 0)
-            level_name = datas.get("levelName", "未知")
-            drip_total = to_int(datas.get("dripTotal"))
-            watering_times = to_int(datas.get("wateringTimes"))
-            result["finalDripNum"] = drip_total
-            result["finalLevelInfo"] = f"等级{level}({level_name}) 水滴{drip_total} 浇水{watering_times}次"
-            drip_change = drip_total - result["dripNum"]
-            if drip_change > 0:
-                print(f"✅ [最终] {result['finalLevelInfo']} (水滴+{drip_change})")
+            sleep(2)
+
+            # 浇水
+            print("🔍 [浇水] 检查当前水滴数量...")
+            current_level_info_resp = api_get(
+                parsed_server,
+                f"{USER_LEVEL_INFO_URL}?mini_token={mini_token}&activityId={ACTIVITY_ID}",
+                mini_token, proxies,
+            )
+            current_drip_total = 0
+            if current_level_info_resp.get("resp_code") == "0000":
+                current_drip_total = to_int(current_level_info_resp.get("datas", {}).get("dripTotal"))
+                print(f"💧 [浇水] 当前水滴数量: {current_drip_total}")
+
+            watering_count = 0
+            upgrade_happened = False
+            while current_drip_total >= 20:
+                watering_count += 1
+                watering_resp = api_post(
+                    parsed_server,
+                    f"{WATERING_URL}?mini_token={mini_token}",
+                    mini_token, proxies,
+                    {"activityId": ACTIVITY_ID, "dripNum": 20, "storeNo": STORE_NO, "mini_token": mini_token},
+                )
+                if watering_resp.get("resp_code") == "0000":
+                    datas = watering_resp.get("datas", {})
+                    upgrade = datas.get("upgrade", False)
+                    if upgrade:
+                        upgrade_happened = True
+                        print(f"🎉 [浇水] 第 {watering_count} 次浇水成功，人参升级")
+                    else:
+                        print(f"✅ [浇水] 第 {watering_count} 次浇水成功")
+                    current_drip_total -= 20
+                    if current_drip_total >= 20:
+                        sleep(2)
+                else:
+                    print(f"⚠️ [浇水] 第 {watering_count} 次浇水失败：{watering_resp.get('resp_msg')}")
+                    break
+
+            if watering_count > 0:
+                result["wateringMsg"] = f"浇水{watering_count}次" + ("，人参升级" if upgrade_happened else "成功")
             else:
-                print(f"✅ [最终] {result['finalLevelInfo']}")
-        else:
-            result["finalLevelInfo"] = "获取最终等级信息失败"
+                result["wateringMsg"] = f"水滴不足20，当前{current_drip_total}，跳过浇水"
+                print(f"⏭️ [浇水] {result['wateringMsg']}")
 
-        # 水滴明细
-        drip_water_resp = api_get(
-            parsed_server,
-            f"{USER_DRIP_WATER_URL}?mini_token={mini_token}&activityId={ACTIVITY_ID}&pageNo=1&pageSize=10",
-            mini_token, proxies,
-        )
-        if drip_water_resp.get("resp_code") == "0000":
-            results_list = drip_water_resp.get("datas", {}).get("results", [])
-            if results_list:
-                result["dripDetails"] = []
-                print(f"📋 [明细] 最近{len(results_list)}条水滴记录：")
-                for item in results_list[:5]:
-                    result["dripDetails"].append({
-                        "name": item.get("waterName", "未知"),
-                        "time": item.get("recordTime", ""),
-                        "num": item.get("dripNum", 0),
-                    })
+            sleep(2)
 
-        result["success"] = True
-        return result
+            # 浏览任务
+            user_tasks_resp = api_get(
+                parsed_server,
+                f"{USER_TASKS_URL}?activityId={ACTIVITY_ID}&storeNo={STORE_NO}&type=1&mini_token={mini_token}",
+                mini_token, proxies,
+            )
+            browse_task_results = []
+            if user_tasks_resp.get("resp_code") == "0000":
+                user_task_infos = user_tasks_resp.get("datas", {}).get("userTaskInfos", [])
+                for task in BROWSE_TASKS:
+                    for task_info in user_task_infos:
+                        if task_info.get("taskId") == task["id"]:
+                            complete_num = to_int(task_info.get("completeNum", 0))
+                            time_drip_num = to_int(task_info.get("timeDripNum", 0))
+                            show_task_name = task_info.get("showTaskName", task["name"])
+                            if complete_num < time_drip_num:
+                                try:
+                                    params = task["params"].copy()
+                                    params["mini_token"] = mini_token
+                                    url = f"{task['url']}?{'&'.join([f'{k}={v}' for k, v in params.items()])}"
+                                    request_with_proxy("GET", url, headers=common_headers(), proxies=proxies, server=parsed_server)
+                                    sleep(2)
+                                    add_task_resp = api_post(
+                                        parsed_server,
+                                        f"{ADD_TASK_RECORD_URL}?mini_token={mini_token}",
+                                        mini_token, proxies,
+                                        {"activityId": ACTIVITY_ID, "taskId": task["id"], "storeNo": STORE_NO, "mini_token": mini_token},
+                                    )
+                                    if add_task_resp.get("resp_code") == "0000":
+                                        print(f"✅ [浏览] {show_task_name} 任务添加成功")
+                                    sleep(3)
+                                    browse_task_results.append(show_task_name)
+                                except Exception as exc:
+                                    print(f"⚠️ [浏览] {show_task_name} 失败: {exc}")
+                            else:
+                                print(f"✅ [浏览] {show_task_name} 今日已完成")
+                            break
+                if browse_task_results:
+                    result["browseTasksMsg"] = f"完成浏览: {', '.join(browse_task_results)}"
+                else:
+                    result["browseTasksMsg"] = "所有浏览任务已完成"
+            else:
+                result["browseTasksMsg"] = "获取任务列表失败"
 
-    except Exception as exc:
-        result["error"] = traceback.format_exc().strip()
-        print(f"❌ [账号] 执行失败: {exc}")
-        return result
+            # 浏览任务后收集水滴
+            if browse_task_results:
+                sleep(5)
+                for loop_num in range(1, 3):
+                    new_drip_after = api_get(
+                        parsed_server,
+                        f"{USER_NEW_DRIP_URL}?mini_token={mini_token}&activityId={ACTIVITY_ID}",
+                        mini_token, proxies,
+                    )
+                    if new_drip_after.get("resp_code") == "0000":
+                        new_drip_list_after = new_drip_after.get("datas", [])
+                        if new_drip_list_after:
+                            all_ids = []
+                            for item in new_drip_list_after:
+                                all_ids.extend(item.get("dripRecordIds", []))
+                            if all_ids:
+                                api_post(
+                                    parsed_server,
+                                    f"{GET_DRIP_URL}?mini_token={mini_token}",
+                                    mini_token, proxies,
+                                    {"dripRecordIds": all_ids, "mini_token": mini_token},
+                                )
+                    if loop_num < 2:
+                        sleep(3)
+
+            sleep(2)
+
+            # 最终等级信息
+            final_level_info_resp = api_get(
+                parsed_server,
+                f"{USER_LEVEL_INFO_URL}?mini_token={mini_token}&activityId={ACTIVITY_ID}",
+                mini_token, proxies,
+            )
+            if final_level_info_resp.get("resp_code") == "0000":
+                datas = final_level_info_resp.get("datas", {})
+                level = datas.get("level", 0)
+                level_name = datas.get("levelName", "未知")
+                drip_total = to_int(datas.get("dripTotal"))
+                watering_times = to_int(datas.get("wateringTimes"))
+                result["finalDripNum"] = drip_total
+                result["finalLevelInfo"] = f"等级{level}({level_name}) 水滴{drip_total} 浇水{watering_times}次"
+                drip_change = drip_total - result["dripNum"]
+                if drip_change > 0:
+                    print(f"✅ [最终] {result['finalLevelInfo']} (水滴+{drip_change})")
+                else:
+                    print(f"✅ [最终] {result['finalLevelInfo']}")
+            else:
+                result["finalLevelInfo"] = "获取最终等级信息失败"
+
+            # 水滴明细
+            drip_water_resp = api_get(
+                parsed_server,
+                f"{USER_DRIP_WATER_URL}?mini_token={mini_token}&activityId={ACTIVITY_ID}&pageNo=1&pageSize=10",
+                mini_token, proxies,
+            )
+            if drip_water_resp.get("resp_code") == "0000":
+                results_list = drip_water_resp.get("datas", {}).get("results", [])
+                if results_list:
+                    result["dripDetails"] = []
+                    print(f"📋 [明细] 最近{len(results_list)}条水滴记录：")
+                    for item in results_list[:5]:
+                        result["dripDetails"].append({
+                            "name": item.get("waterName", "未知"),
+                            "time": item.get("recordTime", ""),
+                            "num": item.get("dripNum", 0),
+                        })
+
+            result["success"] = True
+            return result
+
+        except Exception as exc:
+            result["error"] = traceback.format_exc().strip()
+            print(f"❌ [账号] 执行失败: {exc}")
+            return result
 
 
 def build_notify(results: List[Dict[str, Any]]) -> str:

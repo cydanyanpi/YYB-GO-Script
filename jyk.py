@@ -65,6 +65,30 @@ RETRY_TIMES = 3
 RETRY_BASE_DELAY = 3
 
 
+# ==================== Token 缓存（不过期，失效自动重登） ====================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "jyk_token_cache.json")
+
+
+def read_token_cache():
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        log(f"[缓存] 写入失败: {exc}")
+
+
 # ==================== helpers ====================
 
 
@@ -238,6 +262,7 @@ class BusinessAccount:
     label: str
     access_token: str
     uid: str = ""
+    ref: str = ""
 
 
 class JykClient:
@@ -260,7 +285,7 @@ class JykClient:
         return headers
 
     @staticmethod
-    def exchange_code(wx_code: str, label: str) -> Optional[BusinessAccount]:
+    def exchange_code(wx_code: str, label: str, ref: str = "") -> Optional[BusinessAccount]:
         url = f"{BASE_URL}/api/index/get_openid"
         payload = {"code": wx_code, "pid": PID, "device_info": DEVICE_INFO}
         session = requests.Session()
@@ -291,7 +316,7 @@ class JykClient:
         nickname = user.get("nickname") or label
         uid = str(info.get("uid") or user.get("uid") or "")
         log(f"{mask(label)} 登录成功 uid={uid or '-'} nick={mask(nickname)}")
-        return BusinessAccount(label=str(nickname or label), access_token=token, uid=uid)
+        return BusinessAccount(label=str(nickname or label), access_token=token, uid=uid, ref=ref)
 
     def request_json(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         url = f"{BASE_URL}{path}"
@@ -423,43 +448,95 @@ def load_manual_accounts() -> List[BusinessAccount]:
     return accounts
 
 
-def auto_fetch_accounts() -> List[BusinessAccount]:
+def _login_business(code_account: CodeAccount, provider: YybCodeProvider) -> Optional[BusinessAccount]:
+    wx_code = provider.get_code(code_account)
+    if not wx_code:
+        return None
+    return JykClient.exchange_code(wx_code, code_account.label, code_account.ref)
+
+
+def process_code_account(code_account: CodeAccount, provider: YybCodeProvider) -> None:
+    """带缓存的单账号处理：命中缓存跳过取码+登录，home 探测失败自动重登一次。"""
+    cache = read_token_cache()
+    business: Optional[BusinessAccount] = None
+
+    for attempt in range(2):
+        cached = cache.get(code_account.ref) or {}
+        from_cache = False
+        if attempt == 0 and cached.get("access_token"):
+            from_cache = True
+            log(f"{mask(code_account.label)} [缓存] 使用缓存token")
+            business = BusinessAccount(
+                label=cached.get("label") or code_account.label,
+                access_token=cached["access_token"],
+                uid=str(cached.get("uid") or ""),
+                ref=code_account.ref,
+            )
+        else:
+            if attempt == 1:
+                log(f"{mask(code_account.label)} [重登] token失效，重新登录")
+                cache = read_token_cache()
+                if code_account.ref in cache:
+                    del cache[code_account.ref]
+                    write_token_cache(cache)
+            business = _login_business(code_account, provider)
+            if business:
+                cache = read_token_cache()
+                cache[code_account.ref] = {
+                    "access_token": business.access_token,
+                    "uid": business.uid,
+                    "label": business.label,
+                }
+                write_token_cache(cache)
+
+        if not business:
+            return
+
+        client = JykClient(business)
+        # 探测登录态：home 接口 errno!=0 视为鉴权失败，触发重登
+        home_raw = client.request_json("GET", "/api/checkin/home") or {}
+        if from_cache and home_raw.get("errno") != 0:
+            log(f"{mask(code_account.label)} [重登] 缓存token失效: {str(home_raw)[:120]}")
+            continue
+
+        client.run()
+        return
+
+
+def auto_fetch_accounts() -> None:
     provider = YybCodeProvider(YYB_WX_SERVER)
     code_accounts = provider.list_accounts()
-    business_accounts: List[BusinessAccount] = []
 
     for index, code_account in enumerate(code_accounts, 1):
         log(f"处理账号[{index}/{len(code_accounts)}] {mask(code_account.label)}")
-        wx_code = provider.get_code(code_account)
-        if not wx_code:
-            continue
-        business = JykClient.exchange_code(wx_code, code_account.label)
-        if business:
-            business_accounts.append(business)
-        if index < len(code_accounts):
-            time.sleep(2)
-
-    log(f"业务账号获取成功 {len(business_accounts)} / {len(code_accounts)}")
-    return business_accounts
-
-
-def main() -> int:
-    accounts = load_manual_accounts() or auto_fetch_accounts()
-    if not accounts:
-        log("未获取到业务账号。请检查 YYB_SERVER、YYB_REFS 或 MANUAL_ACCESS_TOKENS。")
-        return 1
-
-    for index, account in enumerate(accounts, 1):
-        log(f"\n===== 账号[{index}/{len(accounts)}] {mask(account.label)} =====")
         try:
-            JykClient(account).run()
+            process_code_account(code_account, provider)
         except KeyboardInterrupt:
             raise
         except Exception as exc:
-            log(f"{account.label} 执行异常：{str(exc)[:160]}")
-        if index < len(accounts):
+            log(f"{code_account.label} 执行异常：{str(exc)[:160]}")
+        if index < len(code_accounts):
             time.sleep(2)
 
+    log(f"业务账号处理完成 {len(code_accounts)} 个")
+
+
+def main() -> int:
+    accounts = load_manual_accounts()
+    if accounts:
+        for index, account in enumerate(accounts, 1):
+            log(f"\n===== 账号[{index}/{len(accounts)}] {mask(account.label)} =====")
+            try:
+                JykClient(account).run()
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                log(f"{account.label} 执行异常：{str(exc)[:160]}")
+            if index < len(accounts):
+                time.sleep(2)
+        return 0
+
+    auto_fetch_accounts()
     return 0
 
 

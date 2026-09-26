@@ -56,7 +56,8 @@ CHANNEL_CODE = "WXjxriol8e8293wezu"
 DEVICE_HASH = "lkmtJuKGKQ0_S6Oem6ZIv3YoiHYGgoMf"
 SITE_ID = "SITE_33254242630091515087"
 
-SESSION_FILE = "xzyycookie.json"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SESSION_FILE = os.path.join(SCRIPT_DIR, "token_caches", "xzyy_token_cache.json")
 ACTCODE_CACHE_FILE = "actCode_cache.json"
 
 PLUSPLUS_TOKEN = os.getenv("PLUSPLUS_TOKEN", "")
@@ -311,10 +312,20 @@ def load_session_cache() -> Dict[str, Any]:
 
 def save_session_cache(cache: Dict[str, Any]) -> None:
     try:
+        os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
         with open(SESSION_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, indent=2, ensure_ascii=False)
     except Exception as exc:
         print(f"⚠️ [缓存] 保存缓存文件失败: {exc}")
+
+
+# 标准 token 缓存别名
+def read_token_cache() -> Dict[str, Any]:
+    return load_session_cache()
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    save_session_cache(cache)
 
 
 def load_actcode_cache() -> Tuple[str | None, str | None]:
@@ -547,6 +558,8 @@ def run_account(index: int, total: int, server: str, cache: Dict[str, Any], act_
 
     log_account_header(index, total, server)
 
+    _, ref = parse_yyb_entry(server)
+
     proxies, proxy_ip = get_valid_proxy(server)
     result["proxyStatus"] = "使用专属代理" if proxies else "使用直连"
     result["proxyIp"] = proxy_ip or "-"
@@ -557,7 +570,7 @@ def run_account(index: int, total: int, server: str, cache: Dict[str, Any], act_
     print(f"⏳ [延迟] 启动延迟 {delay}s")
     sleep(delay)
 
-    cached_session = cache.get(server)
+    cached_session = cache.get(ref)
     session = cached_session if cached_session else None
 
     for attempt in range(2):
@@ -590,6 +603,9 @@ def run_account(index: int, total: int, server: str, cache: Dict[str, Any], act_
                 continue
 
             print("❌ [验证] SESSION 失效，重新登录")
+            if ref in cache:
+                del cache[ref]
+                save_session_cache(cache)
             session = None
             continue
 
@@ -604,7 +620,7 @@ def run_account(index: int, total: int, server: str, cache: Dict[str, Any], act_
             return result
 
         session = new_session
-        cache[server] = session
+        cache[ref] = session
         save_session_cache(cache)
         print("✅ [登录] SESSION 已缓存")
 

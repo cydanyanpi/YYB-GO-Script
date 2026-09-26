@@ -136,6 +136,35 @@ def parse_yyb_go_entry(raw_value: str) -> Tuple[str, str]:
     return server, ref
 
 
+# ===================== Token 缓存（不过期，鉴权失败自动重登）=====================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "jtc_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"  [缓存] 写入失败: {exc}")
+
+
+def is_auth_fail_msg(msg: Any) -> bool:
+    import re
+    return bool(re.search(r'登录|未登录|授权|token|失效|过期|登录态|请重新|身份|凭证|unauthor', str(msg), re.IGNORECASE))
+
+
 async def get_code_via_yyb(server_entry: str, appid: str) -> Optional[str]:
     server, ref = parse_yyb_go_entry(server_entry)
     if not server:
@@ -437,6 +466,7 @@ class JtcBot:
         self.client: Optional[httpx.AsyncClient] = None
         self.report_generator = DataReportGenerator()
         self.task_browse_seconds = {}
+        self._last_error = ""
 
     async def __aenter__(self):
         # 初始化代理管理器
@@ -699,6 +729,7 @@ class JtcBot:
         """检查响应是否正常（适配最新resultCode格式）"""
         if response_data.get("resultCode") != "0" and response_data.get("code") != "0":
             error_msg = response_data.get("message", "未知错误")
+            self._last_error = error_msg
             # 特殊处理："已达到最大领取次数"视为成功
             if "已达到最大领取次数" in error_msg:
                 print(f"ℹ️ [{self.server}] {error_msg}")
@@ -996,95 +1027,126 @@ class JtcBot:
             # 启动延迟
             await sleep(random_int(2000, 5000))
 
-            # 1. 获取code
-            code = await self.get_code()
-            if not code:
-                result["error"] = "获取code失败"
-                return result
+            _, ref = parse_yyb_go_entry(self.server)
+            cache = read_token_cache()
+            cached = cache.get(ref) or {}
+            self.token = cached.get("token", "")
+            used_cache = bool(self.token)
+            if self.token:
+                print(f"💾 [缓存] 使用缓存token: {self.token[:12]}...")
 
-            # 2. 获取token
-            token = await self.get_token_by_code(code)
-            if not token:
-                result["error"] = "获取token失败"
-                return result
+            for relogin_attempt in range(2):
+                if relogin_attempt == 1 or not self.token:
+                    if relogin_attempt == 1:
+                        print("🔄 [重登] token失效，重新登录...")
+                        cache = read_token_cache()
+                        if ref in cache:
+                            del cache[ref]
+                            write_token_cache(cache)
+                        self.token = ""
+                    # 1. 获取code
+                    code = await self.get_code()
+                    if not code:
+                        result["error"] = "获取code失败"
+                        return result
 
-            # 3. 解析JWT
-            exp = self.parse_jwt()
-            if not self.user_id or not self.open_id:
-                result["error"] = "JWT解析失败"
-                return result
+                    # 2. 获取token
+                    token = await self.get_token_by_code(code)
+                    if not token:
+                        result["error"] = "获取token失败"
+                        return result
+                    self.token = token
 
-            # 4. 获取经纬度
-            await self.get_location_info()
+                    cache = read_token_cache()
+                    cache[ref] = {"token": self.token}
+                    write_token_cache(cache)
 
-            # 5. 获取用户信息
-            user_info = await self.get_user_info()
-            if user_info:
-                result["phone"] = self.format_phone(user_info.get("telephone", "未知"))
-                print(f"👤 [{self.server}] 用户: {result['phone']}")
-
-            # 6. 执行签到
-            sign_success = await self.perform_sign_in()
-            result["sign_msg"] = "签到成功" if sign_success else "今日已签到"
-            await sleep(1000)
-
-            # 7. 处理任务
-            task_data = await self.get_task_list()
-            receivable_tasks = []
-            incomplete_tasks = []
-            task_info_map = {}
-
-            if task_data:
-                for task in task_data:
-                    task_no = task.get("taskNo")
-                    task_status = task.get("taskStatus")
-                    show_title = task.get("showTitle", "")
-                    task_info_map[task_no] = task
-
-                    if task_no in SKIP_TASKS:
-                        print(f"⏭️ [{self.server}] 跳过任务: {show_title}")
+                # 3. 解析JWT
+                self.parse_jwt()
+                if not self.user_id or not self.open_id:
+                    result["error"] = "JWT解析失败"
+                    if relogin_attempt == 0 and used_cache:
+                        print("🔄 [重登] JWT解析失败，清除缓存重新登录...")
+                        self.token = ""
                         continue
+                    return result
 
-                    if task_status == "RECEIVE":
-                        receivable_tasks.append((task_no, show_title))
-                    elif task_status == "GOTO":
-                        incomplete_tasks.append((task_no, show_title))
+                # 4. 获取经纬度
+                await self.get_location_info()
 
-            # 强制执行核心任务（即使不在任务列表中）
-            print(f"\n🔧 [{self.server}] 检查强制核心任务...")
-            for task_no, show_title in FORCE_EXECUTE_TASKS:
-                if task_no not in task_info_map and task_no not in SKIP_TASKS:
-                    print(f"➕ [{self.server}] 添加强制任务: {show_title}")
-                    incomplete_tasks.append((task_no, show_title))
-                    task_info_map[task_no] = {"taskNo": task_no, "showTitle": show_title, "taskStatus": "GOTO"}
+                # 5. 获取用户信息（鉴权失败检测点）
+                user_info = await self.get_user_info()
+                if user_info is None and relogin_attempt == 0 and used_cache and is_auth_fail_msg(self._last_error):
+                    print(f"🔄 [重登] 用户信息鉴权失败({self._last_error})，重新登录...")
+                    self.token = ""
+                    continue
+                if user_info:
+                    result["phone"] = self.format_phone(user_info.get("telephone", "未知"))
+                    print(f"👤 [{self.server}] 用户: {result['phone']}")
 
-            # 领取可领取的任务奖励
-            for task_no, show_title in receivable_tasks:
-                reward = await self.receive_task_reward(task_no, task_info_map.get(task_no))
-                result["total_reward"] += reward
+                # 6. 执行签到
+                sign_success = await self.perform_sign_in()
+                result["sign_msg"] = "签到成功" if sign_success else "今日已签到"
                 await sleep(1000)
 
-            # 完成未完成的任务
-            for task_no, show_title in incomplete_tasks:
-                success = await self.complete_task(task_no, task_info_map.get(task_no))
-                if success:
-                    result["task_count"] += 1
-                    await sleep(1000)
-                    # 领取新完成的任务奖励
-                    await sleep(3000)
+                # 7. 处理任务
+                task_data = await self.get_task_list()
+                receivable_tasks = []
+                incomplete_tasks = []
+                task_info_map = {}
+
+                if task_data:
+                    for task in task_data:
+                        task_no = task.get("taskNo")
+                        task_status = task.get("taskStatus")
+                        show_title = task.get("showTitle", "")
+                        task_info_map[task_no] = task
+
+                        if task_no in SKIP_TASKS:
+                            print(f"⏭️ [{self.server}] 跳过任务: {show_title}")
+                            continue
+
+                        if task_status == "RECEIVE":
+                            receivable_tasks.append((task_no, show_title))
+                        elif task_status == "GOTO":
+                            incomplete_tasks.append((task_no, show_title))
+
+                # 强制执行核心任务（即使不在任务列表中）
+                print(f"\n🔧 [{self.server}] 检查强制核心任务...")
+                for task_no, show_title in FORCE_EXECUTE_TASKS:
+                    if task_no not in task_info_map and task_no not in SKIP_TASKS:
+                        print(f"➕ [{self.server}] 添加强制任务: {show_title}")
+                        incomplete_tasks.append((task_no, show_title))
+                        task_info_map[task_no] = {"taskNo": task_no, "showTitle": show_title, "taskStatus": "GOTO"}
+
+                # 领取可领取的任务奖励
+                for task_no, show_title in receivable_tasks:
                     reward = await self.receive_task_reward(task_no, task_info_map.get(task_no))
                     result["total_reward"] += reward
+                    await sleep(1000)
 
-            # 8. 获取最终余额
-            balance_info = await self.get_balance()
-            if balance_info:
-                result["balance"] = balance_info.get("accountAmt", 0)
-                result["deduct_amount"] = balance_info.get("deductAmount", 0)
-                print(f"💰 [{self.server}] 当前余额: {result['balance']}捷停币 | 可抵扣: {result['deduct_amount']}元")
+                # 完成未完成的任务
+                for task_no, show_title in incomplete_tasks:
+                    success = await self.complete_task(task_no, task_info_map.get(task_no))
+                    if success:
+                        result["task_count"] += 1
+                        await sleep(1000)
+                        # 领取新完成的任务奖励
+                        await sleep(3000)
+                        reward = await self.receive_task_reward(task_no, task_info_map.get(task_no))
+                        result["total_reward"] += reward
 
-            result["success"] = True
-            # 已删除：共获得0捷停币 相关输出
-            print(f"✅ [{self.server}] 任务执行完成")
+                # 8. 获取最终余额
+                balance_info = await self.get_balance()
+                if balance_info:
+                    result["balance"] = balance_info.get("accountAmt", 0)
+                    result["deduct_amount"] = balance_info.get("deductAmount", 0)
+                    print(f"💰 [{self.server}] 当前余额: {result['balance']}捷停币 | 可抵扣: {result['deduct_amount']}元")
+
+                result["success"] = True
+                # 已删除：共获得0捷停币 相关输出
+                print(f"✅ [{self.server}] 任务执行完成")
+                break
 
         except Exception as e:
             result["error"] = str(e)

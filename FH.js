@@ -55,12 +55,12 @@ const API_BASE = "https://www.feihevip.com";
 const APP_ID = "xmyx";
 const APP_KEY = "TwUQ01lKS1Km5zlV2f7amsZc5EQYkTbv";
 const SIGN_TASK_TYPE = "DJSYQD";
-const TOKEN_CACHE_FILE = path.join(__dirname, "token_caches", "feihe_token_cache.json");
-try { fs.mkdirSync(path.dirname(TOKEN_CACHE_FILE), { recursive: true }); } catch (e) {}
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "fh_token_cache.json");
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) MicroMessenger/3.9.12 MiniProgramEnv/Windows WindowsWechat/WMPF";
 
 
-function readCache() {
+function readTokenCache() {
     try {
         if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
         return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf8")) || {};
@@ -69,8 +69,9 @@ function readCache() {
     }
 }
 
-function writeCache(cache) {
+function writeTokenCache(cache) {
     try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
         fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf8");
     } catch (e) {
         console.log(`写入token缓存失败: ${e.message || e}`);
@@ -145,47 +146,54 @@ class Task {
     }
 
     async run() {
-        const cached = this.getCachedToken();
-        if (cached) {
-            this.token = cached.token || "";
-            console.log(`账号[${this.index}] 使用缓存token: ${maskToken(this.token)}`);
-            if (!(await this.checkToken())) {
-                console.log(`账号[${this.index}] 缓存token失效，重新code登录`);
-                this.removeCachedToken();
-                this.token = "";
+        const usedCache = !!this.getCachedToken();
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (attempt === 1 || !this.token) {
+                if (attempt === 1) {
+                    console.log(`账号[${this.index}] token失效，重新登录...`);
+                    this.removeCachedToken();
+                    this.token = "";
+                }
+                await this.loginByCode();
+                if (!this.token) return;
+            }
+            try {
+                await this.getIndexInfo();
+                await this.signIn();
+                return;
+            } catch (e) {
+                const msg = String(e.message || e);
+                if (attempt === 0 && usedCache && /token|登录|授权|invalid|401|403/i.test(msg)) {
+                    console.log(`账号[${this.index}] 业务token失效，清除缓存重新登录...`);
+                    this.removeCachedToken();
+                    this.token = "";
+                    continue;
+                }
+                throw e;
             }
         }
-
-        if (!this.token) {
-            await this.loginByCode();
-        }
-        if (!this.token) return;
-
-        await this.getIndexInfo();
-        await this.signIn();
     }
 
     getCachedToken() {
-        const cache = readCache();
+        const cache = readTokenCache();
         return cache[this.account] || null;
     }
 
     saveCachedToken() {
         if (!this.token) return;
-        const cache = readCache();
+        const cache = readTokenCache();
         cache[this.account] = {
             token: this.token,
             userInfo: this.userInfo,
-            updatedAt: new Date().toISOString(),
         };
-        writeCache(cache);
+        writeTokenCache(cache);
     }
 
     removeCachedToken() {
-        const cache = readCache();
+        const cache = readTokenCache();
         if (cache[this.account]) {
             delete cache[this.account];
-            writeCache(cache);
+            writeTokenCache(cache);
         }
     }
 

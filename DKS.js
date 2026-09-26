@@ -55,8 +55,8 @@ const KDT_ID = "46323516";
 const USER_VERSION = "2.233.4.101";
 const PAGE_VERSION = "96";
 const API_BASE = "https://h5.youzan.com";
-const TOKEN_CACHE_FILE = path.join(__dirname, "token_caches", "dks_token_cache.json");
-try { fs.mkdirSync(path.dirname(TOKEN_CACHE_FILE), { recursive: true }); } catch (e) {}
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "dks_token_cache.json");
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) MicroMessenger/3.9.12 MiniProgramEnv/Windows WindowsWechat/WMPF";
 
 function readTokenCache() {
@@ -70,6 +70,7 @@ function readTokenCache() {
 
 function writeTokenCache(cache) {
     try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
         fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf8");
     } catch (e) {
         console.log(`写入token缓存失败: ${e.message || e}`);
@@ -100,24 +101,31 @@ class Task {
     }
 
     async run() {
-        const cached = this.getCachedToken();
-        if (cached) {
-            this.applyToken(cached);
-            console.log(`账号[${this.index}] 使用缓存token`);
-            if (!(await this.checkToken())) {
-                this.removeCachedToken();
-                console.log(`账号[${this.index}] 缓存token失效，重新登录`);
+        const usedCache = !!this.getCachedToken();
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (attempt === 1 || !this.token) {
+                if (attempt === 1) {
+                    console.log(`账号[${this.index}] token失效，重新登录...`);
+                    this.removeCachedToken();
+                }
+                await this.loginByWxCode();
+                if (!this.token) return;
+            }
+            try {
+                await this.showCheckinPage();
+                await this.doCheckin();
+                await this.getPoints();
+                return;
+            } catch (e) {
+                const msg = String(e.message || e);
+                if (attempt === 0 && usedCache && /access_token|token|登录|授权|invalid session|401|403/i.test(msg)) {
+                    console.log(`账号[${this.index}] 业务token失效，清除缓存重新登录...`);
+                    this.removeCachedToken();
+                    continue;
+                }
+                console.log(`账号[${this.index}] 执行失败: ${msg}`);
             }
         }
-
-        if (!this.token) {
-            await this.loginByWxCode();
-            if (!this.token) return;
-        }
-
-        await this.showCheckinPage();
-        await this.doCheckin();
-        await this.getPoints();
     }
 
     getCachedToken() {
@@ -135,7 +143,6 @@ class Task {
             cookie: this.cookie,
             mobile: this.userInfo.mobile || "",
             nickName: this.userInfo.nick_name || this.userInfo.nickName || "",
-            updatedAt: new Date().toISOString(),
         };
         writeTokenCache(cache);
     }
@@ -249,7 +256,7 @@ class Task {
             console.log(`账号[${this.index}] 签到活动: checkinId=${this.checkinId || "未获取"} isShow=${this.isShow}`);
         } catch (e) {
             console.log(`账号[${this.index}] 获取签到活动失败: ${e.message || e}`);
-            if (/access_token|token|登录|授权|invalid session/i.test(String(e.message || e))) this.removeCachedToken();
+            if (/access_token|token|登录|授权|invalid session/i.test(String(e.message || e))) throw e;
         }
     }
 
@@ -272,7 +279,7 @@ class Task {
                 return;
             }
             console.log(`账号[${this.index}] 签到失败: ${message}`);
-            if (/access_token|token|登录|授权|invalid session/i.test(message)) this.removeCachedToken();
+            if (/access_token|token|登录|授权|invalid session/i.test(message)) throw e;
         }
     }
 

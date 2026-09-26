@@ -1,6 +1,8 @@
 // name: 慕斯
 // cron: 48 10,22 * * *
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
 /* __YYB_SERVER_DOLLAR_SHIM__ */
 if (typeof $ === 'undefined') {
   const __path = require('path');
@@ -72,6 +74,24 @@ async function getCode(server) {
         return null;
     }
 }
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "ms_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
+
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 let userIdx = 1;
 
@@ -90,25 +110,66 @@ class Task {
         this.activedAuthToken = null
         this.wcsid = this.openid
         this.openId = null
+        this._authFail = false
     }
 
     async run() {
         //随机延迟5-30s 模拟人工操作
        await await sleep(Math.floor(Math.random() * 20 + 5) * 1000);
-        let code = await getCode(this.server)
-        if (code) {
-            await this.getUserToken(code)
-        }
-        if (!this.activedAuthToken) {
-            console.log(`账号[${this.index}] 获取用户Token失败❌`)
-            return
+
+        // 尝试缓存（不过期，业务失败自动重登）
+        let usedCache = false;
+        const cache = readTokenCache();
+        const cached = cache[this.server] || {};
+        if (cached.activedAuthToken) {
+            this.activedAuthToken = cached.activedAuthToken;
+            this.openId = cached.openId || null;
+            usedCache = true;
+            console.log(`💾 账号[${this.index}] 使用缓存token`);
         }
 
-        await this.getUserInfo()
-        if (!this.customId) return
-        await this.getJob()
-        if (!this.isSigned) {
-            await this.doSign()
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (attempt === 1 || !this.activedAuthToken) {
+                if (attempt === 1) {
+                    console.log(`🔄 账号[${this.index}] token失效，重新登录...`);
+                    const c = readTokenCache();
+                    delete c[this.server];
+                    writeTokenCache(c);
+                }
+                this.activedAuthToken = null;
+                this.openId = null;
+                let code = await getCode(this.server)
+                if (code) {
+                    await this.getUserToken(code)
+                }
+                if (!this.activedAuthToken) {
+                    console.log(`账号[${this.index}] 获取用户Token失败❌`)
+                    return
+                }
+                const c = readTokenCache();
+                c[this.server] = { activedAuthToken: this.activedAuthToken, openId: this.openId };
+                writeTokenCache(c);
+            }
+            this._authFail = false;
+
+            await this.getUserInfo()
+            if (!this.customId) {
+                if (usedCache && attempt === 0 && this._authFail) {
+                    console.log(`⚠️ 账号[${this.index}] token失效，准备重登`);
+                    continue;
+                }
+                return
+            }
+            await this.getJob()
+            if (!this.isSigned) {
+                await this.doSign()
+            }
+
+            if (usedCache && attempt === 0 && this._authFail) {
+                console.log(`⚠️ 账号[${this.index}] token失效，准备重登`);
+                continue;
+            }
+            break;
         }
     }
     async getUserToken(code) {
@@ -186,6 +247,7 @@ class Task {
             } else {
                 console.log(`账号[${this.index}] 查询个人信息失败：${result?.msg || JSON.stringify(result)}`)
                 this.valid = false
+                this._authFail = true
             }
 
         } catch (e) {
@@ -219,6 +281,7 @@ class Task {
                 console.log(`账号[${this.index}] 获取任务列表成功，${this.isSigned ? '已签到' : '未签到'}`)
             } else {
                 console.log(`账号[${this.index}] 获取任务列表失败：${result?.msg || JSON.stringify(result)}`)
+                this._authFail = true;
             }
 
         } catch (e) {
@@ -251,6 +314,7 @@ class Task {
                 console.log(`账号[${this.index}] 签到成功，获得积分：${result?.data?.point}`)
             } else {
                 console.log(`账号[${this.index}] 签到失败：${result?.msg || JSON.stringify(result)}`)
+                this._authFail = true;
             }
 
         } catch (e) {

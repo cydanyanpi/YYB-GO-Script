@@ -134,7 +134,7 @@ try { fs.mkdirSync(path.dirname(TOKEN_CACHE_FILE), { recursive: true }); } catch
 const USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) MicroMessenger/3.9.12 MiniProgramEnv/Windows WindowsWechat/WMPF";
 
-function readCache() {
+function readTokenCache() {
     try {
         if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
         return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf8")) || {};
@@ -143,7 +143,7 @@ function readCache() {
     }
 }
 
-function writeCache(cache) {
+function writeTokenCache(cache) {
     try {
         fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf8");
     } catch (e) {
@@ -374,29 +374,27 @@ class Task {
     }
 
     getCachedToken() {
-        const item = readCache()[this.account];
+        const item = readTokenCache()[this.account];
         if (!item?.token) return null;
-        if (item.expireAt && Number(item.expireAt) < Date.now() + 60000) return null;
         return item;
     }
 
     saveCachedToken() {
         if (!this.token) return;
-        const cache = readCache();
+        const cache = readTokenCache();
         cache[this.account] = {
             token: this.token,
             lmid: this.lmid,
-            expireAt: this.expire ? Date.now() + this.expire * 1000 : 0,
             updatedAt: new Date().toISOString(),
         };
-        writeCache(cache);
+        writeTokenCache(cache);
     }
 
     removeCachedToken() {
-        const cache = readCache();
+        const cache = readTokenCache();
         if (cache[this.account]) {
             delete cache[this.account];
-            writeCache(cache);
+            writeTokenCache(cache);
         }
         this.token = "";
         this.lmid = "";

@@ -5,6 +5,26 @@ const { SocksProxyAgent } = require('socks-proxy-agent');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const { HttpProxyAgent } = require('http-proxy-agent');
 const qs = require('querystring');
+const fs = require('fs');
+const path = require('path');
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "fmyjyhs_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
 
 // 强制全局禁用系统代理环境变量，避免干扰
 delete process.env.HTTP_PROXY;
@@ -417,91 +437,118 @@ async function runAccount(server, globalProxyAgent) {
         console.log(`⏳ [${server}] 启动延迟 ${startDelay / 1000}s`);
         await sleep(startDelay);
 
-        // 1️⃣ 获取code
-        let code = await getCode(server);
-        if (!code) {
-            result.error = "获取code失败";
-            return result;
-        }
-
-        // 2️⃣ 登录获取token 【已添加多路径token提取和错误处理】
-        let login = await wxLogin(code, UA, proxyAgent, server);
-        if (!login) {
-            result.error = "登录请求无响应";
-            console.log(`❌ [${server}] 登录失败：无响应数据`);
-            return result;
-        }
-
-        if (login.code != 200) {
-            result.error = `登录失败：${login.message || "未知错误"}`;
-            console.log(`❌ [${server}] ${result.error}`);
-            return result;
-        }
-
-        // 多路径尝试提取token，兼容不同响应结构
+        // 尝试缓存（不过期，鉴权失败自动重登）
+        const cache = readTokenCache();
+        const cached = cache[server] || {};
         let token = null;
-        if (login.data?.userInfo?.token) {
-            token = login.data.userInfo.token;
-        } else if (login.data?.token) {
-            token = login.data.token;
-        } else if (login.token) {
-            token = login.token;
-        } else if (login.data?.access_token) {
-            token = login.data.access_token;
+        let usedCache = false;
+        if (cached.token) {
+            token = cached.token;
+            usedCache = true;
+            console.log(`💾 [${server}] 使用缓存token`);
         }
 
-        if (!token) {
-            result.error = "无法从登录响应中提取token，请查看调试日志";
-            console.log(`❌ [${server}] ${result.error}`);
-            return result;
-        }
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (attempt === 1 || !token) {
+                if (attempt === 1) {
+                    console.log(`🔄 [${server}] token失效，重新登录...`);
+                    const c = readTokenCache();
+                    delete c[server];
+                    writeTokenCache(c);
+                }
+                // 1️⃣ 获取code
+                let code = await getCode(server);
+                if (!code) {
+                    result.error = "获取code失败";
+                    return result;
+                }
 
-        console.log(`✅ [${server}] 登录成功，获取到有效token`);
-        debugLog("提取到的token", token);
-        await sleep(random(3000, 8000));
+                // 2️⃣ 登录获取token
+                let login = await wxLogin(code, UA, proxyAgent, server);
+                if (!login) {
+                    result.error = "登录请求无响应";
+                    console.log(`❌ [${server}] 登录失败：无响应数据`);
+                    return result;
+                }
 
-        // 3️⃣ 签到
-        let sign = await commonPost('/sign/new/do', {
-            "version": APP_VERSION,
-            "platformKey": PLATFORM_KEY,
-            "mini_scene": 1089,
-            "partner_ext_infos": ""
-        }, token, UA, proxyAgent, server);
-        if (sign?.code == 200) {
-            result.signMsg = `签到成功：${sign.message}`;
-            console.log(`✅ [${server}] 签到成功：${sign.message}`);
-        } else {
-            result.signMsg = `签到失败：${sign?.message || "未知错误"}`;
-            console.log(`❌ [${server}] 签到失败：${sign?.message || "未知错误"}`);
-        }
-        await sleep(random(2000, 5000));
+                if (login.code != 200) {
+                    result.error = `登录失败：${login.message || "未知错误"}`;
+                    console.log(`❌ [${server}] ${result.error}`);
+                    return result;
+                }
 
-        // 4️⃣ 步数兑换（循环3次）
-        for (let i = 0; i < 3; i++) {
-            console.log(`🚶 [${server}] 开始第${i+1}次步数兑换...`);
-            let exchange = await commonPost('/step/exchange', {
-                "steps": random(5000, 8000),
+                // 多路径尝试提取token，兼容不同响应结构
+                if (login.data?.userInfo?.token) {
+                    token = login.data.userInfo.token;
+                } else if (login.data?.token) {
+                    token = login.data.token;
+                } else if (login.token) {
+                    token = login.token;
+                } else if (login.data?.access_token) {
+                    token = login.data.access_token;
+                }
+
+                if (!token) {
+                    result.error = "无法从登录响应中提取token，请查看调试日志";
+                    console.log(`❌ [${server}] ${result.error}`);
+                    return result;
+                }
+
+                console.log(`✅ [${server}] 登录成功，获取到有效token`);
+                debugLog("提取到的token", token);
+                const c = readTokenCache();
+                c[server] = { token };
+                writeTokenCache(c);
+            }
+            await sleep(random(3000, 8000));
+
+            // 3️⃣ 签到
+            let sign = await commonPost('/sign/new/do', {
                 "version": APP_VERSION,
                 "platformKey": PLATFORM_KEY,
                 "mini_scene": 1089,
                 "partner_ext_infos": ""
             }, token, UA, proxyAgent, server);
-            if (exchange?.code == 200) {
-                let msg = `第${i+1}次步数兑换成功：${exchange.message}`;
-                result.exchangeMsgs.push(msg);
-                console.log(`✅ [${server}] ${msg}`);
+            if (sign?.code == 200) {
+                result.signMsg = `签到成功：${sign.message}`;
+                console.log(`✅ [${server}] 签到成功：${sign.message}`);
+            } else if (attempt === 0 && usedCache) {
+                console.log(`⚠️ [${server}] 签到返回: ${sign?.message}，判定token失效`);
+                continue;
             } else {
-                let msg = `第${i+1}次步数兑换失败：${exchange?.message || "未知错误"}`;
-                result.exchangeMsgs.push(msg);
-                console.log(`❌ [${server}] ${msg}`);
+                result.signMsg = `签到失败：${sign?.message || "未知错误"}`;
+                console.log(`❌ [${server}] 签到失败：${sign?.message || "未知错误"}`);
             }
-            if (i < 2) {
-                await sleep(random(3000, 5000));
-            }
-        }
+            await sleep(random(2000, 5000));
 
-        result.success = true;
-        console.log(`✅ [${server}] 账号执行完成`);
+            // 4️⃣ 步数兑换（循环3次）
+            for (let i = 0; i < 3; i++) {
+                console.log(`🚶 [${server}] 开始第${i+1}次步数兑换...`);
+                let exchange = await commonPost('/step/exchange', {
+                    "steps": random(5000, 8000),
+                    "version": APP_VERSION,
+                    "platformKey": PLATFORM_KEY,
+                    "mini_scene": 1089,
+                    "partner_ext_infos": ""
+                }, token, UA, proxyAgent, server);
+                if (exchange?.code == 200) {
+                    let msg = `第${i+1}次步数兑换成功：${exchange.message}`;
+                    result.exchangeMsgs.push(msg);
+                    console.log(`✅ [${server}] ${msg}`);
+                } else {
+                    let msg = `第${i+1}次步数兑换失败：${exchange?.message || "未知错误"}`;
+                    result.exchangeMsgs.push(msg);
+                    console.log(`❌ [${server}] ${msg}`);
+                }
+                if (i < 2) {
+                    await sleep(random(3000, 5000));
+                }
+            }
+
+            result.success = true;
+            console.log(`✅ [${server}] 账号执行完成`);
+            break;
+        }
     } catch (e) {
         result.error = `执行异常：${e.message}`;
         console.log(`❌ [${server}] 执行异常：`, e.message);

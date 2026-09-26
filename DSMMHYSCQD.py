@@ -66,6 +66,34 @@ USER_AGENT = (
 )
 
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "dsmmhyscqd_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"  [缓存] 写入失败: {exc}")
+
+
+def is_auth_fail_msg(msg: Any) -> bool:
+    import re
+    return bool(re.search(r'登录|未登录|授权|token|失效|过期|登录态|请重新|身份|凭证|access', str(msg), re.IGNORECASE))
+
+
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -473,90 +501,125 @@ def run_account(index: int, total: int, server: str) -> Dict[str, Any]:
     print(f"⏳ [延迟] 启动延迟 {delay}s")
     sleep(delay)
 
-    code = get_code(server)
-    if not code:
-        result["error"] = "获取 code 失败"
-        return result
+    _, ref = parse_yyb_go_entry(server)
 
-    token, raw_login = login_by_code(server, code, proxies)
-    if not token:
-        result["error"] = f"登录失败: {json_preview(raw_login)}"
-        return result
+    # 尝试缓存 accessToken + sessionId（不过期，业务鉴权失败自动重登）
+    cache = read_token_cache()
+    cached = cache.get(ref) or {}
+    token = cached.get("accessToken", "")
+    session_id = cached.get("sessionId", "")
+    used_cache = bool(token)
+    if token:
+        print(f"  [缓存] 使用缓存token: {mask(token)}")
 
-    result["token"] = mask(token)
+    for attempt in range(2):
+        if attempt == 1 or not token:
+            if attempt == 1:
+                print("  [重登] token失效，重新登录...")
+                cache = read_token_cache()
+                if ref in cache:
+                    del cache[ref]
+                    write_token_cache(cache)
+            code = get_code(server)
+            if not code:
+                result["error"] = "获取 code 失败"
+                return result
 
-    session_id = ""
-    login_data = raw_login.get("data", {})
-    if login_data:
-        nickname = login_data.get("nickname") or login_data.get("nickName") or "未知用户"
-        user_id = login_data.get("userId") or login_data.get("buyerId") or "-"
-        session_id = login_data.get("sessionId") or ""
-        result["nickname"] = nickname
-        result["userId"] = str(user_id)
-        print(f"👤 [用户] 昵称: {nickname}, ID: {user_id}, Session: {session_id[:10]}...")
+            token, raw_login = login_by_code(server, code, proxies)
+            if not token:
+                result["error"] = f"登录失败: {json_preview(raw_login)}"
+                return result
 
-    try:
-        asset_resp = api_get(server, ASSET_INFO_URL, token, proxies, {}, session_id)
-        if asset_resp.get("code") == 0:
-            asset_data = asset_resp.get("data", {})
-            level_name = asset_data.get("memberInfo", {}).get("vipName") or "未知等级"
-            points = asset_data.get("assetInfo", {}).get("currentPoints") or "0"
-            balance = asset_data.get("assetInfo", {}).get("storedBalanceValue") or "0"
-            vouchers = asset_data.get("assetInfo", {}).get("voucherNum") or "0"
-            result["points"] = points
-            print(f"⭐ [等级] {level_name}, 积分: {points}")
-            print(f"💰 [资产] 余额: {balance}, 优惠券: {vouchers}")
+            login_data = (raw_login or {}).get("data", {}) or {}
+            session_id = login_data.get("sessionId") or ""
+            nickname = login_data.get("nickname") or login_data.get("nickName") or "未知用户"
+            user_id = login_data.get("userId") or login_data.get("buyerId") or "-"
+            result["nickname"] = nickname
+            result["userId"] = str(user_id)
+            print(f"👤 [用户] 昵称: {nickname}, ID: {user_id}, Session: {str(session_id)[:10]}...")
 
-        month_sign_resp = api_get(server, MONTH_SIGN_INFO_URL, token, proxies, {
-            "checkin_id": CHECKIN_ID,
-            "year": datetime.now().year,
-            "month": datetime.now().month
-        }, session_id)
-        if month_sign_resp.get("code") == 0:
-            sign_data = month_sign_resp.get("data", {})
-            checkin_dates = sign_data.get("checkin_date") or []
-            sign_days = len(checkin_dates)
-            result["signDays"] = f"{sign_days} 天"
-            print(f"📅 [签到] 当月签到: {sign_days} 天")
+            cache = read_token_cache()
+            cache[ref] = {
+                "accessToken": token,
+                "sessionId": session_id,
+                "userId": str(user_id),
+                "nickname": nickname,
+            }
+            write_token_cache(cache)
+        else:
+            result["nickname"] = cached.get("nickname", "-")
+            result["userId"] = cached.get("userId", "-")
 
-        sign_resp = api_get(server, SIGN_URL, token, proxies, {
-            "checkinId": CHECKIN_ID
-        }, session_id)
-        sign_ok = False
-        if sign_resp.get("code") == 0:
-            sign_data = sign_resp.get("data")
-            if not isinstance(sign_data, dict):
-                sign_data = {}
-            if sign_data.get("success", False):
-                sign_ok = True
-                reward_list = sign_data.get("list", [])
-                if reward_list:
-                    reward = reward_list[0]
-                    reward_info = reward.get("infos", {})
-                    reward_title = reward_info.get("title", "未知奖励")
-                    result["signMsg"] = f"签到成功: 获得 {reward_title}"
-                    print(f"✅ [签到] {result['signMsg']}")
-                else:
-                    result["signMsg"] = "签到成功，但未获得奖励"
-                    print(f"✅ [签到] {result['signMsg']}")
+        result["token"] = mask(token)
+
+        try:
+            asset_resp = api_get(server, ASSET_INFO_URL, token, proxies, {}, session_id)
+            if asset_resp.get("code") == 0:
+                asset_data = asset_resp.get("data", {})
+                level_name = asset_data.get("memberInfo", {}).get("vipName") or "未知等级"
+                points = asset_data.get("assetInfo", {}).get("currentPoints") or "0"
+                balance = asset_data.get("assetInfo", {}).get("storedBalanceValue") or "0"
+                vouchers = asset_data.get("assetInfo", {}).get("voucherNum") or "0"
+                result["points"] = points
+                print(f"⭐ [等级] {level_name}, 积分: {points}")
+                print(f"💰 [资产] 余额: {balance}, 优惠券: {vouchers}")
             else:
-                msg = sign_data.get("desc") or "签到失败"
+                a_msg = asset_resp.get("msg") or asset_resp.get("message") or ""
+                if attempt == 0 and used_cache and is_auth_fail_msg(a_msg):
+                    print(f"  [重登] 资产查询鉴权失败({a_msg})，重新登录...")
+                    token = None
+                    continue
+
+            month_sign_resp = api_get(server, MONTH_SIGN_INFO_URL, token, proxies, {
+                "checkin_id": CHECKIN_ID,
+                "year": datetime.now().year,
+                "month": datetime.now().month
+            }, session_id)
+            if month_sign_resp.get("code") == 0:
+                sign_data = month_sign_resp.get("data", {})
+                checkin_dates = sign_data.get("checkin_date") or []
+                sign_days = len(checkin_dates)
+                result["signDays"] = f"{sign_days} 天"
+                print(f"📅 [签到] 当月签到: {sign_days} 天")
+
+            sign_resp = api_get(server, SIGN_URL, token, proxies, {
+                "checkinId": CHECKIN_ID
+            }, session_id)
+            sign_ok = False
+            if sign_resp.get("code") == 0:
+                sign_data = sign_resp.get("data")
+                if not isinstance(sign_data, dict):
+                    sign_data = {}
+                if sign_data.get("success", False):
+                    sign_ok = True
+                    reward_list = sign_data.get("list", [])
+                    if reward_list:
+                        reward = reward_list[0]
+                        reward_info = reward.get("infos", {})
+                        reward_title = reward_info.get("title", "未知奖励")
+                        result["signMsg"] = f"签到成功: 获得 {reward_title}"
+                        print(f"✅ [签到] {result['signMsg']}")
+                    else:
+                        result["signMsg"] = "签到成功，但未获得奖励"
+                        print(f"✅ [签到] {result['signMsg']}")
+                else:
+                    msg = sign_data.get("desc") or "签到失败"
+                    result["signMsg"] = f"签到失败: {msg}"
+                    print(f"⚠️ [签到] {result['signMsg']}")
+            else:
+                msg = sign_resp.get("msg") or sign_resp.get("message") or "签到失败"
                 result["signMsg"] = f"签到失败: {msg}"
                 print(f"⚠️ [签到] {result['signMsg']}")
-        else:
-            msg = sign_resp.get("msg") or sign_resp.get("message") or "签到失败"
-            result["signMsg"] = f"签到失败: {msg}"
-            print(f"⚠️ [签到] {result['signMsg']}")
 
-        result["success"] = sign_ok
-        if not sign_ok:
-            result["error"] = result["signMsg"]
-        return result
+            result["success"] = sign_ok
+            if not sign_ok:
+                result["error"] = result["signMsg"]
+            return result
 
-    except Exception as exc:
-        result["error"] = traceback.format_exc().strip()
-        print(f"❌ [账号] 执行失败: {exc}")
-        return result
+        except Exception as exc:
+            result["error"] = traceback.format_exc().strip()
+            print(f"❌ [账号] 执行失败: {exc}")
+            return result
 
 
 def build_notify(results: List[Dict[str, Any]]) -> str:

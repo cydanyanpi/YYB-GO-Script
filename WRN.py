@@ -177,7 +177,7 @@ def get_wx_phone_code(server_entry: str) -> str | None:
 
 # ============ Token 缓存 ============
 
-def load_token_cache():
+def read_token_cache():
     if not os.path.exists(TOKEN_CACHE_FILE):
         return {}
     try:
@@ -187,7 +187,7 @@ def load_token_cache():
         return {}
 
 
-def save_token_cache(cache):
+def write_token_cache(cache):
     try:
         os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
         with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
@@ -270,9 +270,9 @@ def refresh_account_token(server_entry: str):
 
     new_token = login_fetch_token(phone_code, openid, unionid)
     if new_token:
-        cache = load_token_cache()
-        cache[server_entry] = new_token
-        save_token_cache(cache)
+        cache = read_token_cache()
+        cache[wxid] = new_token
+        write_token_cache(cache)
         print(f"✅ 账号 {mask(wxid)} Token刷新成功")
         return new_token
     else:
@@ -592,7 +592,7 @@ def main():
     print(f"║ 账号数量: {len(SERVERS):<36}║")
     print("╚" + "═" * 50 + "╝")
 
-    token_cache = load_token_cache()
+    token_cache = read_token_cache()
     results = []
 
     for index, server_entry in enumerate(SERVERS, 1):
@@ -600,7 +600,7 @@ def main():
         remark = f"账号{index}({mask(wxid)})"
 
         # 获取或刷新 Token
-        cached_token = token_cache.get(server_entry, "")
+        cached_token = token_cache.get(wxid, "")
         if not cached_token:
             print(f"\n🔄 {remark} 无缓存Token，执行首次登录")
             new_token = refresh_account_token(server_entry)

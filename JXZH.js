@@ -2,6 +2,27 @@
 // cron: 8 13,1 * * *
 const axios = require("axios");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "jxzh_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
+
 // ====================== YYB Go 账号（环境变量 YYB_SERVER = 地址@微信账号标识，多行） ======================
 const SERVERS = (process.env.YYB_SERVER || "")
     .split(/\r?\n/)
@@ -146,7 +167,25 @@ class Quwa {
         const check = await this.api("/consumer/consumer/checkOpenid.do", { invitation: "" });
         const data = check?.data || {};
         this.userID = data.userID || data.userid || data.id || login.data.userID || "";
+        this.saveCache();
         return `openid=${login.data.openid || ""} userID=${this.userID || "未知"}`;
+    }
+
+    saveCache() {
+        const c = readTokenCache();
+        c[this.server] = { token: this.token, userID: this.userID };
+        writeTokenCache(c);
+    }
+
+    loadCache() {
+        const c = readTokenCache();
+        const cached = c[this.server] || {};
+        if (cached.token) {
+            this.token = cached.token;
+            this.userID = cached.userID || "";
+            return true;
+        }
+        return false;
     }
 
     async query() {
@@ -177,13 +216,31 @@ class Quwa {
 
 async function runAccount(openid, index) {
     console.log(`\n========== ${APP.name} 账号[${index}] ${openid} ==========`);
-    const runner = new Quwa(openid);
-    try {
-        console.log(`登录：${await runner.login()}`);
-        console.log(`查询：${await runner.query()}`);
-        console.log(`签到：${await runner.sign()}`);
-    } catch (e) {
-        console.log(`执行失败：${e.message || e}`);
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const runner = new Quwa(openid);
+        try {
+            const usedCache = runner.loadCache();
+            if (usedCache) {
+                console.log(`💾 使用缓存token`);
+            } else {
+                console.log(`登录：${await runner.login()}`);
+            }
+            console.log(`查询：${await runner.query()}`);
+            console.log(`签到：${await runner.sign()}`);
+            runner.saveCache();
+            break;
+        } catch (e) {
+            const msg = e.message || e;
+            const isAuthFail = /401|403|登录失效|未登录|token|授权|鉴权|登录状态|get_openid/i.test(msg);
+            if (attempt === 0 && (usedCache || isAuthFail)) {
+                console.log(`🔄 token失效，清除缓存重新登录...`);
+                const c = readTokenCache();
+                delete c[openid];
+                writeTokenCache(c);
+                continue;
+            }
+            console.log(`执行失败：${msg}`);
+        }
     }
 }
 

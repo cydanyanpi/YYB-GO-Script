@@ -22,9 +22,29 @@
 //   npm install axios http-proxy-agent https-proxy-agent socks-proxy-agent
 
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
 const { SocksProxyAgent } = require("socks-proxy-agent");
 const { HttpsProxyAgent } = require("https-proxy-agent");
 const { HttpProxyAgent } = require("http-proxy-agent");
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "mdhy_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
 
 delete process.env.HTTP_PROXY;
 delete process.env.HTTPS_PROXY;
@@ -687,55 +707,97 @@ async function runAccount(index, total, server) {
     console.log(`⏳ [延迟] 启动延迟 ${(delay / 1000).toFixed(1)}s`);
     await sleep(delay);
 
-    const code = await getCode(server);
-    if (!code) {
-        result.error = "获取 code 失败";
-        return result;
+    // 尝试缓存（不过期，业务失败自动重登）
+    let login = null;
+    let usedCache = false;
+    const cache = readTokenCache();
+    const cached = cache[server] || {};
+    if (cached.cookie || cached.ucAccessToken) {
+        login = {
+            cookie: cached.cookie || "",
+            ucAccessToken: cached.ucAccessToken || "",
+            uid: cached.uid || "",
+            sukey: cached.sukey || "",
+        };
+        usedCache = true;
+        console.log(`💾 [${server}] 使用缓存登录凭据`);
     }
 
-    const login = await loginByCode(code, proxyAgent, server);
+    for (let attempt = 0; attempt < 2; attempt++) {
+        if (attempt === 1 || !login) {
+            if (attempt === 1) {
+                console.log(`🔄 [${server}] 登录凭据失效，重新登录...`);
+                const c = readTokenCache();
+                delete c[server];
+                writeTokenCache(c);
+            }
+            const code = await getCode(server);
+            if (!code) {
+                result.error = "获取 code 失败";
+                return result;
+            }
+            login = await loginByCode(code, proxyAgent, server);
+            if (!login.cookie && !login.ucAccessToken) {
+                result.error = "未获取到 cookie 和 ucAccessToken";
+                return result;
+            }
+            const c = readTokenCache();
+            c[server] = {
+                cookie: login.cookie,
+                ucAccessToken: login.ucAccessToken,
+                uid: login.uid,
+                sukey: login.sukey,
+            };
+            writeTokenCache(c);
+        }
 
-    result.cookie = login.cookie ? mask(login.cookie) : "-";
-    result.ucAccessToken = login.ucAccessToken ? mask(login.ucAccessToken) : "-";
+        result.cookie = login.cookie ? mask(login.cookie) : "-";
+        result.ucAccessToken = login.ucAccessToken ? mask(login.ucAccessToken) : "-";
 
-    if (!login.cookie && !login.ucAccessToken) {
-        result.error = "未获取到 cookie 和 ucAccessToken";
-        return result;
-    }
+        let before = {
+            success: false,
+            mobile: "-",
+            points: "-",
+        };
+        let authFailed = false;
 
-    let before = {
-        success: false,
-        mobile: "-",
-        points: "-",
-    };
+        if (login.cookie) {
+            before = await getUserInfo(login.cookie, proxyAgent, server);
+            result.mobile = before.mobile;
+            result.beforePoints = before.points;
+            if (usedCache && attempt === 0 && !before.success) authFailed = true;
+        }
 
-    if (login.cookie) {
-        before = await getUserInfo(login.cookie, proxyAgent, server);
-        result.mobile = before.mobile;
-        result.beforePoints = before.points;
-    }
+        await sleep(random(2000, 5000));
 
-    await sleep(random(2000, 5000));
+        const s1 = await signIn(login.cookie, proxyAgent, server);
+        result.sign1 = s1.message;
+        if (usedCache && attempt === 0 && login.cookie && !s1.success) authFailed = true;
 
-    const s1 = await signIn(login.cookie, proxyAgent, server);
-    result.sign1 = s1.message;
+        await sleep(random(2000, 5000));
 
-    await sleep(random(2000, 5000));
+        const s2 = await signIn2(login.ucAccessToken, proxyAgent, server);
+        result.sign2 = s2.message;
 
-    const s2 = await signIn2(login.ucAccessToken, proxyAgent, server);
-    result.sign2 = s2.message;
+        await sleep(random(2000, 5000));
 
-    await sleep(random(2000, 5000));
+        if (login.cookie) {
+            const after = await getUserInfo(login.cookie, proxyAgent, server);
+            result.afterPoints = after.points;
+        }
 
-    if (login.cookie) {
-        const after = await getUserInfo(login.cookie, proxyAgent, server);
-        result.afterPoints = after.points;
-    }
+        if (authFailed) {
+            console.log(`⚠️ [${server}] 登录凭据失效，准备重登`);
+            continue;
+        }
 
-    result.success = Boolean(s1.success || s2.success);
+        result.success = Boolean(s1.success || s2.success);
 
-    if (!result.success) {
-        result.error = `${result.sign1}; ${result.sign2}`;
+        if (!result.success) {
+            result.error = `${result.sign1}; ${result.sign2}`;
+        }
+
+        break;
     }
 
     return result;

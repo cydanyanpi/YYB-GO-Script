@@ -111,6 +111,29 @@ REQUEST_COUNT = 3
 print_lock = Lock()
 AUTO_COOKIE_INDEX_BY_VALUE: Dict[str, int] = {}
 
+# ==================== Cookie 缓存（不过期，失效自动重登） ====================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "sfsy_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, str]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, str]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"[缓存] 写入失败: {exc}")
+
 
 class Logger:
     def __init__(self):
@@ -348,6 +371,13 @@ class AutoCookieManager:
     def get_cookie_for_wxid(self, wxid: str) -> Optional[str]:
         """通过 /wxapp/getCode 拿到 code 后，走 UCMP 换取顺丰 Cookie。
         """
+        # 命中缓存则直接复用，跳过取 code + UCMP 换绑流程
+        cache = read_token_cache()
+        cached_cookie = (cache.get(wxid) or {}).get("cookie", "")
+        if cached_cookie:
+            _log_global(f"💾 {wxid[:10]}*** [缓存] 使用缓存cookie")
+            return cached_cookie
+
         code = self._get_wx_code(wxid, SF_WX_APPID)
         if not code:
             return None
@@ -457,6 +487,10 @@ class AutoCookieManager:
             cookie_str = ";".join(parts)
             masked_mobile = login_mobile[:3] + "****" + login_mobile[7:] if len(login_mobile) >= 7 else login_mobile
             _log_global(f"✅ {wxid[:10]}*** 自动获取凭证换绑成功 ➔ 手机: {masked_mobile}")
+            # 写入缓存
+            cache = read_token_cache()
+            cache[wxid] = {"cookie": cookie_str, "mobile": login_mobile}
+            write_token_cache(cache)
             return cookie_str
         except Exception as e:
             _log_global(f"❌ {wxid[:10]}*** 换取 Cookie 异常: {str(e)[:80]}")
@@ -972,7 +1006,7 @@ def _auto_fetch_cookies() -> List[str]:
         return []
 
     _log_global(f"🔎 顺丰 YYB_SERVER 解析到 {len(wxids)} 个账号")
-    cookies: List[str] = []
+    cookies: List[Tuple[str, str]] = []
     AUTO_COOKIE_INDEX_BY_VALUE.clear()
 
     for index, wxid in enumerate(wxids, 1):
@@ -983,7 +1017,7 @@ def _auto_fetch_cookies() -> List[str]:
             _log_global(f"❌ 账号[{index}] {mask_account(wxid)} 自动换 Cookie 异常：{str(exc)[:80]}")
 
         if cookie and "_login_mobile_" in cookie:
-            cookies.append(cookie)
+            cookies.append((wxid, cookie))
             AUTO_COOKIE_INDEX_BY_VALUE[cookie] = index
             _log_global(f"👤 账号[{index}] {mask_account(wxid)} 自动换 Cookie 成功")
             continue
@@ -1048,10 +1082,24 @@ def main():
     print("==================================================")
 
     results: List[Dict[str, Any]] = []
-    for idx, raw in enumerate(account_list):
+    for idx, (wxid, raw) in enumerate(account_list):
         result = run_account(raw, idx)
         if not result.get('success'):
             result.setdefault('error', result.get('phone') or '登录失效')
+            # 缓存 cookie 失效：清除该账号缓存后重新获取凭证并重试一次
+            cache = read_token_cache()
+            if wxid in cache:
+                print(f"🔄 [重登] 账号{idx + 1} cookie失效，重新登录")
+                del cache[wxid]
+                write_token_cache(cache)
+                try:
+                    new_cookie = AutoCookieManager().get_cookie_for_wxid(wxid)
+                except Exception:
+                    new_cookie = None
+                if new_cookie:
+                    result = run_account(new_cookie, idx)
+                    if not result.get('success'):
+                        result.setdefault('error', result.get('phone') or '登录失效')
         results.append(result)
         time.sleep(2)
 

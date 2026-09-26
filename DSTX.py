@@ -71,6 +71,36 @@ WEB_REPORT_URL = "https://webreport.pospal.cn/datareport/simple/web_report"
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF WindowsWechat(0x63090a13) UnifiedPCWindowsWechat(0xf2541923) XWEB/19823"
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "dstx_token_cache.json")
+
+
+def read_token_cache() -> dict:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"  [缓存] 写入失败: {exc}")
+
+
+def is_auth_fail_data(data) -> bool:
+    import re
+    msg = ""
+    if isinstance(data, dict):
+        msg = str(data.get("messages") or data.get("message") or data.get("msg") or "")
+    return bool(re.search(r'登录|未登录|授权|visitor|失效|过期|登录态|请重新|身份|凭证|relogin|session', msg, re.IGNORECASE))
+
 
 def sleep(seconds: float) -> None:
     time.sleep(seconds)
@@ -731,58 +761,101 @@ def run_account(index: int, total: int, server: str) -> dict:
     log_step("⏳", "延迟", f"启动延迟 {delay}s")
     sleep(delay)
 
-    store_id, customer_uid, visitor_uid, raw, member_info = login_by_code(server, proxies)
+    _, ref = parse_yyb_go_entry(server)
 
-    if not store_id or not customer_uid or not visitor_uid:
-        if isinstance(raw, dict) and raw.get("isLogin") is False:
-            result["error"] = "微信授权成功，但未登录都市甜心会员；请先在小程序同意隐私并完成会员注册/绑定"
+    # 尝试缓存登录态（store_id/customer_uid/visitor_uid，不过期，鉴权失败自动重登）
+    cache = read_token_cache()
+    cached = cache.get(ref) or {}
+    store_id = cached.get("store_id", "")
+    customer_uid = cached.get("customer_uid", "")
+    visitor_uid = cached.get("visitor_uid", "")
+    used_cache = bool(visitor_uid)
+    if visitor_uid:
+        log_step("💾", "缓存", f"使用缓存登录态 store={store_id} visitor={mask_value(visitor_uid)}")
+
+    for attempt in range(2):
+        if attempt == 1 or not visitor_uid:
+            if attempt == 1:
+                log_step("🔄", "重登", "登录态失效，重新登录...")
+                cache = read_token_cache()
+                if ref in cache:
+                    del cache[ref]
+                    write_token_cache(cache)
+            store_id, customer_uid, visitor_uid, raw, member_info = login_by_code(server, proxies)
+
+            if not store_id or not customer_uid or not visitor_uid:
+                if isinstance(raw, dict) and raw.get("isLogin") is False:
+                    result["error"] = "微信授权成功，但未登录都市甜心会员；请先在小程序同意隐私并完成会员注册/绑定"
+                else:
+                    result["error"] = f"登录识别失败，最后响应：{json_preview(raw, 800)}"
+                log_error("账号", result["error"])
+                return result
+
+            cache = read_token_cache()
+            cache[ref] = {
+                "store_id": store_id,
+                "customer_uid": customer_uid,
+                "visitor_uid": visitor_uid,
+                "nickname": member_info.get("nickname", "-"),
+                "phone": member_info.get("phone", "-"),
+                "point": member_info.get("point", "-"),
+                "category": member_info.get("category", "-"),
+            }
+            write_token_cache(cache)
         else:
-            result["error"] = f"登录识别失败，最后响应：{json_preview(raw, 800)}"
-        log_error("账号", result["error"])
+            member_info = {
+                "nickname": cached.get("nickname", "-"),
+                "phone": cached.get("phone", "-"),
+                "point": cached.get("point", "-"),
+                "category": cached.get("category", "-"),
+            }
+
+        result["store_id"] = store_id
+        result["customer_uid"] = mask_value(customer_uid)
+        result["visitor_uid"] = mask_value(visitor_uid)
+        result["nickname"] = member_info.get("nickname", "-")
+        result["phone"] = member_info.get("phone", "-")
+        result["point"] = member_info.get("point", "-")
+        result["category"] = member_info.get("category", "-")
+
+        log_step("🪪", "会员", f"昵称={result['nickname']} | 等级={result['category']} | 积分={result['point']}")
+
+        q_ok, q_data, today_checked_before = query_checkin_points(server, store_id, visitor_uid, proxies)
+        if not q_ok and used_cache and attempt == 0 and is_auth_fail_data(q_data):
+            log_step("🔄", "重登", f"签到查询鉴权失败({str(q_data.get('messages'))[:60]})，重新登录...")
+            visitor_uid = None
+            continue
+        result["before_status"] = "已签到" if today_checked_before else "未签到"
+
+        if today_checked_before:
+            result["success"] = True
+            result["real_sign"] = "今日已签到，跳过"
+            result["web_report"] = "今日已签到，跳过"
+            result["after_status"] = "已签到"
+            log_success("账号", "今日已签到，账号处理完成")
+            return result
+
+        real_ok, real_msg = real_sign_in(server, store_id, visitor_uid, proxies)
+        result["real_sign"] = real_msg
+
+        sleep(2)
+
+        web_ok, web_msg = web_report_sign_in(server, store_id, customer_uid, visitor_uid, proxies)
+        result["web_report"] = web_msg
+
+        sleep(5)
+
+        _, _, today_checked_after = query_checkin_points(server, store_id, visitor_uid, proxies)
+        result["after_status"] = "已签到" if today_checked_after else "未签到"
+
+        result["success"] = bool(today_checked_after or real_ok or web_ok)
+        if result["success"]:
+            log_success("账号", "账号处理完成")
+        else:
+            result["error"] = "签到后状态未更新，且签到接口未成功"
+            log_error("账号", result["error"])
+
         return result
-
-    result["store_id"] = store_id
-    result["customer_uid"] = mask_value(customer_uid)
-    result["visitor_uid"] = mask_value(visitor_uid)
-    result["nickname"] = member_info.get("nickname", "-")
-    result["phone"] = member_info.get("phone", "-")
-    result["point"] = member_info.get("point", "-")
-    result["category"] = member_info.get("category", "-")
-
-    log_step("🪪", "会员", f"昵称={result['nickname']} | 等级={result['category']} | 积分={result['point']}")
-
-    _, _, today_checked_before = query_checkin_points(server, store_id, visitor_uid, proxies)
-    result["before_status"] = "已签到" if today_checked_before else "未签到"
-
-    if today_checked_before:
-        result["success"] = True
-        result["real_sign"] = "今日已签到，跳过"
-        result["web_report"] = "今日已签到，跳过"
-        result["after_status"] = "已签到"
-        log_success("账号", "今日已签到，账号处理完成")
-        return result
-
-    real_ok, real_msg = real_sign_in(server, store_id, visitor_uid, proxies)
-    result["real_sign"] = real_msg
-
-    sleep(2)
-
-    web_ok, web_msg = web_report_sign_in(server, store_id, customer_uid, visitor_uid, proxies)
-    result["web_report"] = web_msg
-
-    sleep(5)
-
-    _, _, today_checked_after = query_checkin_points(server, store_id, visitor_uid, proxies)
-    result["after_status"] = "已签到" if today_checked_after else "未签到"
-
-    result["success"] = bool(today_checked_after or real_ok or web_ok)
-    if result["success"]:
-        log_success("账号", "账号处理完成")
-    else:
-        result["error"] = "签到后状态未更新，且签到接口未成功"
-        log_error("账号", result["error"])
-
-    return result
 
 
 def build_notify(results: list[dict]) -> str:

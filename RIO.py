@@ -74,6 +74,30 @@ USER_AGENT = (
 )
 
 
+# ==================== Token 缓存（不过期，失效自动重登） ====================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "rio_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"⚠️ [缓存] 写入失败: {exc}")
+
+
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -459,21 +483,47 @@ def run_account(index: int, total: int, server_entry: str) -> Dict[str, Any]:
     print(f"⏳ [延迟] 启动延迟 {delay}s")
     sleep(delay)
 
-    code = get_code(server_entry)
-    if not code:
-        result["error"] = "获取 code 失败"
-        return result
+    cache = read_token_cache()
+    cached = cache.get(wxid) or {}
+    authorization = cached.get("authorization", "")
+    used_cache = bool(authorization)
+    if authorization:
+        print(f"💾 [缓存] 使用缓存token")
 
-    authorization, login_data = login_with_code(code, proxies, parsed_server)
-    if not authorization:
-        result["error"] = f"登录失败: {json_preview(login_data)}"
-        return result
+    login_data = {}
+    for attempt in range(2):
+        if attempt == 1 or not authorization:
+            if attempt == 1:
+                print("🔄 [重登] token失效，重新登录")
+                cache = read_token_cache()
+                if wxid in cache:
+                    del cache[wxid]
+                    write_token_cache(cache)
+            code = get_code(server_entry)
+            if not code:
+                result["error"] = "获取 code 失败"
+                return result
+            authorization, login_data = login_with_code(code, proxies, parsed_server)
+            if not authorization:
+                result["error"] = f"登录失败: {json_preview(login_data)}"
+                return result
+            cache = read_token_cache()
+            cache[wxid] = {"authorization": authorization}
+            write_token_cache(cache)
 
-    result["token"] = "获取成功"
-    if login_data and isinstance(login_data, dict):
-        result["nickname"] = login_data.get("nick_name", "-")
-        result["phone"] = mask(login_data.get("phone", ""))
-        result["points"] = to_int(login_data.get("points", 0))
+        result["token"] = "获取成功"
+        if login_data and isinstance(login_data, dict):
+            result["nickname"] = login_data.get("nick_name", "-")
+            result["phone"] = mask(login_data.get("phone", ""))
+            result["points"] = to_int(login_data.get("points", 0))
+
+        probe = do_sign(authorization, proxies, parsed_server)
+        if not probe.get("success") and attempt == 0 and used_cache:
+            msg = str(probe.get("message", ""))
+            if any(k in msg for k in ("登录", "未登录", "授权", "失效", "token")):
+                print(f"🔄 [重登] 缓存token失效：{msg}")
+                continue
+        break
 
     # 签到
     sign_result = do_sign(authorization, proxies, parsed_server)

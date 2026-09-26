@@ -4,6 +4,26 @@ const axios = require("axios");
 const { SocksProxyAgent } = require("socks-proxy-agent");
 const { HttpsProxyAgent } = require("https-proxy-agent");
 const { HttpProxyAgent } = require("http-proxy-agent");
+const fs = require("fs");
+const path = require("path");
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "kkkl_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
 
 delete process.env.HTTP_PROXY;
 delete process.env.HTTPS_PROXY;
@@ -468,37 +488,69 @@ async function runAccount(index, total, server) {
     console.log(`⏳ [延迟] 启动延迟 ${(delay / 1000).toFixed(1)}s`);
     await sleep(delay);
 
-    const code = await getCode(server);
-    if (!code) {
-        result.error = "获取 code 失败";
-        return result;
+    // 尝试缓存（不过期，鉴权失败自动重登）
+    const cache = readTokenCache();
+    const cached = cache[server] || {};
+    let token = null;
+    let usedCache = false;
+    if (cached.token) {
+        token = cached.token;
+        usedCache = true;
+        console.log(`💾 [${server}] 使用缓存token: ${mask(token)}`);
     }
 
-    const login = await getUserToken(code, proxyAgent, server);
-    if (!login.token) {
-        result.error = "获取 token 失败";
-        return result;
-    }
+    for (let attempt = 0; attempt < 2; attempt++) {
+        if (attempt === 1 || !token) {
+            if (attempt === 1) {
+                console.log(`🔄 [${server}] token失效，重新登录...`);
+                const c = readTokenCache();
+                delete c[server];
+                writeTokenCache(c);
+            }
+            const code = await getCode(server);
+            if (!code) {
+                result.error = "获取 code 失败";
+                return result;
+            }
 
-    result.token = mask(login.token);
+            const login = await getUserToken(code, proxyAgent, server);
+            if (!login.token) {
+                result.error = "获取 token 失败";
+                return result;
+            }
+            token = login.token;
+            const c = readTokenCache();
+            c[server] = { token };
+            writeTokenCache(c);
+        }
 
-    const beforeInfo = await getUserInfo(login.token, proxyAgent, server);
-    result.beforePoint = beforeInfo?.point ?? "-";
+        result.token = mask(token);
 
-    await sleep(random(2000, 5000));
+        const beforeInfo = await getUserInfo(token, proxyAgent, server);
+        result.beforePoint = beforeInfo?.point ?? "-";
 
-    const sign = await addSign(login.token, proxyAgent, server);
-    result.signMsg = sign.message;
+        await sleep(random(2000, 5000));
 
-    await sleep(random(2000, 5000));
+        const sign = await addSign(token, proxyAgent, server);
+        result.signMsg = sign.message;
 
-    const afterInfo = await getUserInfo(login.token, proxyAgent, server);
-    result.afterPoint = afterInfo?.point ?? "-";
+        await sleep(random(2000, 5000));
 
-    result.success = sign.success || String(sign.message).includes("已") || String(sign.message).includes("重复");
+        const afterInfo = await getUserInfo(token, proxyAgent, server);
+        result.afterPoint = afterInfo?.point ?? "-";
 
-    if (!result.success) {
-        result.error = sign.message;
+        result.success = sign.success || String(sign.message).includes("已") || String(sign.message).includes("重复");
+
+        // 缓存token签到失败且非"已签" → 判定token失效，重登重试
+        if (usedCache && attempt === 0 && !result.success) {
+            console.log(`⚠️ [${server}] 签到返回: ${sign.message}，判定token失效`);
+            continue;
+        }
+
+        if (!result.success) {
+            result.error = sign.message;
+        }
+        break;
     }
 
     return result;

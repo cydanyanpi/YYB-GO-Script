@@ -15,6 +15,27 @@
 let notify;
 try { notify = require("./sendNotify"); } catch (_) { try { notify = require("sendNotify"); } catch (__) { notify = null; } }
 
+const fs = require("fs");
+const path = require("path");
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "lthwyccsc_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
+
 // ====================== 环境变量解析 ======================
 const SERVERS = (process.env.YYB_SERVER || "")
     .split(/\r?\n/)
@@ -237,50 +258,84 @@ async function runAccount(index, total, entry) {
 
     await sleep(rand(1000, 3000));
 
-    let code, token, wid;
-    try {
-        code = await getCode(server, ref);
-    } catch (e) { result.error = "获取 code 失败: " + e.message; console.log("  ❌ " + result.error); return result; }
-
-    try {
-        const loginRes = await loginByCode(code);
-        token = loginRes.token;
-        wid = loginRes.wid;
-    } catch (e) { result.error = "登录失败: " + e.message; console.log("  ❌ " + result.error); return result; }
-
-    // 查签到状态
-    let info;
-    try {
-       info = await getSignMainInfo(token, wid);
-        console.log("  [签到] 已签到: " + info.hasSign + " 连续: " + (info.signedDate || 0) + "天 本月: " + (info.monthCumulativeSignDays || 0) + "天");
-    } catch (e) {
-        console.log("  [签到] 查询状态失败: " + e.message + "，直接尝试签到");
+    // 尝试缓存（不过期，鉴权失败自动重登）
+    const cache = readTokenCache();
+    const cached = cache[entry] || {};
+    let token = null, wid = null;
+    let usedCache = false;
+    if (cached.token && cached.wid) {
+        token = cached.token;
+        wid = cached.wid;
+        usedCache = true;
+        console.log("  💾 使用缓存token: " + mask(token) + " wid: " + wid);
     }
 
-    // 签到
-   if (info && info.hasSign) {
-        result.signMsg = "今日已签到（连续" + (info.signedDate || 0) + "天）";
-       result.success = true;
-    } else {
-        try {
-            const signRes = await doSign(token, wid);
-            if (signRes.already) result.signMsg = "今日已签到: " + signRes.message;
-            else result.signMsg = "签到成功: " + signRes.message;
-            result.success = signRes.success;
-            console.log("  [签到] " + result.signMsg);
-        } catch (e) {
-            result.signMsg = "签到异常: " + e.message;
-            console.log("  ❌ " + result.signMsg);
+    for (let attempt = 0; attempt < 2; attempt++) {
+        if (attempt === 1 || !token) {
+            if (attempt === 1) {
+                console.log("  🔄 token失效，清除缓存重新登录...");
+                const c = readTokenCache();
+                delete c[entry];
+                writeTokenCache(c);
+            }
+            let code;
+            try {
+                code = await getCode(server, ref);
+            } catch (e) { result.error = "获取 code 失败: " + e.message; console.log("  ❌ " + result.error); return result; }
+
+            try {
+                const loginRes = await loginByCode(code);
+                token = loginRes.token;
+                wid = loginRes.wid;
+            } catch (e) { result.error = "登录失败: " + e.message; console.log("  ❌ " + result.error); return result; }
+
+            const c = readTokenCache();
+            c[entry] = { token, wid };
+            writeTokenCache(c);
         }
-    }
 
-    // 积分
-    try {
-        const pts = await queryPoints(token, wid);
-        result.pointsMsg = pts.success ? ("可用: " + pts.available + " / 总计: " + pts.total) : "积分查询失败";
-        console.log("  [积分] " + result.pointsMsg);
-    } catch (e) {
-        result.pointsMsg = "积分查询异常";
+        // 查签到状态
+        let info;
+        try {
+           info = await getSignMainInfo(token, wid);
+            console.log("  [签到] 已签到: " + info.hasSign + " 连续: " + (info.signedDate || 0) + "天 本月: " + (info.monthCumulativeSignDays || 0) + "天");
+        } catch (e) {
+            console.log("  [签到] 查询状态失败: " + e.message + "，直接尝试签到");
+            // 缓存token查询失败 → 判定鉴权失效，重登重试
+            if (usedCache && attempt === 0) {
+                console.log("  ⚠️ 判定token失效");
+                continue;
+            }
+        }
+
+        // 签到
+       if (info && info.hasSign) {
+            result.signMsg = "今日已签到（连续" + (info.signedDate || 0) + "天）";
+           result.success = true;
+        } else {
+            try {
+                const signRes = await doSign(token, wid);
+                if (signRes.already) result.signMsg = "今日已签到: " + signRes.message;
+                else result.signMsg = "签到成功: " + signRes.message;
+                result.success = signRes.success;
+                console.log("  [签到] " + result.signMsg);
+            } catch (e) {
+                result.signMsg = "签到异常: " + e.message;
+                console.log("  ❌ " + result.signMsg);
+                if (usedCache && attempt === 0 && /登录|失效|token|鉴权|errcode/i.test(e.message)) continue;
+            }
+        }
+
+        // 积分
+        try {
+            const pts = await queryPoints(token, wid);
+            result.pointsMsg = pts.success ? ("可用: " + pts.available + " / 总计: " + pts.total) : "积分查询失败";
+            console.log("  [积分] " + result.pointsMsg);
+        } catch (e) {
+            result.pointsMsg = "积分查询异常";
+        }
+
+        break;
     }
 
     return result;

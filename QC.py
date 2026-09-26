@@ -217,6 +217,30 @@ def random_int(min_val: int, max_val: int) -> int:
 def get_ua() -> str:
     return random.choice(USER_AGENT_LIST)
 
+
+# ===================== Token 缓存（不过期，失效自动重登） =====================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "qc_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"[缓存] 写入失败: {exc}")
+
 def build_direct_transport() -> AsyncHTTPTransport:
     return AsyncHTTPTransport()
 
@@ -579,54 +603,74 @@ class QueChaoBot:
         try:
             await sleep(random_int(2000, 5000))
 
-            # 1. 获取code（关键日志已优化）
-            code = await self.get_code()
-            if not code:
-                result["error"] = "获取code失败"
-                return result
+            # 0. 尝试缓存 token（命中则跳过取 code + 换 token）
+            _, ref = parse_yyb_go_entry(self.server)
+            cache = read_token_cache()
+            cached = cache.get(ref) or {}
+            self.token = cached.get("access_token", "") or None
+            used_cache = bool(self.token)
+            if self.token:
+                print(f"💾 [{self.server}] [缓存] 使用缓存token")
 
-            # 2. 获取token
-            token = await self.get_token_by_code(code)
-            if not token:
-                result["error"] = "获取token失败"
-                return result
+            for attempt in range(2):
+                if attempt == 1 or not self.token:
+                    if attempt == 1:
+                        print(f"🔄 [{self.server}] [重登] token失效，重新登录")
+                        cache = read_token_cache()
+                        if ref in cache:
+                            del cache[ref]
+                            write_token_cache(cache)
+                    code = await self.get_code()
+                    if not code:
+                        result["error"] = "获取code失败"
+                        return result
+                    self.token = await self.get_token_by_code(code)
+                    if not self.token:
+                        result["error"] = "获取token失败"
+                        return result
+                    cache = read_token_cache()
+                    cache[ref] = {"access_token": self.token}
+                    write_token_cache(cache)
 
-            # 3. 执行业务
-            async with self:
-                initial_balance = await self.get_user_balance()
-                if initial_balance is None:
-                    result["error"] = "获取初始积分失败"
-                    return result
+                # 执行业务
+                async with self:
+                    initial_balance = await self.get_user_balance()
+                    if initial_balance is None:
+                        if attempt == 0 and used_cache:
+                            print(f"🔄 [{self.server}] [重登] 初始积分查询失败，判定token失效")
+                            continue
+                        result["error"] = "获取初始积分失败"
+                        return result
+                    result["initial_score"] = initial_balance
+                    print(f"💰 [{self.server}] 初始积分: {initial_balance}")
 
-                result["initial_score"] = initial_balance
-                print(f"💰 [{self.server}] 初始积分: {initial_balance}")
+                    # 每日签到
+                    sign_success, sign_msg = await self.daily_sign()
+                    result["sign_msg"] = sign_msg
+                    await sleep(1000)
 
-                # 每日签到
-                sign_success, sign_msg = await self.daily_sign()
-                result["sign_msg"] = sign_msg
-                await sleep(1000)
+                    # 完成日常任务
+                    tasks = await self.get_task_list()
+                    task_msgs = []
+                    for task in tasks:
+                        task_guid = task.get("task_guid", "")
+                        task_desc = task.get("task_sub_desc", task.get("task_title", "未知任务"))
+                        if task_guid:
+                            success, msg = await self.complete_task(task_guid, task_desc)
+                            task_msgs.append(msg)
+                            await sleep(1000)
+                    result["task_msgs"] = task_msgs
 
-                # 完成日常任务
-                tasks = await self.get_task_list()
-                task_msgs = []
-                for task in tasks:
-                    task_guid = task.get("task_guid", "")
-                    task_desc = task.get("task_sub_desc", task.get("task_title", "未知任务"))
-                    if task_guid:
-                        success, msg = await self.complete_task(task_guid, task_desc)
-                        task_msgs.append(msg)
-                        await sleep(1000)
-                result["task_msgs"] = task_msgs
+                    # 获取最终积分
+                    final_balance = await self.get_user_balance()
+                    if final_balance is not None:
+                        result["final_score"] = final_balance
+                        result["gained_score"] = final_balance - initial_balance
+                        print(f"📊 [{self.server}] 今日新增: {result['gained_score']}积分 | 当前: {final_balance}")
 
-                # 获取最终积分
-                final_balance = await self.get_user_balance()
-                if final_balance is not None:
-                    result["final_score"] = final_balance
-                    result["gained_score"] = final_balance - initial_balance
-                    print(f"📊 [{self.server}] 今日新增: {result['gained_score']}积分 | 当前: {final_balance}")
-
-                result["success"] = True
-                print(f"✅ [{self.server}] 任务执行完成")
+                    result["success"] = True
+                    print(f"✅ [{self.server}] 任务执行完成")
+                    break
 
         except Exception as e:
             result["error"] = str(e)

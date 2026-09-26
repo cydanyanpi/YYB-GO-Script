@@ -29,20 +29,23 @@ COMMON_HEADERS = {
 
 
 # ================= cookie =================
-def load_cookie():
+def read_token_cache():
     if not os.path.exists(COOKIE_FILE):
         return {}
     try:
         with open(COOKIE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except Exception:
         return {}
 
 
-def save_cookie(data):
-    os.makedirs(os.path.dirname(COOKIE_FILE), exist_ok=True)
-    with open(COOKIE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def write_token_cache(data):
+    try:
+        os.makedirs(os.path.dirname(COOKIE_FILE), exist_ok=True)
+        with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[缓存] 写入失败: {e}")
 
 
 # ================= YYB_SERVER 环境变量解析 =================
@@ -252,7 +255,7 @@ def do_sign(cookie):
 
 # ================= 主程序 =================
 def main():
-    old_cookie = load_cookie()
+    old_cookie = read_token_cache()
     accounts = parse_yyb_go()
 
     print("账号数量:", len(accounts))
@@ -346,7 +349,7 @@ def main():
 
     # 合并并保存最新cookie（含shop_code）
     old_cookie.update(update_cookie)
-    save_cookie(old_cookie)
+    write_token_cache(old_cookie)
 
     print("\n全部执行完成")
 

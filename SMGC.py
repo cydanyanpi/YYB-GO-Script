@@ -110,6 +110,30 @@ def json_preview(data: Any, limit: int = 800) -> str:
 
 # ============ YYB Server 交互 ============
 
+# ==================== Token 缓存（不过期，失效自动重登） ====================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "smgc_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"[缓存] 写入失败: {exc}")
+
+
 def parse_yyb_go_entry(raw_value: str):
     raw_value = (raw_value or "").strip()
     if not raw_value:
@@ -424,17 +448,22 @@ class SmSignin:
         return None
 
     def process_account(self, code: str) -> Dict[str, Any]:
+        if not self.get_project_config_id():
+            return {"mallName": self.mall_name, "mallId": self.mall_id, "success": False,
+                    "token": "-", "nickName": "-", "points": "-", "signStatus": "-",
+                    "signMsg": "-", "error": "获取项目ID失败"}
+        if not self.login(code):
+            return {"mallName": self.mall_name, "mallId": self.mall_id, "success": False,
+                    "token": "-", "nickName": "-", "points": "-", "signStatus": "-",
+                    "signMsg": "-", "error": "登录失败"}
+        return self.run_business()
+
+    def run_business(self) -> Dict[str, Any]:
         result = {
             "mallName": self.mall_name, "mallId": self.mall_id,
             "success": False, "token": "-", "nickName": "-",
             "points": "-", "signStatus": "-", "signMsg": "-", "error": "",
         }
-        if not self.get_project_config_id():
-            result["error"] = "获取项目ID失败"
-            return result
-        if not self.login(code):
-            result["error"] = "登录失败"
-            return result
         result["token"] = mask(self.token)
         result["nickName"] = self.nick_name
 
@@ -488,13 +517,44 @@ def run_mall_for_account(
         delay = random.randint(1, 2)
         sleep(delay)
 
-        code = get_wx_code(server_entry)
-        if not code:
-            result["error"] = "获取 code 失败"
+        client = SmSignin(mall_name, mall_id, parsed_server, proxies)
+        if not client.get_project_config_id():
+            result["error"] = "获取项目ID失败"
             return result
 
-        client = SmSignin(mall_name, mall_id, parsed_server, proxies)
-        account_result = client.process_account(code)
+        cache_key = f"{wxid}|{mall_id}"
+        cache = read_token_cache()
+        client.token = (cache.get(cache_key) or {}).get("token", "")
+        used_cache = bool(client.token)
+        if client.token:
+            print(f"  💾 [缓存] 使用缓存token: {mask(client.token)}")
+
+        for attempt in range(2):
+            if attempt == 1 or not client.token:
+                if attempt == 1:
+                    print("  🔄 [重登] token失效，重新登录")
+                    cache = read_token_cache()
+                    if cache_key in cache:
+                        del cache[cache_key]
+                        write_token_cache(cache)
+                code = get_wx_code(server_entry)
+                if not code:
+                    result["error"] = "获取 code 失败"
+                    return result
+                if not client.login(code):
+                    result["error"] = "登录失败"
+                    return result
+                cache = read_token_cache()
+                cache[cache_key] = {"token": client.token}
+                write_token_cache(cache)
+
+            account_result = client.run_business()
+            if account_result.get("error") == "检查签到状态失败" and attempt == 0 and used_cache:
+                print("  🔄 [重登] 缓存token失效，重新登录")
+                continue
+            result.update(account_result)
+            return result
+
         result.update(account_result)
         return result
     except Exception:

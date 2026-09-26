@@ -103,6 +103,34 @@ USER_AGENT = (
 )
 
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "jdbclub_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"  [缓存] 写入失败: {exc}")
+
+
+def is_auth_fail_msg(msg: Any) -> bool:
+    import re
+    return bool(re.search(r'登录|未登录|授权|token|失效|过期|登录态|请重新|身份|凭证|查询用户信息失败', str(msg), re.IGNORECASE))
+
+
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -738,74 +766,101 @@ def run_account(index: int, total: int, server_entry: str) -> Dict[str, Any]:
     print(f"  [延迟] 启动延迟 {delay}s")
     sleep(delay)
 
-    # 获取3个code：登录、授权、手机验证
-    login_code = get_code(server_entry)
-    if not login_code:
-        result["error"] = "获取登录 code 失败"
-        return result
+    # 尝试缓存 token + apitoken（不过期，业务鉴权失败自动重登）
+    cache = read_token_cache()
+    cached = cache.get(wxid) or {}
+    token = cached.get("token", "")
+    apitoken = cached.get("apitoken", "")
+    used_cache = bool(token)
+    if token:
+        print(f"  [缓存] 使用缓存token: {mask(token)}")
 
-    sleep(1)
-    auth_code = get_code(server_entry)
-    if not auth_code:
-        result["error"] = "获取授权 code 失败"
-        return result
+    for attempt in range(2):
+        if attempt == 1 or not token:
+            if attempt == 1:
+                print("  [重登] token失效，重新登录...")
+                cache = read_token_cache()
+                if wxid in cache:
+                    del cache[wxid]
+                    write_token_cache(cache)
+            # 获取2个code：登录、授权
+            login_code = get_code(server_entry)
+            if not login_code:
+                result["error"] = "获取登录 code 失败"
+                return result
 
-    # 第3个code用 getPhoneNumber 接口
-    sleep(1)
-    phone_code = get_phone_code_yyb(server_entry)
-    if phone_code:
-        print("  [授权] 手机验证 code 获取成功")
-    else:
-        print("  [授权] 手机验证 code 获取失败，将跳过手机验证")
+            sleep(1)
+            auth_code = get_code(server_entry)
+            if not auth_code:
+                result["error"] = "获取授权 code 失败"
+                return result
 
-    # 登录
-    token, apitoken, raw_login = login_by_code(parsed_server, login_code, auth_code, proxies)
-    if not token:
-        result["error"] = f"登录失败: {json_preview(raw_login)}"
-        return result
+            # 第3个code用 getPhoneNumber 接口
+            sleep(1)
+            phone_code = get_phone_code_yyb(server_entry)
+            if phone_code:
+                print("  [授权] 手机验证 code 获取成功")
+            else:
+                print("  [授权] 手机验证 code 获取失败，将跳过手机验证")
 
-    result["token"] = mask(token)
+            # 登录
+            token, apitoken, raw_login = login_by_code(parsed_server, login_code, auth_code, proxies)
+            if not token:
+                result["error"] = f"登录失败: {json_preview(raw_login)}"
+                return result
 
-    try:
-        # 会员注册
-        member_ok, member_msg = check_and_register_member(parsed_server, token, apitoken, phone_code, proxies)
-        result["memberMsg"] = member_msg
+            cache = read_token_cache()
+            cache[wxid] = {"token": token, "apitoken": apitoken}
+            write_token_cache(cache)
+        else:
+            phone_code = ""
 
-        sleep(random.randint(1, 3))
+        result["token"] = mask(token)
 
-        # 签到
-        result["signMsg"] = do_signin(parsed_server, token, apitoken, proxies)
+        try:
+            # 会员注册
+            member_ok, member_msg = check_and_register_member(parsed_server, token, apitoken, phone_code, proxies)
+            if not member_ok and attempt == 0 and used_cache and is_auth_fail_msg(member_msg):
+                print(f"  [重登] 会员鉴权失败({str(member_msg)[:60]})，重新登录...")
+                token = None
+                continue
+            result["memberMsg"] = member_msg
 
-        sleep(random.randint(1, 3))
+            sleep(random.randint(1, 3))
 
-        # 分享小程序任务
-        result["taskShareMsg"] = do_task(parsed_server, SHARE_TASK_ID_FALLBACK, "分享小程序", token, apitoken, proxies)
+            # 签到
+            result["signMsg"] = do_signin(parsed_server, token, apitoken, proxies)
 
-        sleep(random.randint(1, 3))
+            sleep(random.randint(1, 3))
 
-        # 浏览商城任务
-        result["taskBrowseMsg"] = do_task(parsed_server, BROWSE_TASK_ID_FALLBACK, "浏览商城", token, apitoken, proxies)
+            # 分享小程序任务
+            result["taskShareMsg"] = do_task(parsed_server, SHARE_TASK_ID_FALLBACK, "分享小程序", token, apitoken, proxies)
 
-        sleep(random.randint(1, 3))
+            sleep(random.randint(1, 3))
 
-        # 抽奖
-        result["lotteryMsg"] = do_lottery(parsed_server, token, apitoken, proxies)
+            # 浏览商城任务
+            result["taskBrowseMsg"] = do_task(parsed_server, BROWSE_TASK_ID_FALLBACK, "浏览商城", token, apitoken, proxies)
 
-        sleep(random.randint(1, 3))
+            sleep(random.randint(1, 3))
 
-        # 积分
-        result["point"] = query_point(parsed_server, token, apitoken, proxies)
+            # 抽奖
+            result["lotteryMsg"] = do_lottery(parsed_server, token, apitoken, proxies)
 
-        # 阅历
-        result["seniority"] = query_seniority(parsed_server, token, apitoken, proxies)
+            sleep(random.randint(1, 3))
 
-        result["success"] = True
-        return result
+            # 积分
+            result["point"] = query_point(parsed_server, token, apitoken, proxies)
 
-    except Exception as exc:
-        result["error"] = traceback.format_exc().strip()
-        print(f"  [账号] 执行失败: {exc}")
-        return result
+            # 阅历
+            result["seniority"] = query_seniority(parsed_server, token, apitoken, proxies)
+
+            result["success"] = True
+            return result
+
+        except Exception as exc:
+            result["error"] = traceback.format_exc().strip()
+            print(f"  [账号] 执行失败: {exc}")
+            return result
 
 
 def build_notify(results: List[Dict[str, Any]]) -> str:

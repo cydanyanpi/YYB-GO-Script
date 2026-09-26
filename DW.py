@@ -404,8 +404,11 @@ SW_APP_LOGIN_PATH = "/api/v1/h5/user_core/mapi/users/wechat/login"
 # 小程序登录专用请求头里的 SK / ltk 等固定值 (得物-code.py 抓包内置)
 SW_APP_SK = "9U7MQhgnG8oZXxFz88rUDzxlHf8BQe4pNv5y7wMGKqoChmYNNPA4D56K2C4i066BtQ6yv8CKBW8vbXCdLdDH8MnN271p"
 SW_APP_LTK = "eMKkwoHDnMOrCMKcw6PDsMKRP8KUworCgsOue8OmwpbCkcKnNTjCk3fDk8OrLcOKa1TCnHrDjVDCh8Ogw7s9cMOLcCjCoMOyw5I="
-# Token 缓存文件
-TOKEN_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dwcookie.json")
+# Token 缓存文件（不过期，业务鉴权失败自动重登）
+TOKEN_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token_caches", "dw_token_cache.json")
+
+# 业务运行中检测到 token 失效时置位，由 main 清缓存并重登重试一次
+_AUTH_FAILED = False
 
 
 def parse_yyb_go_entry(raw_value):
@@ -563,6 +566,7 @@ def load_token_cache():
 
 def save_token_cache(cache):
     try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
         with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, indent=2, ensure_ascii=False)
     except Exception as exc:
@@ -570,28 +574,15 @@ def save_token_cache(cache):
 
 
 def is_token_valid(token_str):
-    """简单判断 JWT 是否过期 (解析 exp 字段)。"""
-    if not token_str:
-        return False
-    try:
-        parts = token_str.split(".")
-        if len(parts) != 3:
-            return False
-        payload = parts[1]
-        payload += "=" * (-len(payload) % 4)
-        decoded = base64.b64decode(payload)
-        data = json.loads(decoded)
-        exp = data.get("exp", 0)
-        return time.time() < exp
-    except Exception:
-        return False
+    """(已废弃 TTL 校验) 缓存不过期，仅业务鉴权失败时才重登。"""
+    return True
 
 
 def get_token_for_server(server_key):
-    """从缓存获取该服务对应的有效 token，若无或过期则返回空。"""
+    """从缓存获取该账号对应的 token 条目；存在即返回（不过期）。"""
     cache = load_token_cache()
     entry = cache.get(str(server_key))
-    if entry and is_token_valid(entry.get("x_auth_token", "")):
+    if entry and entry.get("x_auth_token"):
         return entry
     return None
 
@@ -1310,8 +1301,10 @@ def is_token_expired(status_code, data):
 
 
 def ensure_auth(code, data):
-    """鉴权失败时直接退出并打印换 token 提示。"""
+    """鉴权失败时标记并退出当前账号（由 main 捕获后清缓存重登重试一次）。"""
     if is_token_expired(code, data):
+        global _AUTH_FAILED
+        _AUTH_FAILED = True
         sys.exit("\n[错误] " + TOKEN_EXPIRED_HINT)
 
 
@@ -2336,40 +2329,62 @@ def main():
     # =====================================================================
     print("[初始化] 使用 YYB Go 动态获取 Token。")
     print("[初始化] 账号列表: %d 个" % len(SERVERS))
+    global _AUTH_FAILED
     n = len(SERVERS)
     for idx, server_entry in enumerate(SERVERS):
         print("\n" + "=" * 50)
         print(">>> 账号 %d / %d : %s" % (idx + 1, n, server_entry))
         print("=" * 50)
-        # 优先用缓存 token
-        token_entry = get_token_for_server(server_entry)
-        if token_entry:
-            print("[Token] 使用缓存 Token (最近更新: %s)" % token_entry.get("updated_at", "未知"))
-        else:
-            print("[Token] 缓存未命中或已过期，重新登录...")
-            code = get_code(server_entry)
-            if not code:
-                print("[错误] %s 获取 code 失败，跳过该账号。" % server_entry)
-                continue
-            x_auth_token, login_token = login_with_wx_code(code)
-            if not x_auth_token or not login_token:
-                print("[错误] %s 登录失败，跳过该账号。" % server_entry)
-                continue
-            update_token_for_server(server_entry, x_auth_token, login_token)
-            token_entry = {
-                "x_auth_token": x_auth_token,
-                "login_token": login_token,
-                "cookie_token": login_token,
-            }
-        x_auth_token = token_entry["x_auth_token"]
-        login_token = token_entry["login_token"]
-        cookie_token = token_entry.get("cookie_token", login_token)
-        headers = build_auth_headers(
-            x_auth_token=x_auth_token,
-            du_token=login_token,
-            cookie_token=cookie_token,
-        )
-        run_one(headers, "账号%d/%d" % (idx + 1, n))
+        _, ref = parse_yyb_go_entry(server_entry)
+        server_key = ref or server_entry
+
+        token_entry = None
+        for relogin_attempt in range(2):
+            if relogin_attempt == 1:
+                # attempt 0 检测到 token 失效 → 清缓存并重登
+                print("[重登] token失效，清除缓存重新登录...")
+                cache = load_token_cache()
+                if server_key in cache:
+                    del cache[server_key]
+                    save_token_cache(cache)
+                token_entry = None
+
+            if not token_entry:
+                token_entry = get_token_for_server(server_key)
+            if token_entry:
+                print("[缓存] 使用缓存 Token: %s" % str(token_entry.get("x_auth_token", ""))[:12])
+            else:
+                print("[Token] 缓存未命中，重新登录...")
+                code = get_code(server_entry)
+                if not code:
+                    print("[错误] %s 获取 code 失败，跳过该账号。" % server_entry)
+                    break
+                x_auth_token, login_token = login_with_wx_code(code)
+                if not x_auth_token or not login_token:
+                    print("[错误] %s 登录失败，跳过该账号。" % server_entry)
+                    break
+                update_token_for_server(server_key, x_auth_token, login_token)
+                token_entry = {
+                    "x_auth_token": x_auth_token,
+                    "login_token": login_token,
+                    "cookie_token": login_token,
+                }
+
+            x_auth_token = token_entry["x_auth_token"]
+            login_token = token_entry["login_token"]
+            cookie_token = token_entry.get("cookie_token", login_token)
+            headers = build_auth_headers(
+                x_auth_token=x_auth_token,
+                du_token=login_token,
+                cookie_token=cookie_token,
+            )
+            _AUTH_FAILED = False
+            run_one(headers, "账号%d/%d" % (idx + 1, n))
+            if not _AUTH_FAILED or relogin_attempt == 1:
+                break
+            # token 失效：下一轮清缓存重登
+            token_entry = None
+
         if idx < n - 1:
             random_sleep(5)
 

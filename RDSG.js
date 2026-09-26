@@ -1,6 +1,26 @@
 // name: 热带时光
 // cron: 19 9,21 * * *
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "rdsg_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
 // ====================== YYB Go 账号（环境变量 YYB_SERVER = 地址@微信账号标识，多行） ======================
 const SERVERS = (process.env.YYB_SERVER || "")
     .split(/\r?\n/)
@@ -239,7 +259,11 @@ class Task {
                 timeout: 30000,
             }
         );
-        if (data?.code !== 200) throw new Error(`查询失败: ${data?.msg || JSON.stringify(data)}`);
+        if (data?.code !== 200) {
+            const err = new Error(`查询失败: ${data?.msg || JSON.stringify(data)}`);
+            err.authFail = true;
+            throw err;
+        }
         const info = data.data?.member_info || {};
         const phone = info.leag_tel || data.data?.mobile || this.mobile;
         const card = info.card_no || info.leag_no || "未知会员";
@@ -292,14 +316,45 @@ class Task {
     }
 
     async run() {
-        try {
-            await this.login();
-            await this.queryAssets();
-            await this.sign();
-            await this.queryAssets();
-        } catch (e) {
-            this.summary.sign = `执行失败: ${e.message || e}`;
-            this.log(this.summary.sign);
+        // 尝试缓存（不过期，业务失败自动重登）
+        let usedCache = false;
+        const cache = readTokenCache();
+        const cached = cache[this.account] || {};
+        if (cached.shiruanKey) {
+            this.shiruanKey = cached.shiruanKey;
+            this.openid = cached.openid || "";
+            this.mobile = cached.mobile || "";
+            usedCache = true;
+            this.log("💾 使用缓存登录凭据");
+        }
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                if (attempt === 1 || !this.shiruanKey) {
+                    if (attempt === 1) {
+                        this.log("🔄 登录凭据失效，重新登录...");
+                        const c = readTokenCache();
+                        delete c[this.account];
+                        writeTokenCache(c);
+                    }
+                    await this.login();
+                    const c = readTokenCache();
+                    c[this.account] = { shiruanKey: this.shiruanKey, openid: this.openid, mobile: this.mobile };
+                    writeTokenCache(c);
+                }
+                await this.queryAssets();
+                await this.sign();
+                await this.queryAssets();
+                break;
+            } catch (e) {
+                this.summary.sign = `执行失败: ${e.message || e}`;
+                this.log(this.summary.sign);
+                if (usedCache && attempt === 0 && e.authFail) {
+                    this.log("⚠️ 登录凭据失效，准备重登");
+                    continue;
+                }
+                break;
+            }
         }
         return this.summary;
     }

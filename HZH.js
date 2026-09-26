@@ -1,6 +1,27 @@
 // name: 华住会
 // cron: 48 13,1 * * *
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "hzh_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
+
 // ====================== YYB Go 账号（环境变量 YYB_SERVER = 地址@微信账号标识，多行） ======================
 const SERVERS = (process.env.YYB_SERVER || "")
     .split(/\r?\n/)
@@ -146,6 +167,14 @@ class Huazhu {
     this.account = parseAccount(rawAccount);
     this.sId = this.account.sId || "";
     this.memberId = "";
+    // 加载缓存
+    const cache = readTokenCache();
+    const cached = cache[this.server] || {};
+    if (!this.sId && cached.sId) {
+        this.sId = cached.sId;
+        this.memberId = cached.memberId || "";
+        this._usedCache = true;
+    }
   }
 
   log(message) {
@@ -171,6 +200,9 @@ class Huazhu {
     this.memberId = data?.Extend?.memberId || "";
     if (!this.sId) throw new Error(`登录响应缺少 sId: ${short(data)}`);
     this.log(`登录成功 memberId=${this.memberId || "-"} sId=${mask(this.sId)}`);
+    const c = readTokenCache();
+    c[this.server] = { sId: this.sId, memberId: this.memberId };
+    writeTokenCache(c);
   }
 
   async queryMember() {
@@ -243,14 +275,30 @@ class Huazhu {
   }
 
   async run() {
-    try {
-      this.log("开始执行");
-      await this.login();
-      await this.queryMember();
-      await this.sign();
-      await this.queryMember();
-    } catch (e) {
-      this.log(`执行失败: ${e.message || e}`);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        this.log("开始执行");
+        if (this._usedCache) this.log(`💾 使用缓存sId`);
+        await this.login();
+        await this.queryMember();
+        await this.sign();
+        await this.queryMember();
+        break;
+      } catch (e) {
+        const msg = e.message || e;
+        const isAuthFail = /登录失败|未登录|登录失效|sId|401|token|鉴权|crossAuth|authCheck/i.test(msg);
+        if (attempt === 0 && (this._usedCache || isAuthFail)) {
+          this.log(`🔄 token失效，清除缓存重新登录...`);
+          const c = readTokenCache();
+          delete c[this.server];
+          writeTokenCache(c);
+          this.sId = "";
+          this.memberId = "";
+          this._usedCache = false;
+          continue;
+        }
+        this.log(`执行失败: ${msg}`);
+      }
     }
   }
 }

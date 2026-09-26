@@ -1,8 +1,28 @@
 // name: 同程旅行里程
 // cron: 21 8,20 * * *
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
 const dns = require("dns");
 const https = require("https");
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "tclxlc_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
 
 dns.setDefaultResultOrder("ipv4first");
 
@@ -379,13 +399,42 @@ async function main() {
 
         const runner = new Tongcheng(SERVERS[i]);
 
-        try {
-            console.log("登录：" + await runner.login());
-            console.log("查询：" + await runner.query());
-            console.log("签到：" + await runner.sign());
-            console.log("任务：" + await runner.doTasks());
-        } catch (e) {
-            console.log("执行失败：" + (e.stack || JSON.stringify(e)));
+        // 尝试缓存（不过期，业务失败自动重登）
+        let usedCache = false;
+        const cache = readTokenCache();
+        const cached = cache[SERVERS[i]] || {};
+        if (cached.sectoken) {
+            runner.loginInfo = cached;
+            usedCache = true;
+            console.log("💾 使用缓存登录凭据 openId=" + (cached.openId || ""));
+        }
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                if (attempt === 1 || !runner.loginInfo.sectoken) {
+                    if (attempt === 1) {
+                        console.log("🔄 登录凭据失效，重新登录...");
+                        const c = readTokenCache();
+                        delete c[SERVERS[i]];
+                        writeTokenCache(c);
+                    }
+                    console.log("登录：" + await runner.login());
+                    const c = readTokenCache();
+                    c[SERVERS[i]] = { ...runner.loginInfo };
+                    writeTokenCache(c);
+                }
+                console.log("查询：" + await runner.query());
+                console.log("签到：" + await runner.sign());
+                console.log("任务：" + await runner.doTasks());
+                break;
+            } catch (e) {
+                console.log("执行失败：" + (e.stack || JSON.stringify(e)));
+                if (usedCache && attempt === 0) {
+                    console.log("⚠️ 登录凭据失效，准备重登");
+                    continue;
+                }
+                break;
+            }
         }
 
         if (i < SERVERS.length - 1) {

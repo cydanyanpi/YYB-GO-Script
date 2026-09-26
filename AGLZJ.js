@@ -1,5 +1,5 @@
-// name: 敷尔佳
-// cron: 32 15,3 * * *
+// name: 爱果乐之家
+// cron: 24 17,5 * * *
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
@@ -49,15 +49,17 @@ async function getCode(server) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 let userIdx = 1;
 
-const MINI_APP_ID = "wx7ff0b3a99cb13b43";
+const querystring = require("querystring");
+
+const MINI_APP_ID = "wxa1086b8081476f46";
+const KDT_ID = "18774683";
+const USER_VERSION = "2.195.7.101";
 const CLIENT_ID = "4d65249d377b2c3ed8";
 const CLIENT_SECRET = "1cdc05151d64f3a4a6ebd0e9de64422a";
 const GRANT_TYPE = "yz_union";
-const KDT_ID = "44980544";
-const USER_VERSION = "2.220.5.101";
 const API_BASE = "https://h5.youzan.com";
 const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
-const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "fej_token_cache.json");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "aglzj_token_cache.json");
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) MicroMessenger/3.9.12 MiniProgramEnv/Windows WindowsWechat/WMPF";
 
 function readTokenCache() {
@@ -82,6 +84,11 @@ function maskPhone(phone = "") {
     return String(phone).replace(/^(\d{3})\d{4}(\d{4})$/, "$1****$2");
 }
 
+function maskToken(token = "") {
+    if (!token) return "";
+    return token.length > 12 ? `${token.slice(0, 6)}***${token.slice(-6)}` : `${token.slice(0, 3)}***`;
+}
+
 class Task {
     constructor(openid) {
         this.server = openid;
@@ -90,32 +97,32 @@ class Task {
         this.openid = _yyb.ref;
         this.index = userIdx++;
         this.openid = String(openid || "").trim();
-        this.token = "";
-        this.sessionId = "";
-        this.cookie = "";
-        this.kdtId = KDT_ID;
-        this.userInfo = {};
+        this.token = {};
+        this.checkinId = "";
     }
 
     async run() {
         const usedCache = !!this.getCachedToken();
         for (let attempt = 0; attempt < 2; attempt++) {
-            if (attempt === 1 || !this.token) {
+            if (attempt === 1 || !this.accessToken) {
                 if (attempt === 1) {
                     console.log(`账号[${this.index}] token失效，重新登录...`);
                     this.removeCachedToken();
                 }
                 await this.loginByWxCode();
-                if (!this.token) return;
+                if (!this.accessToken) return;
             }
+
             try {
-                await this.showCheckinPage();
+                await this.getPoints("签到前");
+                await this.getCheckinInfo();
+                await this.getActivityInfo();
                 await this.doCheckin();
-                await this.getPoints();
+                await this.getPoints("签到后");
                 return;
             } catch (e) {
                 const msg = String(e.message || e);
-                if (attempt === 0 && usedCache && /access_token|token|登录|授权|请先登录|401|403/i.test(msg)) {
+                if (attempt === 0 && usedCache && /登录|token|access|invalid|401|403|未登录|40010|40009/i.test(msg)) {
                     console.log(`账号[${this.index}] 业务token失效，清除缓存重新登录...`);
                     this.removeCachedToken();
                     continue;
@@ -131,16 +138,9 @@ class Task {
     }
 
     saveCachedToken() {
-        if (!this.token) return;
+        if (!this.accessToken) return;
         const cache = readTokenCache();
-        cache[this.openid] = {
-            accessToken: this.token,
-            sessionId: this.sessionId,
-            kdtId: this.kdtId,
-            cookie: this.cookie,
-            mobile: this.userInfo.mobile || "",
-            nickName: this.userInfo.nick_name || this.userInfo.nickName || "",
-        };
+        cache[this.openid] = { ...this.token };
         writeTokenCache(cache);
     }
 
@@ -150,74 +150,82 @@ class Task {
             delete cache[this.openid];
             writeTokenCache(cache);
         }
-        this.token = "";
+        this.token = {};
     }
 
-    applyToken(data = {}) {
-        this.token = data.accessToken || data.access_token || "";
-        this.sessionId = data.sessionId || data.session_id || "";
-        this.kdtId = String(data.kdtId || data.kdt_id || KDT_ID);
-        this.cookie = data.cookie || "";
+    get accessToken() {
+        return this.token.accessToken || this.token.access_token || "";
+    }
+
+    get sessionId() {
+        return this.token.sessionId || this.token.session_id || "";
+    }
+
+    buildExtraData() {
+        return JSON.stringify({
+            is_weapp: 1,
+            sid: this.sessionId,
+            version: USER_VERSION,
+            client: "weapp",
+            bizEnv: "wsc",
+        });
+    }
+
+    buildUrl(apiPath, query = {}) {
+        const pathname = apiPath.replace(/^\/+/, "");
+        const params = querystring.stringify({
+            store_id: "",
+            app_id: MINI_APP_ID,
+            kdt_id: KDT_ID,
+            access_token: this.accessToken,
+            ...query,
+        });
+        return `${API_BASE}/${pathname}?${params}`;
     }
 
     getHeaders(extra = {}) {
-        const headers = {
+        return {
             "User-Agent": USER_AGENT,
-            "Referer": `https://servicewechat.com/${MINI_APP_ID}/30/page-frame.html`,
-            "Accept": "*/*",
-            "Extra-Data": JSON.stringify({
-                sid: this.sessionId || "",
-                version: USER_VERSION,
-                clientType: "weapp-miniprogram",
-                client: "weapp",
-                bizEnv: "wsc",
-            }),
+            "Referer": `https://servicewechat.com/${MINI_APP_ID}/3/page-frame.html`,
+            "Extra-Data": this.buildExtraData(),
+            "Accept": "application/json, text/plain, */*",
             ...extra,
         };
-        if (this.cookie) headers.Cookie = this.cookie;
-        return headers;
     }
 
-    getBaseParams(params = {}) {
-        return {
-            app_id: MINI_APP_ID,
-            kdt_id: this.kdtId,
-            access_token: this.token,
-            ...params,
-        };
-    }
-
-    async request({ method = "GET", path: apiPath, params = {}, data = {}, skipToken = false }) {
+    async request({ method = "GET", apiPath, query = {}, data = {}, skipToken = false }) {
+        const oldToken = this.token;
+        if (skipToken) this.token = {};
         const options = {
             method,
-            url: `${API_BASE}${apiPath.startsWith("/") ? apiPath : `/${apiPath}`}`,
+            url: this.buildUrl(apiPath, query),
             headers: this.getHeaders(method === "POST" ? { "Content-Type": "application/json" } : {}),
             timeout: 15000,
             validateStatus: () => true,
         };
-        if (!skipToken) options.params = this.getBaseParams(params);
-        else options.params = params;
         if (method !== "GET") options.data = data;
+        if (skipToken) this.token = oldToken;
 
-        const { data: result, status, headers } = await axios.request(options);
-        if (headers["set-cookie"]) {
-            this.cookie = headers["set-cookie"].map((item) => item.split(";")[0]).join("; ");
+        const { status, data: result } = await axios.request(options);
+        if (status !== 200) throw new Error(`HTTP ${status}: ${typeof result === "string" ? result.slice(0, 200) : JSON.stringify(result)}`);
+        if (!result || result.code !== 0) {
+            const err = new Error(result?.msg || result?.message || JSON.stringify(result));
+            err.code = result?.code;
+            throw err;
         }
-        if (status !== 200) throw new Error(`HTTP ${status}: ${JSON.stringify(result)}`);
-        if (!result || result.code !== 0) throw new Error(result?.msg || JSON.stringify(result));
         return result.data;
     }
 
-    async getLoginCode() {
+    async getWxCode() {
         return await getCode(this.server);
     }
 
     async loginByWxCode() {
         try {
-            const code = await this.getLoginCode();
+            const code = await this.getWxCode();
             const data = await this.request({
                 method: "POST",
-                path: "/wscshop/weapp/authorize.json",
+                apiPath: "wscshop/weapp/authorize.json",
                 skipToken: true,
                 data: {
                     appId: MINI_APP_ID,
@@ -227,10 +235,9 @@ class Task {
                     code,
                 },
             });
-            this.applyToken(data);
-            this.userInfo = data || {};
+            this.token = data || {};
             this.saveCachedToken();
-            console.log(`账号[${this.index}] 登录成功: ${data.nick_name || ""} ${maskPhone(data.mobile) || ""}`);
+            console.log(`账号[${this.index}] 登录成功: ${data?.nick_name || data?.nickName || ""} ${maskPhone(data?.mobile)}`);
         } catch (e) {
             console.log(`账号[${this.index}] 登录失败: ${e.message || e}`);
         }
@@ -238,48 +245,72 @@ class Task {
 
     async checkToken() {
         try {
-            const data = await this.request({ path: "/wscump/integral/user_points.json" });
-            this.points = data?.current_points ?? data?.real_points;
+            await this.getPoints("缓存校验");
             return true;
         } catch (e) {
             return false;
         }
     }
 
-    async showCheckinPage() {
-        try {
-            const data = await this.request({ path: "/wscump/checkin/show_checkin_page_v2.json" });
-            this.checkinId = data?.checkinId;
-            console.log(`账号[${this.index}] 签到活动: checkinId=${this.checkinId || "未获取"} isShow=${!!data?.isShow}`);
-        } catch (e) {
-            console.log(`账号[${this.index}] 获取签到活动失败: ${e.message || e}`);
-        }
+    async getPoints(label = "积分") {
+        const data = await this.request({ apiPath: "wscump/integral/user_points.json" });
+        const points = data?.current_points ?? data?.real_points ?? data?.total_points ?? "未知";
+        console.log(`账号[${this.index}] ${label}: ${points}积分`);
+        return data;
+    }
+
+    async getCheckinInfo() {
+        const data = await this.request({ apiPath: "wscump/checkin/check-in-info.json" });
+        this.checkinId = data?.checkInId || data?.checkinId || data?.check_in_id || "";
+        console.log(`账号[${this.index}] 签到活动: checkinId=${this.checkinId || "未获取"} ownerKdtId=${data?.activityOwnerKdtId || ""}`);
+        return data;
+    }
+
+    async getActivityInfo() {
+        if (!this.checkinId) return null;
+        const data = await this.request({
+            apiPath: "wscump/checkin/get_activity_by_yzuid_v2.json",
+            query: { checkinId: this.checkinId },
+        });
+        this.isCheckin = !!data?.isCheckin;
+        this.isOpen = data?.isOpen !== false;
+        const reward = (data?.dailyRewards || []).map((item) => item?.desc).filter(Boolean).join(", ");
+        console.log(`账号[${this.index}] 签到状态: ${this.isCheckin ? "已签" : "未签"} 连续${data?.continuesDay ?? 0}天${reward ? ` 今日奖励${reward}` : ""}`);
+        return data;
     }
 
     async doCheckin() {
         if (!this.checkinId) {
-            console.log(`账号[${this.index}] 未获取到 checkinId，跳过签到`);
+            console.log(`账号[${this.index}] 未获取到签到活动，跳过`);
             return;
         }
+        if (this.isCheckin) {
+            console.log(`账号[${this.index}] 今日已签到`);
+            return;
+        }
+        if (!this.isOpen) {
+            console.log(`账号[${this.index}] 签到活动未开启`);
+            return;
+        }
+
         try {
             const data = await this.request({
-                path: "/wscump/checkin/checkinV2.json",
-                params: { checkinId: this.checkinId },
+                apiPath: "wscump/checkin/checkinV2.json",
+                query: { checkinId: this.checkinId },
             });
-            const awards = (data?.list || []).map((item) => item?.infos?.title).filter(Boolean).join(", ");
-            console.log(`账号[${this.index}] 签到成功: ${data?.desc || ""}${awards ? ` ${awards}` : ""}`);
+            const award = (data?.list || [])
+                .map((item) => item?.infos?.title || item?.infos?.desc || "")
+                .filter(Boolean)
+                .join(", ");
+            console.log(`账号[${this.index}] 签到成功: ${data?.desc || ""}${award ? ` ${award}` : ""}`);
         } catch (e) {
-            console.log(`账号[${this.index}] 签到失败: ${e.message || e}`);
-            if (/access_token|token|登录|授权|请先登录/i.test(String(e.message || e))) throw e;
-        }
-    }
-
-    async getPoints() {
-        try {
-            const data = await this.request({ path: "/wscump/integral/user_points.json" });
-            console.log(`账号[${this.index}] 当前积分: ${data?.current_points ?? data?.real_points ?? "未知"}`);
-        } catch (e) {
-            console.log(`账号[${this.index}] 查询积分失败: ${e.message || e}`);
+            const message = String(e.message || e);
+            if (/已签到|已经签到|重复|今日.*签|参与次数/.test(message)) {
+                console.log(`账号[${this.index}] 今日已签到`);
+                return;
+            }
+            console.log(`账号[${this.index}] 签到失败: ${message}`);
+            if (e.code === -1 || e.code === 40010 || e.code === 40009 || /登录|token|access/i.test(message)) throw e;
         }
     }
 }

@@ -197,6 +197,35 @@ def get_valid_proxy(account_name):
     return None
 # ======================================================
 
+# ====================== Token 缓存（不过期，鉴权失败自动重登）======================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "dtsh_token_cache.json")
+
+
+def read_token_cache():
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache):
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"  [缓存] 写入失败: {exc}")
+
+
+def is_auth_fail_msg(msg):
+    import re
+    return bool(re.search(r'登录|未登录|授权|token|失效|过期|登录态|请重新|身份|凭证', str(msg), re.IGNORECASE))
+
+
 def parse_yyb_go_entry(raw_value):
     value = str(raw_value or "").strip()
     if not value:
@@ -437,87 +466,116 @@ def run_account(code_url, index, global_proxy_config):
         # 代理获取后加间隔，避免频繁请求
         time.sleep(PROXY_FETCH_INTERVAL)
 
-    token, headers = refresh_token(code_url, proxy_config, account_name)
-    if not token:
-        return {
-            "account": account_name,
-            "success": False,
-            "proxy_status": proxy_status,
-            "error": "Token获取失败"
-        }
+    _, ref = parse_yyb_go_entry(code_url)
+    cache = read_token_cache()
+    cached = cache.get(ref) or {}
+    token = cached.get("token", "")
+    used_cache = bool(token)
+    headers = {
+        "Content-Type": "application/json",
+        "charset": "utf-8",
+        "User-Agent": random.choice(USER_AGENT_LIST),
+    }
+    if token:
+        print(f"💾 [缓存] 使用缓存token: {token[:8]}...")
 
-    # 随机延迟 3~8 秒
-    delay = random.uniform(3, 8)
-    print(f"⏳ 签到前等待：{delay:.1f}秒")
-    time.sleep(delay)
+    for attempt in range(2):
+        if attempt == 1 or not token:
+            if attempt == 1:
+                print("🔄 [重登] token失效，重新登录...")
+                cache = read_token_cache()
+                if ref in cache:
+                    del cache[ref]
+                    write_token_cache(cache)
+            token, headers = refresh_token(code_url, proxy_config, account_name)
+            if not token:
+                return {
+                    "account": account_name,
+                    "success": False,
+                    "proxy_status": proxy_status,
+                    "error": "Token获取失败"
+                }
+            cache = read_token_cache()
+            cache[ref] = {"token": token}
+            write_token_cache(cache)
 
-    try:
-        # 执行签到
-        data = do_sign(token, headers, proxy_config, account_name)
-        if not data:
+        # 随机延迟 3~8 秒
+        delay = random.uniform(3, 8)
+        print(f"⏳ 签到前等待：{delay:.1f}秒")
+        time.sleep(delay)
+
+        try:
+            # 执行签到
+            data = do_sign(token, headers, proxy_config, account_name)
+            if not data:
+                return {
+                    "account": account_name,
+                    "success": False,
+                    "proxy_status": proxy_status,
+                    "error": "签到请求异常"
+                }
+
+            sign_msg = data.get("msg", "完成")
+            if attempt == 0 and used_cache and is_auth_fail_msg(sign_msg):
+                print(f"🔄 [重登] 签到鉴权失败({sign_msg})，重新登录...")
+                token = None
+                continue
+
+            sign_data = data.get("data")
+            if not isinstance(sign_data, dict):
+                sign_data = {}
+            get_points = sign_data.get("points", 0)
+            sign_num = sign_data.get("sign_num", 0)
+
+            # 获取用户信息
+            nickname, uid, total_points = get_user_info(token, headers, proxy_config, account_name)
+
+            # 控制台简洁展示
+            print(f"👤 账户昵称：{nickname}")
+            print(f"🆔 账号UID：{uid}")
+            print(f"📊 签到结果：{sign_msg}")
+            print(f"📅 累计签到：{sign_num} 次")
+            print(f"🎁 本次获得：{get_points} 积分")
+            print(f"💰 账户总积分：{total_points} 分")
+
+            # 带Emoji图标的推送内容
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            push_title = f"✅ DT生活签到 {account_name}"
+            push_content = (
+                f"🕒 执行时间：{now}\n\n"
+                f"🔌 代理状态：{proxy_status}\n"
+                f"👤 账户昵称：{nickname}\n"
+                f"🆔 账号UID：{uid}\n"
+                f"📊 签到结果：{sign_msg}\n"
+                f"📅 累计签到：{sign_num} 次\n"
+                f"🎁 本次获得：{get_points} 积分\n"
+                f"💰 账户总积分：{total_points} 分"
+            )
+
+            # 推送并显示状态
+            push_ok = push_plusplus(push_title, push_content)
+            print("✅ 推送成功" if push_ok else "❌ 推送失败")
+
+            return {
+                "account": account_name,
+                "success": True,
+                "proxy_status": proxy_status,
+                "nickname": nickname,
+                "uid": uid,
+                "sign_msg": sign_msg,
+                "sign_num": sign_num,
+                "get_points": get_points,
+                "total_points": total_points
+            }
+
+        except Exception as e:
+            print(f"❌ 签到异常：{str(e)}")
             return {
                 "account": account_name,
                 "success": False,
                 "proxy_status": proxy_status,
-                "error": "签到请求异常"
+                "error": str(e)
             }
-
-        sign_msg = data.get("msg", "完成")
-        sign_data = data.get("data")
-        if not isinstance(sign_data, dict):
-            sign_data = {}
-        get_points = sign_data.get("points", 0)
-        sign_num = sign_data.get("sign_num", 0)
-
-        # 获取用户信息
-        nickname, uid, total_points = get_user_info(token, headers, proxy_config, account_name)
-
-        # 控制台简洁展示
-        print(f"👤 账户昵称：{nickname}")
-        print(f"🆔 账号UID：{uid}")
-        print(f"📊 签到结果：{sign_msg}")
-        print(f"📅 累计签到：{sign_num} 次")
-        print(f"🎁 本次获得：{get_points} 积分")
-        print(f"💰 账户总积分：{total_points} 分")
-
-        # 带Emoji图标的推送内容
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        push_title = f"✅ DT生活签到 {account_name}"
-        push_content = (
-            f"🕒 执行时间：{now}\n\n"
-            f"🔌 代理状态：{proxy_status}\n"
-            f"👤 账户昵称：{nickname}\n"
-            f"🆔 账号UID：{uid}\n"
-            f"📊 签到结果：{sign_msg}\n"
-            f"📅 累计签到：{sign_num} 次\n"
-            f"🎁 本次获得：{get_points} 积分\n"
-            f"💰 账户总积分：{total_points} 分"
-        )
-
-        # 推送并显示状态
-        push_ok = push_plusplus(push_title, push_content)
-        print("✅ 推送成功" if push_ok else "❌ 推送失败")
-
-        return {
-            "account": account_name,
-            "success": True,
-            "proxy_status": proxy_status,
-            "nickname": nickname,
-            "uid": uid,
-            "sign_msg": sign_msg,
-            "sign_num": sign_num,
-            "get_points": get_points,
-            "total_points": total_points
-        }
-
-    except Exception as e:
-        print(f"❌ 签到异常：{str(e)}")
-        return {
-            "account": account_name,
-            "success": False,
-            "proxy_status": proxy_status,
-            "error": str(e)
-        }
 
 if __name__ == "__main__":
     print('===== DT生活签到（环境变量YYB_SERVER读取内网多服务+独立代理版）=====\n')

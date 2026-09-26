@@ -59,6 +59,30 @@ def random_int(min_val, max_val):
 def getUA():
     return random.choice(USER_AGENT_LIST)
 
+
+# ==================== Token 缓存（不过期，失效自动重登） ====================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "sanf_token_cache.json")
+
+
+def readTokenCache():
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def writeTokenCache(cache) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"[缓存] 写入失败: {exc}")
+
 # ====================== 品赞IP代理系统 ======================
 def parseProxyResponse(text):
     text = text.strip()
@@ -330,37 +354,56 @@ async def runAccount(server, globalProxyAgent):
         print(f"⏳ [{server}] 启动延迟 {startDelay / 1000}s")
         await sleep(startDelay)
         
-        # 1. 获取code
-        code = getCode(server)
-        if not code:
-            result["error"] = "获取code失败"
-            print(f"❌ [{server}] 获取code失败")
-            return result
-        
-        # 2. 登录获取sid
-        login_data = wxLogin(code, UA, proxyAgent, server)
-        if not login_data or login_data.get("code") != 200:
-            result["error"] = login_data.get("msg", "登录失败") if login_data else "登录无响应"
-            print(f"❌ [{server}] 登录失败：{result['error']}")
-            return result
-        sid = login_data["data"].get("sid", "")
-        if not sid:
-            result["error"] = "未获取到sid，无法继续"
-            print(f"❌ [{server}] 未获取到sid，无法继续")
-            return result
-        print(f"✅ [{server}] 登录成功获取sid")
-        await sleep(random_int(3000, 8000))
-        
-        # 3. 每日签到
-        sign_data = commonRequest(
-            "/ms-sanfu-wechat-common/customer/onSign",
-            method="POST",
-            body={"signWay": 0},
-            sid=sid,
-            UA=UA,
-            proxies=proxyAgent,
-            server=server
-        )
+        # 1. 尝试缓存 sid（命中则跳过取 code + 登录）
+        _, ref = parse_yyb_go_entry(server)
+        cache = readTokenCache()
+        cached = cache.get(ref) or {}
+        sid = cached.get("sid", "")
+        used_cache = bool(sid)
+        if sid:
+            print(f"💾 [{server}] [缓存] 使用缓存sid")
+
+        for attempt in range(2):
+            if attempt == 1 or not sid:
+                if attempt == 1:
+                    print(f"🔄 [{server}] [重登] sid失效，重新登录")
+                    cache = readTokenCache()
+                    if ref in cache:
+                        del cache[ref]
+                        writeTokenCache(cache)
+                code = getCode(server)
+                if not code:
+                    result["error"] = "获取code失败"
+                    print(f"❌ [{server}] 获取code失败")
+                    return result
+                login_data = wxLogin(code, UA, proxyAgent, server)
+                if not login_data or login_data.get("code") != 200:
+                    result["error"] = login_data.get("msg", "登录失败") if login_data else "登录无响应"
+                    print(f"❌ [{server}] 登录失败：{result['error']}")
+                    return result
+                sid = login_data["data"].get("sid", "")
+                if not sid:
+                    result["error"] = "未获取到sid，无法继续"
+                    print(f"❌ [{server}] 未获取到sid，无法继续")
+                    return result
+                cache = readTokenCache()
+                cache[ref] = {"sid": sid}
+                writeTokenCache(cache)
+                print(f"✅ [{server}] 登录成功获取sid")
+                await sleep(random_int(3000, 8000))
+
+            sign_data = commonRequest(
+                "/ms-sanfu-wechat-common/customer/onSign",
+                method="POST", body={"signWay": 0},
+                sid=sid, UA=UA, proxies=proxyAgent, server=server,
+            )
+            if not (sign_data and sign_data.get("code") == 200) and attempt == 0 and used_cache:
+                msg = sign_data.get("msg", "") if sign_data else ""
+                if any(k in str(msg) for k in ("登录", "未登录", "授权", "失效", "token", "sid")):
+                    print(f"🔄 [{server}] [重登] 缓存sid失效：{msg}")
+                    continue
+            break
+
         if sign_data and sign_data.get("code") == 200:
             fubi = sign_data["data"].get("fubi", 0)
             keep_day = sign_data["data"].get("onKeepSignDay", 0)

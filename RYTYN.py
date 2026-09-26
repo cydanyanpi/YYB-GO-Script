@@ -44,7 +44,8 @@ except Exception as exc:
 
 BASE_URL = "https://www.milkcard.mall.ryytngroup.com"
 APP_ID = "wx0408f3f20d769a2f"
-ACCOUNT_FILE = "token_caches/ryytncookie.json"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ACCOUNT_FILE = os.path.join(SCRIPT_DIR, "token_caches", "rytyn_token_cache.json")
 
 # 答题正确答案缓存（内存级，跨账号共享）
 ANSWER_CACHE = {}
@@ -267,7 +268,7 @@ def refresh_token(server: str, ref: str) -> str | None:
 
 # ============ 本地缓存管理 ============
 
-def load_accounts() -> list[dict]:
+def read_token_cache() -> list[dict]:
     if not os.path.exists(ACCOUNT_FILE):
         return []
     try:
@@ -280,7 +281,7 @@ def load_accounts() -> list[dict]:
     return []
 
 
-def save_accounts(accounts: list[dict]):
+def write_token_cache(accounts: list[dict]):
     os.makedirs(os.path.dirname(ACCOUNT_FILE), exist_ok=True)
     try:
         with open(ACCOUNT_FILE, "w", encoding="utf-8") as f:
@@ -538,7 +539,7 @@ def _run():
     print(f"✅ 读取到 {len(servers)} 个 YYB Go 账号")
 
     # 加载缓存
-    cached = load_accounts()
+    cached = read_token_cache()
     cache_map = {item["ref"]: item for item in cached}
 
     accounts = []
@@ -583,7 +584,7 @@ def _run():
         if idx < len(accounts) - 1:
             time.sleep(2 + random.random() * 2)
 
-    save_accounts(accounts)
+    write_token_cache(accounts)
     print("\n所有账号处理完成，缓存已更新")
 
 

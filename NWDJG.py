@@ -85,6 +85,30 @@ USER_AGENT = (
 )
 
 
+# ==================== Token 缓存（不过期，失效自动重登） ====================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "nwdjg_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"⚠️ [缓存] 写入失败: {exc}")
+
+
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -456,29 +480,50 @@ def run_account(index: int, total: int, server: str) -> Dict[str, Any]:
     print(f"⏳ [延迟] 启动延迟 {delay}s")
     sleep(delay)
 
-    code = get_code(server)
-    if not code:
-        result["error"] = "获取 code 失败"
-        return result
+    _, ref = parse_yyb_go_entry(server)
 
-    token, raw_login = login_by_code(server, code, proxies)
-    if not token:
-        result["error"] = f"登录失败: {json_preview(raw_login)}"
-        return result
+    cache = read_token_cache()
+    cached = cache.get(ref) or {}
+    token = cached.get("token", "")
+    used_cache = bool(token)
+    if token:
+        print(f"💾 [缓存] 使用缓存token: {mask(token)}")
 
-    result["token"] = mask(token)
+    user_info_resp = {}
+    for attempt in range(2):
+        if attempt == 1 or not token:
+            if attempt == 1:
+                print("🔄 [重登] token失效，重新登录")
+                cache = read_token_cache()
+                if ref in cache:
+                    del cache[ref]
+                    write_token_cache(cache)
+            code = get_code(server)
+            if not code:
+                result["error"] = "获取 code 失败"
+                return result
+            token, raw_login = login_by_code(server, code, proxies)
+            if not token:
+                result["error"] = f"登录失败: {json_preview(raw_login)}"
+                return result
+            cache = read_token_cache()
+            cache[ref] = {"token": token}
+            write_token_cache(cache)
 
-    try:
+        result["token"] = mask(token)
+
         print(f"🔍 [用户] 开始查询用户信息...")
-        user_info_resp = api_get(
-            server,
-            USER_INFO_URL,
-            token,
-            proxies
-        )
-
+        user_info_resp = api_get(server, USER_INFO_URL, token, proxies)
         print(f"🔍 [用户] 响应数据: {json_preview(user_info_resp, 200)}")
 
+        if user_info_resp.get("code") == 0 and user_info_resp.get("data"):
+            break
+        if attempt == 0 and used_cache:
+            print("🔄 [重登] 用户信息查询失败，判定token失效")
+            continue
+        break
+
+    try:
         if user_info_resp.get("code") == 0 and user_info_resp.get("data"):
             user_data = user_info_resp["data"]
             member_data = user_data.get("member") or {}

@@ -207,6 +207,7 @@ class Vipshop {
     this.unionid = this.account.unionid || "";
     this.marsCid = this.account.marsCid || CONFIGURED_MARS_CID;
     this.cacheKey = this.openid || (this.vipOpenid ? md5(this.vipOpenid).slice(0, 16) : `account_${index}`);
+    this.loginInvalid = false;
   }
 
   log(message) {
@@ -320,6 +321,7 @@ class Vipshop {
       delete cache[this.cacheKey].userId;
       writeCache(cache);
     }
+    this.loginInvalid = true;
   }
 
   loadCache() {
@@ -460,9 +462,27 @@ class Vipshop {
   async run() {
     try {
       this.log(`开始执行 ${mask(this.openid || this.vipOpenid || this.token)}`);
-      await this.ensureLogin();
-      await this.sign();
-      this.saveCache();
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (attempt === 1) {
+          this.log(`🔄 登录态失效，清除缓存并重新登录...`);
+          this.loginInvalid = false;
+          this.removeLoginCache();
+          this.token = "";
+          this.userId = "";
+        }
+        await this.ensureLogin();
+        try {
+          await this.sign();
+          this.saveCache();
+          break;
+        } catch (e) {
+          if (attempt === 0 && this.loginInvalid) {
+            this.log(`⚠️ 签到业务判定登录态失效，重登后重试一次`);
+            continue;
+          }
+          throw e;
+        }
+      }
     } catch (e) {
       this.log(`执行失败: ${e.message || e}`);
     }

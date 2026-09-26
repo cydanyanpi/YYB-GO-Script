@@ -1,6 +1,26 @@
 // name: 谢瑞麟
 // cron: 16 7,19 * * *
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "xrl_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
 // ====================== YYB Go 账号（环境变量 YYB_SERVER = 地址@微信账号标识，多行） ======================
 const SERVERS = (process.env.YYB_SERVER || "")
     .split(/\r?\n/)
@@ -63,23 +83,58 @@ class Task {
         this.wcsid = this.openid
         this.openid = null
         this.isSign = false
+        this._authFail = false
     }
 
     async run() {
        //随机延迟5-30s 模拟人工操作
        await await sleep(Math.floor(Math.random() * 20 + 5) * 1000);
-        let code = await getCode(this.server)
-        if (code) {
-            await this.getUserToken(code)
-        }
-        if (!this.token) {
-            console.log(`账号[${this.index}] 获取用户Token失败❌`)
-            return
-        }
-        this.token = 'Bearer ' + this.token
 
-        await this.getUserInfo()
-        if (!this.isSign) await this.doSign()
+        // 尝试缓存（不过期，业务失败自动重登）
+        let usedCache = false;
+        const cache = readTokenCache();
+        const cached = cache[this.server] || {};
+        if (cached.token) {
+            this.token = cached.token;
+            this.openid = cached.openid || null;
+            usedCache = true;
+            console.log(`💾 账号[${this.index}] 使用缓存token`);
+        }
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (attempt === 1 || !this.token) {
+                if (attempt === 1) {
+                    console.log(`🔄 账号[${this.index}] token失效，重新登录...`);
+                    const c = readTokenCache();
+                    delete c[this.server];
+                    writeTokenCache(c);
+                }
+                this.token = null;
+                this.openid = null;
+                let code = await getCode(this.server)
+                if (code) {
+                    await this.getUserToken(code)
+                }
+                if (!this.token) {
+                    console.log(`账号[${this.index}] 获取用户Token失败❌`)
+                    return
+                }
+                const c = readTokenCache();
+                c[this.server] = { token: this.token, openid: this.openid };
+                writeTokenCache(c);
+            }
+            this.token = 'Bearer ' + this.token
+            this._authFail = false;
+
+            await this.getUserInfo()
+            if (!this.isSign) await this.doSign()
+
+            if (usedCache && attempt === 0 && this._authFail) {
+                console.log(`⚠️ 账号[${this.index}] token失效，准备重登`);
+                continue;
+            }
+            break;
+        }
     }
     async getUserToken(code) {
         let options = {
@@ -138,6 +193,7 @@ class Task {
             }
         } else {
             console.log(`🌸账号[${this.index}] 获取用户信息-失败:${result.msg}❌`)
+            this._authFail = true;
         }
     }
 
@@ -166,6 +222,7 @@ class Task {
             console.log(`签到成功, 已连续签到 ${total_days} 天, 获得 ${integral} 积分 🎉`);
         } else {
             console.log(`🌸账号[${this.index}] 签到-失败:${result.msg}❌`)
+            this._authFail = true;
         }
 
     }

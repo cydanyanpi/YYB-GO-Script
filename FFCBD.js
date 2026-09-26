@@ -54,8 +54,8 @@ const PAGE_VERSION = "99";
 const APP_VERSION = "2.31.2";
 const ENV_VERSION = "release";
 const API_BASE = "https://smp-api.iyouke.com/dtapi";
-const TOKEN_CACHE_FILE = path.join(__dirname, "token_caches", "fafa_token_cache.json");
-try { fs.mkdirSync(path.dirname(TOKEN_CACHE_FILE), { recursive: true }); } catch (e) {}
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "ffcbd_token_cache.json");
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) MicroMessenger/3.9.12 MiniProgramEnv/Windows WindowsWechat/WMPF";
 
 function readTokenCache() {
@@ -69,6 +69,7 @@ function readTokenCache() {
 
 function writeTokenCache(cache) {
     try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
         fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf8");
     } catch (e) {
         console.log(`写入token缓存失败: ${e.message || e}`);
@@ -112,29 +113,45 @@ class Task {
     }
 
     async run() {
-        if (!this.authorization) {
-            const cached = this.getCachedToken();
-            if (cached) {
-                this.applyToken(cached);
-                console.log(`账号[${this.index}] 使用缓存token`);
-                if (!(await this.checkToken())) {
+        if (this.isDirectToken) {
+            // 直连token模式不走缓存重试
+            this.applyToken({ authorization: this.account.replace(/^token=/i, "") });
+            await this.getUserInfo();
+            await this.getPointsInfo();
+            await this.getSignList();
+            await this.doSign();
+            await this.getPointsInfo();
+            this.saveCachedToken();
+            return;
+        }
+        const usedCache = !!this.getCachedToken();
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (attempt === 1 || !this.authorization) {
+                if (attempt === 1) {
+                    console.log(`账号[${this.index}] token失效，重新登录...`);
                     this.removeCachedToken();
-                    console.log(`账号[${this.index}] 缓存token失效，重新登录`);
                 }
+                await this.loginByWxCode();
+                if (!this.authorization) return;
+            }
+            try {
+                await this.getUserInfo();
+                await this.getPointsInfo();
+                await this.getSignList();
+                await this.doSign();
+                await this.getPointsInfo();
+                this.saveCachedToken();
+                return;
+            } catch (e) {
+                const msg = String(e.message || e);
+                if (attempt === 0 && usedCache && /token|登录|授权|401/i.test(msg)) {
+                    console.log(`账号[${this.index}] 业务token失效，清除缓存重新登录...`);
+                    this.removeCachedToken();
+                    continue;
+                }
+                console.log(`账号[${this.index}] 执行失败: ${msg}`);
             }
         }
-
-        if (!this.authorization) {
-            await this.loginByWxCode();
-            if (!this.authorization) return;
-        }
-
-        await this.getUserInfo();
-        await this.getPointsInfo();
-        await this.getSignList();
-        await this.doSign();
-        await this.getPointsInfo();
-        this.saveCachedToken();
     }
 
     cacheKey() {
@@ -155,7 +172,6 @@ class Task {
             userId: this.userInfo.userId || "",
             nickName: this.userInfo.nickName || "",
             userMobile: this.userInfo.userMobile || "",
-            updatedAt: new Date().toISOString(),
         };
         writeTokenCache(cache);
     }
@@ -276,7 +292,7 @@ class Task {
         } catch (e) {
             const message = e.message || e;
             console.log(`账号[${this.index}] 查询积分失败: ${message}`);
-            if (/token|登录|授权|401/i.test(String(message))) this.removeCachedToken();
+            if (/token|登录|授权|401/i.test(String(message))) throw e;
         }
     }
 
@@ -295,7 +311,7 @@ class Task {
         } catch (e) {
             const message = e.message || e;
             console.log(`账号[${this.index}] 查询签到状态失败: ${message}`);
-            if (/token|登录|授权|401/i.test(String(message))) this.removeCachedToken();
+            if (/token|登录|授权|401/i.test(String(message))) throw e;
         }
     }
 
@@ -319,7 +335,7 @@ class Task {
                 return;
             }
             console.log(`账号[${this.index}] 签到失败: ${message}`);
-            if (/token|登录|授权|401/i.test(message)) this.removeCachedToken();
+            if (/token|登录|授权|401/i.test(message)) throw e;
         }
     }
 }

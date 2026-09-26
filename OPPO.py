@@ -454,7 +454,7 @@ def login(code: str, proxies: Optional[Dict[str, str]] = None,
 # =============================================================================
 # 缓存管理 (凭证 + 活动ID)
 # =============================================================================
-def load_cache() -> Dict[str, Any]:
+def read_token_cache() -> Dict[str, Any]:
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -462,7 +462,7 @@ def load_cache() -> Dict[str, Any]:
         return {"accounts": {}, "activity_ids": {}}
 
 
-def save_cache(cache: Dict[str, Any]) -> None:
+def write_token_cache(cache: Dict[str, Any]) -> None:
     try:
         os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
@@ -804,6 +804,9 @@ def run_account(server: str, sign_act_id: str, task_act_id: str,
                 cache: dict, index: int) -> dict:
     remark = server.split("#", 1)[1].strip() if "#" in server else ""
     nickname = remark or f"账号{index}"
+    # 缓存 key 使用 YYB_SERVER 中 @ 后的 ref/wxid
+    _, cache_ref = parse_yyb_entry(server)
+    cache_key = cache_ref or server
     log_blank()
     log(f"👤 账号【{index}】> 【{nickname}】来源 {server}")
 
@@ -823,7 +826,7 @@ def run_account(server: str, sign_act_id: str, task_act_id: str,
     time.sleep(delay)
 
     # 检查缓存凭证
-    cached = cache.get("accounts", {}).get(server)
+    cached = cache.get("accounts", {}).get(cache_key)
     session_id = aes_key = None
     openid = ""
     if cached:
@@ -855,13 +858,13 @@ def run_account(server: str, sign_act_id: str, task_act_id: str,
         # 更新缓存
         if "accounts" not in cache:
             cache["accounts"] = {}
-        cache["accounts"][server] = {
+        cache["accounts"][cache_key] = {
             "sessionId": session_id,
             "aesSessionId": aes_key,
             "openid": openid,
             "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%S")
         }
-        save_cache(cache)
+        write_token_cache(cache)
 
     client = OppoMiniClient(session_id, aes_key, openid, sign_act_id, task_act_id,
                             proxies=proxies, server=server)
@@ -941,7 +944,7 @@ def main():
     log("💡 版本: 2.1.0 (code 接口 + 品赞代理 + PushPlus)")
     log("==============================")
 
-    cache = load_cache()
+    cache = read_token_cache()
     if not SERVERS:
         log("❌ 没有配置本地 code 服务，退出")
         return
@@ -952,7 +955,7 @@ def main():
         log_section("🔍 提取活动 ID（无缓存）")
         sign_act_id, task_act_id = extract_activity_ids()
         update_activity_ids_cache(cache, sign_act_id, task_act_id)
-        save_cache(cache)
+        write_token_cache(cache)
 
     results = []
     for idx, server in enumerate(SERVERS, 1):
@@ -964,7 +967,7 @@ def main():
                 new_sign, new_task = extract_activity_ids()
                 if new_sign != sign_act_id or new_task != task_act_id:
                     update_activity_ids_cache(cache, new_sign, new_task)
-                    save_cache(cache)
+                    write_token_cache(cache)
                     log(f"🔄 使用新活动ID重试: 签到={new_sign}, 任务={new_task}")
                     res = run_account(server, new_sign, new_task, cache, idx)
                 else:

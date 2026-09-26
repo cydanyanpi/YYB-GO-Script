@@ -1,6 +1,26 @@
 // name: 米其林会员
 // cron: 0 11,23 * * *
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "mqlhy_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
 // ====================== YYB Go 账号（环境变量 YYB_SERVER = 地址@微信账号标识，多行） ======================
 const SERVERS = (process.env.YYB_SERVER || "")
     .split(/\r?\n/)
@@ -62,24 +82,57 @@ class Task {
         this.token = null
         this.wcsid = this.openid
         this.isSign = false
+        this._authFail = false
     }
 
     async run() {
         //随机延迟5-30s 模拟人工操作
        await await sleep(Math.floor(Math.random() * 20 + 5) * 1000);
-        let code = await getCode(this.server)
-        if (code) {
-            await this.getUserToken(code)
+
+        // 尝试缓存（不过期，业务失败自动重登）
+        let usedCache = false;
+        const cache = readTokenCache();
+        const cached = cache[this.server] || {};
+        if (cached.access_token) {
+            this.token = cached.access_token;
+            usedCache = true;
+            console.log(`💾 账号[${this.index}] 使用缓存token`);
         }
-        if (!this.token) {
-            console.log(`账号[${this.index}] 获取用户Token失败❌`)
-            return
-        }
-        this.token = 'Bearer ' + this.token
-        await this.getUserInfo()
-        await this.doPaper()
-        for (let i = 0; i < 10; i++) {
-            await this.share();
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (attempt === 1 || !this.token) {
+                if (attempt === 1) {
+                    console.log(`🔄 账号[${this.index}] token失效，重新登录...`);
+                    const c = readTokenCache();
+                    delete c[this.server];
+                    writeTokenCache(c);
+                }
+                let code = await getCode(this.server)
+                if (code) {
+                    await this.getUserToken(code)
+                }
+                if (!this.token) {
+                    console.log(`账号[${this.index}] 获取用户Token失败❌`)
+                    return
+                }
+                const c = readTokenCache();
+                c[this.server] = { access_token: this.token };
+                writeTokenCache(c);
+            }
+            this.token = 'Bearer ' + this.token
+            this._authFail = false;
+
+            await this.getUserInfo()
+            await this.doPaper()
+            for (let i = 0; i < 10; i++) {
+                await this.share();
+            }
+
+            if (usedCache && attempt === 0 && this._authFail) {
+                console.log(`⚠️ 账号[${this.index}] token失效，准备重登`);
+                continue;
+            }
+            break;
         }
     }
     async share() {
@@ -97,6 +150,7 @@ class Task {
         let { data: result } = await axios.request(options);
 
         console.log(`转发:${result?.code != 200 ? "转发失败" + result?.message : "转发成功!"}`)
+        if (result && result.code != 200) this._authFail = true;
     }
     async getUserToken(code) {
         let options = {
@@ -134,6 +188,7 @@ class Task {
                 console.log(`账号[${this.index}] 获取用户积分成功:${result?.data?.points}`)
             } else {
                 console.log(`账号[${this.index}] 获取用户积分失败❌`)
+                if (result && result.code != 200) this._authFail = true;
             }
 
         } catch (e) {
@@ -196,6 +251,7 @@ class Task {
             this.paperCode = result?.data?.paperCode;
         } else {
             this.ckStatus = false;
+            this._authFail = true;
         }
 
     }

@@ -120,6 +120,29 @@ USER_AGENT = (
     "UnifiedPCWindowsWechat(0xf2541c1a) XWEB/25297"
 )
 
+# ==================== Token 缓存（不过期，失效自动重登） ====================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "jx_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"⚠️ [缓存] 写入失败: {exc}")
+
 
 # ==================== 通用工具函数 ====================
 def now_text() -> str:
@@ -795,15 +818,39 @@ def run_account(index: int, total: int, server: str) -> Dict[str, Any]:
     print(f"⏳ [延迟] 启动延迟 {delay}s")
     sleep(delay)
 
-    code = get_code(server)
-    if not code:
-        result["error"] = "获取 code 失败"
-        return result
+    parsed_server, ref = parse_yyb_entry(server)
 
-    ok, user_id, token = jx_fetch_login_state(server, code, proxies)
-    if not ok:
-        result["error"] = "换取登录态失败，请检查微信是否在线/已授权酒仙"
-        return result
+    # 尝试使用缓存登录态（命中则跳过取 code + 登录）
+    cache = read_token_cache()
+    cached = cache.get(ref) or {}
+    token = cached.get("token", "")
+    user_id = str(cached.get("userId", ""))
+
+    if token:
+        print(f"💾 [缓存] 使用缓存token: {mask(token)}")
+        if not jx_validate_token(server, token, proxies):
+            print("🔄 [重登] token失效，重新登录")
+            if ref in cache:
+                del cache[ref]
+                write_token_cache(cache)
+            token = ""
+            user_id = ""
+
+    if not token:
+        code = get_code(server)
+        if not code:
+            result["error"] = "获取 code 失败"
+            return result
+
+        ok, user_id, token = jx_fetch_login_state(server, code, proxies)
+        if not ok:
+            result["error"] = "换取登录态失败，请检查微信是否在线/已授权酒仙"
+            return result
+
+        # 写入缓存
+        cache = read_token_cache()
+        cache[ref] = {"token": token, "userId": user_id}
+        write_token_cache(cache)
 
     result["token"] = mask(token)
     print(f"✅ [登录] 登录成功：userId: {mask_userid(user_id)}")

@@ -2,6 +2,26 @@
 // cron: 20 8,20 * * *
 const axios = require("axios");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "gjjj_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
 
 // ====================== YYB Go 账号（环境变量 YYB_SERVER = 地址@微信账号标识，多行） ======================
 const SERVERS = (process.env.YYB_SERVER || "")
@@ -233,9 +253,22 @@ class Task {
         console.log(`账号[${this.index}] 👤 用户: ${label}`);
     }
 
-    async ensureLogin() {
+    async ensureLogin(useCache) {
+        const cache = readTokenCache();
+        const cached = cache[this.serverEntry] || {};
+        if (useCache && cached.accessToken) {
+            this.accessToken = cached.accessToken;
+            this.memberId = String(cached.memberId || "");
+            console.log(`💾 账号[${this.index}] 使用缓存token`);
+            await this.getUserInfo();
+            console.log(`账号[${this.index}] ✅ 登录成功（缓存）`);
+            return;
+        }
         await this.login();
         await this.getUserInfo();
+        const c = readTokenCache();
+        c[this.serverEntry] = { accessToken: this.accessToken, memberId: this.memberId };
+        writeTokenCache(c);
         console.log(`账号[${this.index}] ✅ 登录成功`);
     }
 
@@ -488,8 +521,9 @@ class Task {
     }
 
     async run() {
-        try {
-            await this.ensureLogin();
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            await this.ensureLogin(attempt === 0);
             const pStart = await this.getPoints().catch(() => null);
             if (pStart !== null) console.log(`账号[${this.index}] 💰 当前积分: 【${pStart}】`);
 
@@ -558,9 +592,22 @@ class Task {
                 const arrow = delta === 0 ? `【${pEnd}】` : `【${pStart}】→【${pEnd}】 本次 +${delta}积分${detail}`;
                 console.log(`账号[${this.index}] 💰 积分: ${arrow}`);
             }
-        } catch (e) {
+          } catch (e) {
             const msg = e.message || String(e);
+            // 鉴权失败（401/402/token失效等）→ 清缓存重登重试一次
+            const isAuthFail = /401|402|登录失效|未登录|token|登录状态|authorizeLogin|identify/i.test(msg);
+            if (attempt === 0 && isAuthFail) {
+                console.log(`🔄 账号[${this.index}] token失效，清除缓存重新登录...`);
+                const c = readTokenCache();
+                delete c[this.serverEntry];
+                writeTokenCache(c);
+                this.accessToken = "";
+                this.memberId = "";
+                continue;
+            }
             console.log(`账号[${this.index}] 执行失败: ${msg}`);
+          }
+          break;
         }
     }
 }

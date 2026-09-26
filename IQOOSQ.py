@@ -398,6 +398,9 @@ class Task:
         self.server = server
         self.proxies = proxies
         self.openid = server
+        # 缓存 key 使用 YYB_SERVER 中 @ 后的 ref/wxid
+        _, _ref = parse_yyb_entry(server)
+        self.cache_key = _ref or server
         self.token = ""
         self.refresh_token = ""
         self.user_id = ""
@@ -407,6 +410,7 @@ class Task:
         self._sign_msg = "-"
         self._draw_msg = "-"
         self._login_error = ""
+        self._token_dead = False
 
     def run(self):
         result = {
@@ -439,79 +443,17 @@ class Task:
                     result["drawMsg"] = self._draw_msg
                     return result
 
-            self.user_info_request()
-            result["token"] = short_token(self.token)
-            result["userName"] = mask_name(
-                self.user_info.get("nickname")
-                or self.user_info.get("username")
-                or self.user_info.get("userName")
-                or self.user_id
-            )
-            score_val = self.user_info.get("score")
-            if score_val is None:
-                score_val = self.user_info.get("points")
-            if score_val is None:
-                score_val = self.user_info.get("coolCoin", "未知")
-            result["score"] = score_val
+            self._token_dead = False
+            self._run_business(result)
 
-            daily_tasks = self.fetch_daily_tasks()
-            if not daily_tasks:
-                log(f"账号[{self.index}] 未获取到每日任务，跳过任务执行")
-            else:
-                need_threads = any(
-                    t.get("upper_limit") != "不限次数"
-                    and (int(t.get("upper_limit", 0)) - t.get("isFinal", 0)) > 0
-                    and t.get("rule") in ("view_thread", "like", "share", "create_post")
-                    for t in daily_tasks
-                )
-                if need_threads:
-                    self.get_thread_list()
-
-                for task in daily_tasks:
-                    rule = task.get("rule")
-                    done = task.get("isFinal", 0)
-                    upper = task.get("upper_limit")
-                    if upper == "不限次数":
-                        continue
-                    max_count = int(upper)
-                    remaining = max_count - done
-                    if remaining <= 0:
-                        continue
-
-                    log(f"账号[{self.index}] 任务[{task.get('access')}] 已完成{done}/{max_count}，还需{remaining}次")
-
-                    if rule == "view_thread":
-                        for item in self.thread_list:
-                            if remaining <= 0:
-                                break
-                            self.view_post(item.get("threadId"))
-                            remaining -= 1
-                            sleep(3)
-                    elif rule == "like":
-                        for item in self.thread_list:
-                            if remaining <= 0:
-                                break
-                            self.like_post(item.get("threadId"), item.get("postId"))
-                            remaining -= 1
-                            sleep(3)
-                    elif rule == "share":
-                        for item in self.thread_list:
-                            if remaining <= 0:
-                                break
-                            self.share_post(item.get("threadId"))
-                            remaining -= 1
-                            sleep(3)
-                    elif rule == "create_post":
-                        if self.thread_list:
-                            self.comment_post(self.thread_list[0].get("threadId"))
-                            remaining -= 1
-                        else:
-                            log(f"账号[{self.index}] 无帖子可评论")
-                    elif rule == "create_thread":
-                        self.create_and_delete_thread()
-
-            self.get_draw_num()
-            self.sign_in()
+            # 业务执行中检测到登录失效 → 清缓存重登写回，重试一次业务
+            if self._token_dead:
+                log(f"账号[{self.index}] 业务返回登录失效，清除缓存重新登录并重试一次")
+                self.remove_cached_token()
+                self.login_by_wx_code()
+                if self.token:
+                    self._token_dead = False
+                    self._run_business(result)
 
             result["success"] = True
         except Exception as e:
@@ -520,15 +462,91 @@ class Task:
         result["signMsg"] = self._sign_msg
         result["drawMsg"] = self._draw_msg
         return result
+
+    def _run_business(self, result):
+        self.user_info_request()
+        result["token"] = short_token(self.token)
+        result["userName"] = mask_name(
+            self.user_info.get("nickname")
+            or self.user_info.get("username")
+            or self.user_info.get("userName")
+            or self.user_id
+        )
+        score_val = self.user_info.get("score")
+        if score_val is None:
+            score_val = self.user_info.get("points")
+        if score_val is None:
+            score_val = self.user_info.get("coolCoin", "未知")
+        result["score"] = score_val
+
+        daily_tasks = self.fetch_daily_tasks()
+        if not daily_tasks:
+            log(f"账号[{self.index}] 未获取到每日任务，跳过任务执行")
+        else:
+            need_threads = any(
+                t.get("upper_limit") != "不限次数"
+                and (int(t.get("upper_limit", 0)) - t.get("isFinal", 0)) > 0
+                and t.get("rule") in ("view_thread", "like", "share", "create_post")
+                for t in daily_tasks
+            )
+            if need_threads:
+                self.get_thread_list()
+
+            for task in daily_tasks:
+                rule = task.get("rule")
+                done = task.get("isFinal", 0)
+                upper = task.get("upper_limit")
+                if upper == "不限次数":
+                    continue
+                max_count = int(upper)
+                remaining = max_count - done
+                if remaining <= 0:
+                    continue
+
+                log(f"账号[{self.index}] 任务[{task.get('access')}] 已完成{done}/{max_count}，还需{remaining}次")
+
+                if rule == "view_thread":
+                    for item in self.thread_list:
+                        if remaining <= 0:
+                            break
+                        self.view_post(item.get("threadId"))
+                        remaining -= 1
+                        sleep(3)
+                elif rule == "like":
+                    for item in self.thread_list:
+                        if remaining <= 0:
+                            break
+                        self.like_post(item.get("threadId"), item.get("postId"))
+                        remaining -= 1
+                        sleep(3)
+                elif rule == "share":
+                    for item in self.thread_list:
+                        if remaining <= 0:
+                            break
+                        self.share_post(item.get("threadId"))
+                        remaining -= 1
+                        sleep(3)
+                elif rule == "create_post":
+                    if self.thread_list:
+                        self.comment_post(self.thread_list[0].get("threadId"))
+                        remaining -= 1
+                    else:
+                        log(f"账号[{self.index}] 无帖子可评论")
+                elif rule == "create_thread":
+                    self.create_and_delete_thread()
+
+        self.get_draw_num()
+        self.sign_in()
+
     def get_cached_token(self):
         cache = read_token_cache()
-        return cache.get(self.openid) or None
+        return cache.get(self.cache_key) or None
 
     def save_cached_token(self):
         if not self.token:
             return
         cache = read_token_cache()
-        cache[self.openid] = {
+        cache[self.cache_key] = {
             "accessToken": self.token,
             "refreshToken": self.refresh_token,
             "userId": self.user_id,
@@ -540,8 +558,8 @@ class Task:
 
     def remove_cached_token(self):
         cache = read_token_cache()
-        if cache.get(self.openid):
-            del cache[self.openid]
+        if cache.get(self.cache_key):
+            del cache[self.cache_key]
             write_token_cache(cache)
         self.token = ""
         self.refresh_token = ""
@@ -694,6 +712,7 @@ class Task:
             message = str(e)
             log(f"账号[{self.index}] 获取用户信息失败:{message}")
             if is_token_error(message):
+                self._token_dead = True
                 self.remove_cached_token()
 
     def get_draw_num(self):
@@ -733,6 +752,7 @@ class Task:
             self._sign_msg = f"签到失败: {message}"
             log(f"账号[{self.index}] 签到失败:{message}")
             if is_token_error(message):
+                self._token_dead = True
                 self.remove_cached_token()
     def like_post(self, thread_id, post_id):
         try:

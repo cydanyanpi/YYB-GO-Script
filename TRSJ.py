@@ -83,6 +83,30 @@ if not CODE_SERVERS:
 print(f"✅ 读取到 {len(CODE_SERVERS)} 个 code 服务（账号）")
 
 
+# ============ Token 缓存 ============
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "trsj_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"  [缓存] 写入失败: {exc}")
+
+
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -647,11 +671,31 @@ def run_account(server: str, index: int, total: int) -> dict:
     print(f"⏳ [延迟] 启动延迟 {delay}s")
     time.sleep(delay)
 
-    auth_token = get_ck(server, proxies)
+    # 缓存键用 @ 后面的 ref/wxid
+    _, ref = parse_yyb_entry(server)
+    cache = read_token_cache()
+    cached = cache.get(ref) or {}
+    auth_token = cached.get("auth_token", "")
+
+    if auth_token:
+        print(f"  [缓存] 使用缓存 authToken: {str(auth_token)[:8]}...")
+        if not verify_ck(auth_token, proxies):
+            print("  [缓存] ck 已失效，清除缓存重新登录")
+            cache = read_token_cache()
+            cache.pop(ref, None)
+            write_token_cache(cache)
+            auth_token = ""
+
     if not auth_token:
-        result["error"] = "获取 ck 失败（code→ck 失败），跳过"
-        print("❌ 获取 ck 失败（code→ck 失败），跳过")
-        return result
+        auth_token = get_ck(server, proxies)
+        if not auth_token:
+            result["error"] = "获取 ck 失败（code→ck 失败），跳过"
+            print("❌ 获取 ck 失败（code→ck 失败），跳过")
+            return result
+        cache = read_token_cache()
+        cache[ref] = {"auth_token": auth_token}
+        write_token_cache(cache)
+        print("  [缓存] 新登录 authToken 已写入缓存")
 
     all_logs = []
 

@@ -150,7 +150,6 @@ class Task {
         const cache = readTokenCache();
         const item = cache[this.account];
         if (!item || !item.token) return null;
-        if (item.expireTime && Number(item.expireTime) < Date.now()) return null;
         return item;
     }
 

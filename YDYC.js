@@ -1,6 +1,26 @@
 // name: 优点云创
 // cron: 48 6,18 * * *
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "ydyc_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
 // ====================== YYB Go 账号（环境变量 YYB_SERVER = 地址@微信账号标识，多行） ======================
 const SERVERS = (process.env.YYB_SERVER || "")
     .split(/\r?\n/)
@@ -132,13 +152,21 @@ class YouDianYunChuang {
             headers: { "3rdSession": this.session || "" },
             data,
         });
-        if (status !== 200) throw new Error(`${data.action || "接口"} HTTP ${status}: ${short(result)}`);
+        if (status !== 200) {
+            const err = new Error(`${data.action || "接口"} HTTP ${status}: ${short(result)}`);
+            err.authFail = true;
+            throw err;
+        }
         return result;
     }
 
     async call(data = {}) {
         const result = await this.api(data);
-        if (!result?.Status) throw new Error(`${data.action || "接口"} 失败: ${short(result?.Data || result)}`);
+        if (!result?.Status) {
+            const err = new Error(`${data.action || "接口"} 失败: ${short(result?.Data || result)}`);
+            err.authFail = true;
+            throw err;
+        }
         return result.Data;
     }
 
@@ -227,16 +255,47 @@ class YouDianYunChuang {
     }
 
     async run() {
-        try {
-            this.log(`开始执行 ${APP.name}`);
-            await this.login();
-            await this.queryUser();
-            await this.runSign();
-            await this.runAdRewards();
-            await this.queryIntegralInfo("jifen");
-            await this.queryUser();
-        } catch (e) {
-            this.log(`执行失败: ${e.message || e}`);
+        this.log(`开始执行 ${APP.name}`);
+
+        // 尝试缓存（不过期，业务失败自动重登）
+        let usedCache = false;
+        const cache = readTokenCache();
+        const cached = cache[this.server] || {};
+        if (cached.session) {
+            this.session = cached.session;
+            this.openid = cached.openid || "";
+            usedCache = true;
+            this.log(`💾 使用缓存登录凭据 openid=${this.openid || "未知"}`);
+        }
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                if (attempt === 1 || !this.session) {
+                    if (attempt === 1) {
+                        this.log("🔄 登录凭据失效，重新登录...");
+                        const c = readTokenCache();
+                        delete c[this.server];
+                        writeTokenCache(c);
+                    }
+                    await this.login();
+                    const c = readTokenCache();
+                    c[this.server] = { session: this.session, openid: this.openid };
+                    writeTokenCache(c);
+                }
+                await this.queryUser();
+                await this.runSign();
+                await this.runAdRewards();
+                await this.queryIntegralInfo("jifen");
+                await this.queryUser();
+                break;
+            } catch (e) {
+                this.log(`执行失败: ${e.message || e}`);
+                if (usedCache && attempt === 0 && e.authFail) {
+                    this.log("⚠️ 登录凭据失效，准备重登");
+                    continue;
+                }
+                break;
+            }
         }
     }
 }

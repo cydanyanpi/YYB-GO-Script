@@ -80,6 +80,30 @@ USER_AGENT = (
 )
  
  
+# ==================== Token 缓存（不过期，失效自动重登） ====================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "jyxejyfhs_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"⚠️ [缓存] 写入失败: {exc}")
+
+
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
  
@@ -476,34 +500,56 @@ def run_account(index: int, total: int, server: str) -> Dict[str, Any]:
     print(f"⏳ [延迟] 启动延迟 {delay}s")
     sleep(delay)
  
-    code = get_code(server)
-    if not code:
-        result["error"] = "获取 code 失败"
-        return result
- 
-    token, raw_login = login_by_code(server, code, proxies)
-    if not token:
-        result["error"] = f"登录失败: {json_preview(raw_login)}"
-        return result
- 
-    result["token"] = mask(token)
- 
-    try:
+    parsed_server, ref = parse_yyb_go_entry(server)
+
+    cache = read_token_cache()
+    cached = cache.get(ref) or {}
+    token = cached.get("token", "")
+    used_cache = bool(token)
+    if token:
+        print(f"💾 [缓存] 使用缓存token: {mask(token)}")
+
+    person_data = {}
+    for attempt in range(2):
+        if attempt == 1 or not token:
+            if attempt == 1:
+                print("🔄 [重登] token失效，重新登录")
+                cache = read_token_cache()
+                if ref in cache:
+                    del cache[ref]
+                    write_token_cache(cache)
+            code = get_code(server)
+            if not code:
+                result["error"] = "获取 code 失败"
+                return result
+            token, raw_login = login_by_code(server, code, proxies)
+            if not token:
+                result["error"] = f"登录失败: {json_preview(raw_login)}"
+                return result
+            cache = read_token_cache()
+            cache[ref] = {"token": token}
+            write_token_cache(cache)
+
+        result["token"] = mask(token)
         person_resp = api_post_form(server, PERSON_INFO_URL, token, proxies, {"token": token})
-        if person_resp.get("code") == 1000:
-            person_data = person_resp.get("data", {})
-            nickname = person_data.get("nickname", "-")
-            score_before = person_data.get("score", 0)
-            sign_in_num = person_data.get("sign_in_num", 0)
-            result["nickname"] = nickname
-            result["scoreBefore"] = str(score_before)
-            print(f"👤 [信息] 昵称: {nickname}")
-            print(f"💰 [积分] 当前积分: {score_before}")
-            print(f"✅ [签到] 今日已签到: {'是' if sign_in_num > 0 else '否'}")
-        else:
+        if person_resp.get("code") != 1000:
+            if attempt == 0 and used_cache:
+                continue
             result["error"] = f"获取个人信息失败: {person_resp.get('msg', '未知错误')}"
             return result
- 
+        person_data = person_resp.get("data", {})
+        break
+
+    nickname = person_data.get("nickname", "-")
+    score_before = person_data.get("score", 0)
+    sign_in_num = person_data.get("sign_in_num", 0)
+    result["nickname"] = nickname
+    result["scoreBefore"] = str(score_before)
+    print(f"👤 [信息] 昵称: {nickname}")
+    print(f"💰 [积分] 当前积分: {score_before}")
+    print(f"✅ [签到] 今日已签到: {'是' if sign_in_num > 0 else '否'}")
+
+    try:
         sign_resp = api_post_form(server, SIGN_URL, token, proxies, {"token": token})
         sign_code = sign_resp.get("code", 0)
         sign_msg = sign_resp.get("msg", "")

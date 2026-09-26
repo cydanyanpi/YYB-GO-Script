@@ -69,6 +69,30 @@ UA_LIST = [
 ]
 
 
+# ===================== Token 缓存（不过期，失效自动重登） =====================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "nxdc_token_cache.json")
+
+
+def read_token_cache() -> dict:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"[缓存] 写入失败：{exc}")
+
+
 # ===================== 工具函数 =====================
 
 def sleep(seconds: float) -> None:
@@ -527,29 +551,49 @@ def run_account(server: str, global_proxy: dict | None = None) -> dict:
         print(f"[{server}] 启动延迟 {delay}s")
         sleep(delay)
 
-        code = get_code(server)
-        if not code:
-            result["error"] = "获取 code 失败"
-            return result
+        _, ref = parse_yyb_go_entry(server)
 
-        token, login_raw = login_by_code(code, ua, proxies, server)
-        if not token:
-            result["error"] = "登录失败或未识别 token 字段"
-            return result
+        cache = read_token_cache()
+        cached = cache.get(ref) or {}
+        token = cached.get("token", "")
+        used_cache = bool(token)
+        if token:
+            print(f"[{server}] [缓存] 使用缓存token")
 
-        result["login_msg"] = "登录成功"
-        rand_sleep(2, 5)
+        userinfo = {}
+        for attempt in range(2):
+            if attempt == 1 or not token:
+                if attempt == 1:
+                    print(f"[{server}] [重登] token失效，重新登录")
+                    cache = read_token_cache()
+                    if ref in cache:
+                        del cache[ref]
+                        write_token_cache(cache)
+                code = get_code(server)
+                if not code:
+                    result["error"] = "获取 code 失败"
+                    return result
+                token, login_raw = login_by_code(code, ua, proxies, server)
+                if not token:
+                    result["error"] = "登录失败或未识别 token 字段"
+                    return result
+                cache = read_token_cache()
+                cache[ref] = {"token": token}
+                write_token_cache(cache)
 
-        userinfo = call_api(
-            "https://tm-web.pin-dao.cn/user/base-userinfo",
-            token,
-            ua,
-            proxies,
-            server,
-            {},
-        )
+            result["login_msg"] = "登录成功"
+            rand_sleep(2, 5)
 
-        if userinfo.get("code") != 0:
+            userinfo = call_api(
+                "https://tm-web.pin-dao.cn/user/base-userinfo",
+                token, ua, proxies, server, {},
+            )
+
+            if userinfo.get("code") == 0:
+                break
+            if attempt == 0 and used_cache:
+                print(f"[{server}] [重登] 用户信息查询失败，判定token失效")
+                continue
             result["error"] = f"查询用户信息失败：{userinfo.get('message') or '未知错误'}"
             return result
 

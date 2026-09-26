@@ -53,8 +53,8 @@ const MINI_APP_ID = "wx89a714fb03b61b99";
 const APP_VERSION = "2.30.3";
 const ENV_VERSION = "release";
 const API_BASE = "https://smp-api.iyouke.com/dtapi";
-const TOKEN_CACHE_FILE = path.join(__dirname, "token_caches", "parkson_token_cache.json");
-try { fs.mkdirSync(path.dirname(TOKEN_CACHE_FILE), { recursive: true }); } catch (e) {}
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "hlq_token_cache.json");
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) MicroMessenger/3.9.12 MiniProgramEnv/Windows WindowsWechat/WMPF";
 
 function readTokenCache() {
@@ -68,6 +68,7 @@ function readTokenCache() {
 
 function writeTokenCache(cache) {
     try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
         fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf8");
     } catch (e) {
         console.log(`写入token缓存失败: ${e.message || e}`);
@@ -95,25 +96,32 @@ class Task {
     }
 
     async run() {
-        const cached = this.getCachedToken();
-        if (cached) {
-            this.applyToken(cached);
-            console.log(`账号[${this.index}] 使用缓存token`);
-            if (!(await this.checkToken())) {
-                this.removeCachedToken();
-                console.log(`账号[${this.index}] 缓存token失效，重新登录`);
+        const usedCache = !!this.getCachedToken();
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (attempt === 1 || !this.accessToken) {
+                if (attempt === 1) {
+                    console.log(`账号[${this.index}] token失效，重新登录...`);
+                    this.removeCachedToken();
+                }
+                await this.loginByWxCode();
+                if (!this.accessToken) return;
+            }
+            try {
+                await this.getPointsInfo();
+                await this.getSignList();
+                await this.doSign();
+                await this.getPointsInfo();
+                return;
+            } catch (e) {
+                const msg = String(e.message || e);
+                if (attempt === 0 && usedCache && /token|登录|授权|401/i.test(msg)) {
+                    console.log(`账号[${this.index}] 业务token失效，清除缓存重新登录...`);
+                    this.removeCachedToken();
+                    continue;
+                }
+                console.log(`账号[${this.index}] 执行失败: ${msg}`);
             }
         }
-
-        if (!this.accessToken) {
-            await this.loginByWxCode();
-            if (!this.accessToken) return;
-        }
-
-        await this.getPointsInfo();
-        await this.getSignList();
-        await this.doSign();
-        await this.getPointsInfo();
     }
 
     getCachedToken() {
@@ -130,7 +138,6 @@ class Task {
             userId: this.userInfo.userId || "",
             nickName: this.userInfo.nickName || "",
             userMobile: this.userInfo.userMobile || "",
-            updatedAt: new Date().toISOString(),
         };
         writeTokenCache(cache);
     }
@@ -244,7 +251,7 @@ class Task {
             return data;
         } catch (e) {
             console.log(`账号[${this.index}] 查询积分失败: ${e.message || e}`);
-            if (/token|登录|授权|401/i.test(String(e.message || e))) this.removeCachedToken();
+            if (/token|登录|授权|401/i.test(String(e.message || e))) throw e;
         }
     }
 
@@ -262,7 +269,7 @@ class Task {
             console.log(`账号[${this.index}] 签到状态: ${this.todayDate} ${this.isTodaySign ? "已签" : "未签"}`);
         } catch (e) {
             console.log(`账号[${this.index}] 查询签到状态失败: ${e.message || e}`);
-            if (/token|登录|授权|401/i.test(String(e.message || e))) this.removeCachedToken();
+            if (/token|登录|授权|401/i.test(String(e.message || e))) throw e;
         }
     }
 
@@ -286,7 +293,7 @@ class Task {
                 return;
             }
             console.log(`账号[${this.index}] 签到失败: ${message}`);
-            if (/token|登录|授权|401/i.test(message)) this.removeCachedToken();
+            if (/token|登录|授权|401/i.test(message)) throw e;
         }
     }
 }

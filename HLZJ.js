@@ -90,13 +90,16 @@ const jsonPreview = (data, limit = 800) => {
 
 // 缓存读写
 let cookieStore = {};
+const TOKEN_CACHE_DIR = path.join(__dirname, 'token_caches');
 const loadCookie = () => {
-    try { if (fs.existsSync(COOKIE_FILE)) cookieStore = JSON.parse(fs.readFileSync(COOKIE_FILE, 'utf8')); }
+    try { if (fs.existsSync(COOKIE_FILE)) cookieStore = JSON.parse(fs.readFileSync(COOKIE_FILE, 'utf8')) || {}; }
     catch { cookieStore = {}; }
 };
 const saveCookie = () => {
-    fs.mkdirSync(path.dirname(COOKIE_FILE), { recursive: true });
-    fs.writeFileSync(COOKIE_FILE, JSON.stringify(cookieStore, null, 2));
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(COOKIE_FILE, JSON.stringify(cookieStore, null, 2));
+    } catch (e) { console.log('⚠️ 缓存写入失败:', e.message); }
 };
 
 // ========== 品赞代理（移植自铛铛一下） ==========
@@ -492,6 +495,22 @@ const runAccount = async (index, total, server) => {
     cookieStore.current = cookieStore[server];
     cookieStore.current.server = server;
 
+    const doLogin = async () => {
+        console.log('开始微信登录...');
+        const code = await getCode(server);
+        if (!code) throw new Error('获取 code 失败');
+        console.log(`获取到 code: ${code.substring(0, 10)}...`);
+        const unionInfo = await codeToUnionId(code, proxyConfig, server);
+        console.log(`获取到 unionId: ${unionInfo.unionId}`);
+        cookieStore.current.unionId = unionInfo.unionId;
+        const loginData = await authorizedLogin(unionInfo.unionId);
+        cookieStore.current.authorization = `Bearer ${loginData.token}`;
+        cookieStore.current.userId = loginData.user_info.id;
+        cookieStore.current.treeId = loginData.user_info.tree_id;
+        saveCookie();
+        console.log('游戏登录成功，token已缓存');
+    };
+
     try {
         const { proxyConfig, ip } = await getValidProxy(server);
         cookieStore.current.proxyConfig = proxyConfig;
@@ -503,41 +522,50 @@ const runAccount = async (index, total, server) => {
         console.log(`⏳ [延迟] 启动延迟 ${delay}s`);
         await wait(delay * 1000);
 
-        if (!cookieStore.current.authorization) {
-            console.log('缓存未命中，开始微信登录...');
-            const code = await getCode(server);
-            if (!code) { result.error = '获取 code 失败'; return result; }
-            console.log(`获取到 code: ${code.substring(0, 10)}...`);
-            const unionInfo = await codeToUnionId(code, proxyConfig, server);
-            console.log(`获取到 unionId: ${unionInfo.unionId}`);
-            cookieStore.current.unionId = unionInfo.unionId;
-            const loginData = await authorizedLogin(unionInfo.unionId);
-            cookieStore.current.authorization = `Bearer ${loginData.token}`;
-            cookieStore.current.userId = loginData.user_info.id;
-            cookieStore.current.treeId = loginData.user_info.tree_id;
-            saveCookie();
-            console.log('游戏登录成功，token已缓存');
-            result.loginMsg = '登录成功';
-        } else {
-            result.loginMsg = '缓存命中';
+        const usedCache = !!cookieStore.current.authorization;
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (attempt === 1 || !cookieStore.current.authorization) {
+                if (attempt === 1) {
+                    console.log('🔄 token失效，清除缓存重新登录...');
+                    delete cookieStore[server];
+                    cookieStore[server] = {};
+                    cookieStore.current = cookieStore[server];
+                    cookieStore.current.server = server;
+                    cookieStore.current.proxyConfig = proxyConfig;
+                    cookieStore.current.proxyIp = ip;
+                }
+                await doLogin();
+                result.loginMsg = attempt === 0 ? '登录成功' : '重新登录成功';
+            } else {
+                result.loginMsg = '缓存命中';
+            }
+
+            try {
+                await getUserInfo();
+                result.signMsg = `昵称:${cookieStore.current.userId || '未知'}`;
+
+                await wait(randomWait(2000, 3000));
+                await getTodayWater();
+                await wait(randomWait(2000, 3000));
+                await getDayList();
+                result.signMsg += ' 签到完成';
+                await wait(randomWait(2000, 3000));
+
+                await joinPower();
+                result.powerMsg = '电力任务完成';
+                result.boxMsg = '宝箱已处理';
+
+                result.success = true;
+                return result;
+            } catch (e) {
+                const msg = String(e.message || e);
+                if (attempt === 0 && usedCache && /token|登录|授权|未登录|401|403|309|invalid/i.test(msg)) {
+                    console.log(`⚠️ 业务token失效，清除缓存重新登录: ${msg}`);
+                    continue;
+                }
+                throw e;
+            }
         }
-
-        await getUserInfo();
-        result.signMsg = `昵称:${cookieStore.current.userId || '未知'}`;
-
-        await wait(randomWait(2000, 3000));
-        await getTodayWater();
-        await wait(randomWait(2000, 3000));
-        await getDayList();
-        result.signMsg += ' 签到完成';
-        await wait(randomWait(2000, 3000));
-
-        await joinPower();
-        result.powerMsg = '电力任务完成';
-        result.boxMsg = '宝箱已处理';
-
-        result.success = true;
-        return result;
     } catch (e) {
         console.error(`账号 ${server} 执行异常: ${e.message}`);
         delete cookieStore[server];

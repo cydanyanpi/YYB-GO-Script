@@ -1,7 +1,27 @@
 // name: 蜜雪冰城
 // cron: 40 10,22 * * *
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
 const rs = require("jsrsasign");
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "mxbc_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
 
 // ====================== 配置项 ======================
 // PushPlus 通知Token（在青龙面板环境变量中设置 PLUSPLUS_TOKEN）
@@ -102,8 +122,14 @@ async function getUserPoint(token) {
             },
             timeout: 8000
         });
-        return data.code === 0 ? parseInt(data.data.customerPoint) : 0;
+        if (data.code !== 0) {
+            const err = new Error("查询积分失败: " + (data.msg || data.code));
+            err.authFail = true;
+            throw err;
+        }
+        return parseInt(data.data.customerPoint);
     } catch (e) {
+        if (e.authFail) throw e;
         return 0;
     }
 }
@@ -165,55 +191,88 @@ async function runServer(server) {
     console.log(`蜜雪冰城 - ${server} 账号任务`);
     console.log(`==============================`);
 
-    try {
-        // 1. 获取登录code
-        const code = await getCode(server);
-        if (!code) throw new Error("获取code失败");
+    // 尝试缓存（不过期，业务失败自动重登）
+    let token = null;
+    let usedCache = false;
+    const cache = readTokenCache();
+    const cached = cache[server] || {};
+    if (cached.accessToken) {
+        token = cached.accessToken;
+        usedCache = true;
+        console.log(`💾 ${server} 使用缓存token`);
+    }
 
-        // 2. code换session
-        const t1 = ts13();
-        const session = await axios.post("https://mxsa.mxbc.net/api/v1/app/code2Session", {
-            code, miniAppId: MINI_APP_ID, t: t1, appId: APP_ID,
-            sign: getSHA256withRSA(`appId=${APP_ID}&code=${code}&miniAppId=${MINI_APP_ID}&t=${t1}`)
-        }, { headers: { version: "2.8.27" } });
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            if (attempt === 1 || !token) {
+                if (attempt === 1) {
+                    console.log(`🔄 ${server} token失效，重新登录...`);
+                    const c = readTokenCache();
+                    delete c[server];
+                    writeTokenCache(c);
+                }
 
-        const { openid, unionid } = session.data.data;
+                // 1. 获取登录code
+                const code = await getCode(server);
+                if (!code) throw new Error("获取code失败");
 
-        // 3. 登录获取token
-        const t2 = ts13();
-        const loginRes = await axios.post("https://mxsa.mxbc.net/api/v2/app/loginByAuthCode", {
-            authCode: code, openId: openid, unionid, third: "wxmini", miniAppId: MINI_APP_ID,
-            t: t2, appId: APP_ID,
-            sign: getSHA256withRSA(`appId=${APP_ID}&authCode=${code}&miniAppId=${MINI_APP_ID}&openId=${openid}&t=${t2}&third=wxmini&unionid=${unionid}`)
-        }, { headers: { version: "2.8.27", "x-ssos-cid": unionid } });
+                // 2. code换session
+                const t1 = ts13();
+                const session = await axios.post("https://mxsa.mxbc.net/api/v1/app/code2Session", {
+                    code, miniAppId: MINI_APP_ID, t: t1, appId: APP_ID,
+                    sign: getSHA256withRSA(`appId=${APP_ID}&code=${code}&miniAppId=${MINI_APP_ID}&t=${t1}`)
+                }, { headers: { version: "2.8.27" } });
 
-        const token = loginRes.data.data.accessToken;
-        const before = await getUserPoint(token);
-        console.log(`✅ ${server} 登录成功 | 当前雪王币：${before}`);
+                const { openid, unionid } = session.data.data;
 
-        // 4. 执行任务
-        console.log(`\n执行任务：访问魔法铺...`);
-        await doMagicShop(token);
-        await new Promise(r => setTimeout(r, 1500));
+                // 3. 登录获取token
+                const t2 = ts13();
+                const loginRes = await axios.post("https://mxsa.mxbc.net/api/v2/app/loginByAuthCode", {
+                    authCode: code, openId: openid, unionid, third: "wxmini", miniAppId: MINI_APP_ID,
+                    t: t2, appId: APP_ID,
+                    sign: getSHA256withRSA(`appId=${APP_ID}&authCode=${code}&miniAppId=${MINI_APP_ID}&openId=${openid}&t=${t2}&third=wxmini&unionid=${unionid}`)
+                }, { headers: { version: "2.8.27", "x-ssos-cid": unionid } });
 
-        // 5. 结果展示
-        const after = await getUserPoint(token);
-        const gain = Math.max(0, after - before);
+                token = loginRes.data.data.accessToken;
+                const c = readTokenCache();
+                c[server] = { accessToken: token };
+                writeTokenCache(c);
+            }
 
-        console.log(`\n======================================`);
-        console.log(`💎 ${server} 执行前：${before} 雪王币`);
-        console.log(`✅ ${server} 本次获得：${gain} 雪王币`);
-        console.log(`💎 ${server} 执行后：${after} 雪王币`);
-        console.log(`======================================`);
+            const before = await getUserPoint(token);
+            console.log(`✅ ${server} 登录成功 | 当前雪王币：${before}`);
 
-        result.success = true;
-        result.before = before;
-        result.after = after;
-        result.gain = gain;
+            // 4. 执行任务
+            console.log(`\n执行任务：访问魔法铺...`);
+            await doMagicShop(token);
+            await new Promise(r => setTimeout(r, 1500));
 
-    } catch (e) {
-        result.error = e.message;
-        console.log(`❌ ${server} 执行失败：`, e.message);
+            // 5. 结果展示
+            const after = await getUserPoint(token);
+            const gain = Math.max(0, after - before);
+
+            console.log(`\n======================================`);
+            console.log(`💎 ${server} 执行前：${before} 雪王币`);
+            console.log(`✅ ${server} 本次获得：${gain} 雪王币`);
+            console.log(`💎 ${server} 执行后：${after} 雪王币`);
+            console.log(`======================================`);
+
+            result.success = true;
+            result.before = before;
+            result.after = after;
+            result.gain = gain;
+
+            break;
+
+        } catch (e) {
+            result.error = e.message;
+            console.log(`❌ ${server} 执行失败：`, e.message);
+            if (usedCache && attempt === 0 && e.authFail) {
+                console.log(`⚠️ ${server} token失效，准备重登`);
+                continue;
+            }
+            break;
+        }
     }
     return result;
 }
