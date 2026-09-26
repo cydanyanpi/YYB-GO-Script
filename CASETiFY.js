@@ -54,8 +54,8 @@ const PAGE_VERSION = "160";
 const API_BASE = "https://mini-app-api.casetify.cn/api/v4";
 const WECHAT_ID = 260;
 const POINT_MALL_TYPE = 13;
-const TOKEN_CACHE_FILE = path.join(__dirname, "token_caches", "casetify_token_cache.json");
-try { fs.mkdirSync(path.dirname(TOKEN_CACHE_FILE), { recursive: true }); } catch (e) {}
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "casetify_token_cache.json");
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) MicroMessenger/3.9.12 MiniProgramEnv/Windows WindowsWechat/WMPF";
 
 function readTokenCache() {
@@ -69,6 +69,7 @@ function readTokenCache() {
 
 function writeTokenCache(cache) {
     try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
         fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf8");
     } catch (e) {
         console.log(`写入token缓存失败: ${e.message || e}`);
@@ -107,24 +108,31 @@ class Task {
     }
 
     async run() {
-        const cached = this.getCachedToken();
-        if (cached) {
-            this.applyToken(cached);
-            console.log(`账号[${this.index}] 使用缓存token`);
-            if (!(await this.checkToken())) {
-                this.removeCachedToken();
-                console.log(`账号[${this.index}] 缓存token失效，重新登录`);
+        const usedCache = !!this.getCachedToken();
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (attempt === 1 || !this.token) {
+                if (attempt === 1) {
+                    console.log(`账号[${this.index}] token失效，重新登录...`);
+                    this.removeCachedToken();
+                }
+                await this.loginByWxCode();
+                if (!this.token) return;
+            }
+            try {
+                await this.getCampaignId();
+                await this.doSign();
+                this.saveCachedToken();
+                return;
+            } catch (e) {
+                const msg = String(e.message || e);
+                if (attempt === 0 && usedCache && isTokenError(msg)) {
+                    console.log(`账号[${this.index}] 业务token失效，清除缓存重新登录...`);
+                    this.removeCachedToken();
+                    continue;
+                }
+                console.log(`账号[${this.index}] 执行失败: ${msg}`);
             }
         }
-
-        if (!this.token) {
-            await this.loginByWxCode();
-            if (!this.token) return;
-        }
-
-        await this.getCampaignId();
-        await this.doSign();
-        this.saveCachedToken();
     }
 
     getCachedToken() {
@@ -142,7 +150,6 @@ class Task {
             phone: this.phone,
             levels: this.levels,
             campaignId: this.campaignId,
-            updatedAt: new Date().toISOString(),
         };
         writeTokenCache(cache);
     }
@@ -284,7 +291,7 @@ class Task {
         } catch (e) {
             const message = e.message || e;
             console.log(`账号[${this.index}] 签到失败: ${message}`);
-            if (isTokenError(message)) this.removeCachedToken();
+            if (isTokenError(message)) throw e;
         }
     }
 }

@@ -94,6 +94,34 @@ USER_AGENT = (
 )
 
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "ddyx_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"  [缓存] 写入失败: {exc}")
+
+
+def is_auth_fail_msg(msg: Any) -> bool:
+    import re
+    return bool(re.search(r'登录|未登录|授权|token|失效|过期|登录态|请重新|身份|凭证', str(msg), re.IGNORECASE))
+
+
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -564,104 +592,131 @@ def run_account(index: int, total: int, server: str) -> Dict[str, Any]:
     print(f"⏳ [延迟] 启动延迟 {delay}s")
     sleep(delay)
 
-    code = get_code(server)
-    if not code:
-        result["error"] = "获取 code 失败"
-        return result
+    _, ref = parse_yyb_go_entry(server)
 
-    token, raw_login = login_by_code(server, code, proxies)
-    if not token:
-        result["error"] = f"登录失败: {json_preview(raw_login)}"
-        return result
+    # 尝试缓存 token（不过期，业务鉴权失败自动重登）
+    cache = read_token_cache()
+    cached = cache.get(ref) or {}
+    token = cached.get("token", "")
+    used_cache = bool(token)
+    if token:
+        print(f"  [缓存] 使用缓存token: {mask(token)}")
 
-    result["token"] = mask(token)
+    for attempt in range(2):
+        if attempt == 1 or not token:
+            if attempt == 1:
+                print("  [重登] token失效，重新登录...")
+                cache = read_token_cache()
+                if ref in cache:
+                    del cache[ref]
+                    write_token_cache(cache)
+            code = get_code(server)
+            if not code:
+                result["error"] = "获取 code 失败"
+                return result
 
-    try:
-        sign_resp = api_get(server, SIGN_JOIN_URL, token, proxies)
-        if sign_resp.get("code") == 0:
-            sign_name = sign_resp.get("data", {}).get("name", "签到成功")
-            result["signMsg"] = f"每日签到: {sign_name}"
-            print(f"✅ [签到] {result['signMsg']}")
-        else:
-            result["signMsg"] = sign_resp.get("msg") or sign_resp.get("message") or "签到失败"
-            print(f"⚠️ [签到] {result['signMsg']}")
+            token, raw_login = login_by_code(server, code, proxies)
+            if not token:
+                result["error"] = f"登录失败: {json_preview(raw_login)}"
+                return result
 
-        lottery_info = api_get(server, LOTTERY_INFO_URL, token, proxies)
-        lottery_data = lottery_info.get("data")
-        if not isinstance(lottery_data, dict):
-            lottery_data = {}
-        member_count = int(lottery_data.get("member_count", 0) or 0)
-        print(f"🎰 [抽奖] 当前可抽奖 {member_count} 次")
+            cache = read_token_cache()
+            cache[ref] = {"token": token}
+            write_token_cache(cache)
 
-        prize_list: List[str] = []
-        for draw_index in range(1, member_count + 1):
-            wait_time = random.randint(2, 5)
-            print(f"⏳ [抽奖] 第 {draw_index} 次抽奖前等待 {wait_time}s")
-            sleep(wait_time)
+        result["token"] = mask(token)
 
-            draw_resp = api_get(server, LOTTERY_RESULT_URL, token, proxies)
-            if draw_resp.get("code") != 0:
-                msg = draw_resp.get("msg") or draw_resp.get("message") or "抽奖失败"
-                prize_list.append(f"第{draw_index}次失败: {msg}")
-                print(f"❌ [抽奖] {msg}")
-                continue
+        try:
+            sign_resp = api_get(server, SIGN_JOIN_URL, token, proxies)
+            if sign_resp.get("code") == 0:
+                sign_name = sign_resp.get("data", {}).get("name", "签到成功")
+                result["signMsg"] = f"每日签到: {sign_name}"
+                print(f"✅ [签到] {result['signMsg']}")
+            else:
+                s_msg = sign_resp.get("msg") or sign_resp.get("message") or "签到失败"
+                if attempt == 0 and used_cache and is_auth_fail_msg(s_msg):
+                    print(f"  [重登] 签到鉴权失败({s_msg})，重新登录...")
+                    token = None
+                    continue
+                result["signMsg"] = s_msg
+                print(f"⚠️ [签到] {result['signMsg']}")
 
-            data = draw_resp.get("data") or {}
-            prize_name = data.get("prizeName") or data.get("goodName") or "未知奖品"
-            record_id = data.get("record_id") or data.get("recordId") or data.get("id")
-            prize_list.append(prize_name)
-            print(f"✅ [抽奖] 第 {draw_index} 次获得: {prize_name}")
+            lottery_info = api_get(server, LOTTERY_INFO_URL, token, proxies)
+            lottery_data = lottery_info.get("data")
+            if not isinstance(lottery_data, dict):
+                lottery_data = {}
+            member_count = int(lottery_data.get("member_count", 0) or 0)
+            print(f"🎰 [抽奖] 当前可抽奖 {member_count} 次")
 
-            if record_id:
-                update_url = f"{LOTTERY_UPDATE_URL}?id={quote(str(record_id))}"
-                update_resp = api_get(server, update_url, token, proxies)
-                if update_resp.get("code") == 0:
-                    print("✅ [抽奖] 奖品结果确认成功")
-                else:
-                    print(f"⚠️ [抽奖] 奖品结果确认失败: {json_preview(update_resp, 300)}")
+            prize_list: List[str] = []
+            for draw_index in range(1, member_count + 1):
+                wait_time = random.randint(2, 5)
+                print(f"⏳ [抽奖] 第 {draw_index} 次抽奖前等待 {wait_time}s")
+                sleep(wait_time)
 
-        result["lotteryMsg"] = "、".join(prize_list) if prize_list else f"{member_count} 次机会"
+                draw_resp = api_get(server, LOTTERY_RESULT_URL, token, proxies)
+                if draw_resp.get("code") != 0:
+                    msg = draw_resp.get("msg") or draw_resp.get("message") or "抽奖失败"
+                    prize_list.append(f"第{draw_index}次失败: {msg}")
+                    print(f"❌ [抽奖] {msg}")
+                    continue
 
-        account_resp = api_get(server, ACCOUNT_DETAIL_URL, token, proxies)
-        account_data = account_resp.get("data")
-        if not isinstance(account_data, dict):
-            account_data = {}
-        total_raw = account_data.get("total", 0)
-        total = to_float(total_raw)
+                data = draw_resp.get("data") or {}
+                prize_name = data.get("prizeName") or data.get("goodName") or "未知奖品"
+                record_id = data.get("record_id") or data.get("recordId") or data.get("id")
+                prize_list.append(prize_name)
+                print(f"✅ [抽奖] 第 {draw_index} 次获得: {prize_name}")
 
-        result["balance"] = str(total_raw)
-        print(f"💰 [余额] 当前总金额: {total_raw} 元")
+                if record_id:
+                    update_url = f"{LOTTERY_UPDATE_URL}?id={quote(str(record_id))}"
+                    update_resp = api_get(server, update_url, token, proxies)
+                    if update_resp.get("code") == 0:
+                        print("✅ [抽奖] 奖品结果确认成功")
+                    else:
+                        print(f"⚠️ [抽奖] 奖品结果确认失败: {json_preview(update_resp, 300)}")
 
-        if total < 0.3:
-            result["withdrawMsg"] = "余额不足 0.3 元，跳过提现"
-            print(f"⚠️ [提现] {result['withdrawMsg']}")
+            result["lotteryMsg"] = "、".join(prize_list) if prize_list else f"{member_count} 次机会"
+
+            account_resp = api_get(server, ACCOUNT_DETAIL_URL, token, proxies)
+            account_data = account_resp.get("data")
+            if not isinstance(account_data, dict):
+                account_data = {}
+            total_raw = account_data.get("total", 0)
+            total = to_float(total_raw)
+
+            result["balance"] = str(total_raw)
+            print(f"💰 [余额] 当前总金额: {total_raw} 元")
+
+            if total < 0.3:
+                result["withdrawMsg"] = "余额不足 0.3 元，跳过提现"
+                print(f"⚠️ [提现] {result['withdrawMsg']}")
+                result["success"] = True
+                return result
+
+            trade_resp = api_get(server, WITHDRAWAL_TRADE_LIST_URL, token, proxies)
+            payload, withdraw_prepare_msg = build_withdraw_payload(trade_resp)
+            print(f"💸 [提现] {withdraw_prepare_msg}")
+
+            if not payload:
+                result["withdrawMsg"] = withdraw_prepare_msg
+                result["success"] = True
+                return result
+
+            withdraw_resp = api_post(server, WITHDRAWAL_URL, token, proxies, payload)
+            result["withdrawMsg"] = (
+                withdraw_resp.get("msg")
+                or withdraw_resp.get("message")
+                or json_preview(withdraw_resp)
+            )
+            print(f"💸 [提现] {result['withdrawMsg']}")
+
             result["success"] = True
             return result
 
-        trade_resp = api_get(server, WITHDRAWAL_TRADE_LIST_URL, token, proxies)
-        payload, withdraw_prepare_msg = build_withdraw_payload(trade_resp)
-        print(f"💸 [提现] {withdraw_prepare_msg}")
-
-        if not payload:
-            result["withdrawMsg"] = withdraw_prepare_msg
-            result["success"] = True
+        except Exception as exc:
+            result["error"] = traceback.format_exc().strip()
+            print(f"❌ [账号] 执行失败: {exc}")
             return result
-
-        withdraw_resp = api_post(server, WITHDRAWAL_URL, token, proxies, payload)
-        result["withdrawMsg"] = (
-            withdraw_resp.get("msg")
-            or withdraw_resp.get("message")
-            or json_preview(withdraw_resp)
-        )
-        print(f"💸 [提现] {result['withdrawMsg']}")
-
-        result["success"] = True
-        return result
-
-    except Exception as exc:
-        result["error"] = traceback.format_exc().strip()
-        print(f"❌ [账号] 执行失败: {exc}")
-        return result
 
 
 def build_notify(results: List[Dict[str, Any]]) -> str:

@@ -22,11 +22,10 @@ const FALLBACK_CHECKIN_ID = "5540097";
 const USER_VERSION = "3.197.5.102";
 const PAGE_VERSION = "32";
 const API_BASE = "https://h5.youzan.com";
-const TOKEN_CACHE_FILE = path.join(__dirname, "token_caches", "camel_token_cache.json");
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "camel_token_cache.json");
 
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF WindowsWechat(0x63090a13) UnifiedPCWindowsWechat(0xf2541923) XWEB/19823";
-
-try { fs.mkdirSync(path.dirname(TOKEN_CACHE_FILE), { recursive: true }); } catch (_) {}
 
 const YYB_SERVERS = (process.env.YYB_SERVER || "")
     .split(/\r?\n/)
@@ -63,7 +62,10 @@ function readTokenCache() {
 }
 
 function writeTokenCache(cache) {
-    try { fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf8"); }
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf8");
+    }
     catch (e) { console.log(`写入 token 缓存失败：${e.message || e}`); }
 }
 
@@ -184,7 +186,6 @@ class Task {
             cookie: this.cookie,
             mobile: this.userInfo.mobile || "",
             nickName: this.userInfo.nick_name || this.userInfo.nickName || "",
-            updatedAt: new Date().toISOString(),
         };
         writeTokenCache(cache);
     }
@@ -308,32 +309,36 @@ class Task {
 
     async run() {
         this.log("开始执行 CAMEL骆驼签到");
-        try {
-            if (this.mode === "direct") {
-                this.applyDirectToken();
-            } else {
-                const cached = this.getCachedToken();
-                if (cached) {
-                    this.applyToken(cached);
-                    this.log("使用缓存 token");
-                    if (!(await this.checkToken())) {
-                        this.log("缓存 token 失效，重新登录");
+        if (this.mode === "direct") {
+            this.applyDirectToken();
+        } else {
+            const usedCache = !!this.getCachedToken();
+            for (let attempt = 0; attempt < 2; attempt++) {
+                if (attempt === 1 || !this.token) {
+                    if (attempt === 1) {
+                        this.log("token失效，重新登录...");
                         this.removeCachedToken();
                     }
+                    await this.loginByWxCode();
                 }
-                if (!this.token) await this.loginByWxCode();
+                if (!this.token) { this.log("未获取到 accessToken"); break; }
+                try {
+                    await sleep(rand(800, 1800));
+                    await this.getPoints("签到前积分");
+                    await this.getCheckinInfo();
+                    await this.doCheckin();
+                    await this.getPoints("签到后积分");
+                    break;
+                } catch (e) {
+                    const msg = e.message || String(e);
+                    if (attempt === 0 && usedCache && /access_token|token|授权|登录|invalid session|session|401|403/i.test(msg)) {
+                        this.log(`业务token失效，清除缓存重新登录: ${msg}`);
+                        this.removeCachedToken();
+                        continue;
+                    }
+                    this.log(`执行失败：${msg}`);
+                }
             }
-
-            if (!this.token) throw new Error("未获取到 accessToken");
-            await sleep(rand(800, 1800));
-            await this.getPoints("签到前积分");
-            await this.getCheckinInfo();
-            await this.doCheckin();
-            await this.getPoints("签到后积分");
-        } catch (e) {
-            const msg = e.message || String(e);
-            this.log(`执行失败：${msg}`);
-            if (/access_token|token|授权|登录|invalid session|session/i.test(msg)) this.removeCachedToken();
         }
         return this.logs.join("\n");
     }

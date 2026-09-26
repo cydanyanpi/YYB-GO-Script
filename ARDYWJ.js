@@ -53,10 +53,10 @@ let userIdx = 1;
 const MINI_APP_ID = "wx342d760f674b013b";
 const API_BASE = "https://api.ikbang.cn/v2";
 const APP_KEY = "A749380BBD5A4D93B55B4BE245A42988";
-const TOKEN_CACHE_FILE = path.join(__dirname, "token_caches", "airui_token_cache.json");
-try { fs.mkdirSync(path.dirname(TOKEN_CACHE_FILE), { recursive: true }); } catch (e) {}
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "ardywj_token_cache.json");
 
-function readCache() {
+function readTokenCache() {
   try {
     if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
     return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf8")) || {};
@@ -65,8 +65,9 @@ function readCache() {
   }
 }
 
-function writeCache(cache) {
+function writeTokenCache(cache) {
   try {
+    fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
     fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf8");
   } catch (e) {
     console.log(`token缓存写入失败: ${e.message || e}`);
@@ -165,26 +166,25 @@ class Task {
   }
 
   getCached() {
-    return readCache()[this.cacheKey] || {};
+    return readTokenCache()[this.cacheKey] || {};
   }
 
   saveCache(extra = {}) {
-    const cache = readCache();
+    const cache = readTokenCache();
     cache[this.cacheKey] = {
       ...(cache[this.cacheKey] || {}),
       ...(this.token ? { token: this.token } : {}),
       ...(this.userId ? { userId: this.userId } : {}),
       ...extra,
-      updatedAt: new Date().toISOString(),
     };
-    writeCache(cache);
+    writeTokenCache(cache);
   }
 
   removeToken() {
-    const cache = readCache();
+    const cache = readTokenCache();
     if (cache[this.cacheKey]) {
-      delete cache[this.cacheKey].token;
-      writeCache(cache);
+      delete cache[this.cacheKey];
+      writeTokenCache(cache);
     }
   }
 

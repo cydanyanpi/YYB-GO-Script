@@ -72,6 +72,34 @@ USER_AGENT = (
 )
 
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "blds_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"  [缓存] 写入失败: {exc}")
+
+
+def is_auth_fail_msg(msg: Any) -> bool:
+    import re
+    return bool(re.search(r'登录|未登录|授权|token|失效|过期|登录态|请重新|身份|凭证', str(msg), re.IGNORECASE))
+
+
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -369,85 +397,110 @@ def run_account(index: int, total: int, server_entry: str) -> Dict[str, Any]:
     print(f"  [延迟] 启动延迟 {delay}s")
     sleep(delay)
 
-    code = get_wx_code(server_entry)
-    if not code:
-        result["error"] = "获取 code 失败"
-        return result
+    # 尝试缓存 accessToken（不过期，业务鉴权失败自动重登）
+    cache = read_token_cache()
+    cached = cache.get(wxid) or {}
+    token = cached.get("accessToken", "")
+    used_cache = bool(token)
+    if token:
+        print(f"  [缓存] 使用缓存token: {mask(token)}")
 
-    token, raw_login = login_by_code(parsed_server, code, proxies)
-    if not token:
-        result["error"] = f"登录失败: {json_preview(raw_login)}"
-        return result
+    for attempt in range(2):
+        if attempt == 1 or not token:
+            if attempt == 1:
+                print("  [重登] token失效，重新登录...")
+                cache = read_token_cache()
+                if wxid in cache:
+                    del cache[wxid]
+                    write_token_cache(cache)
+            code = get_wx_code(server_entry)
+            if not code:
+                result["error"] = "获取 code 失败"
+                return result
 
-    result["token"] = mask(token)
+            token, raw_login = login_by_code(parsed_server, code, proxies)
+            if not token:
+                result["error"] = f"登录失败: {json_preview(raw_login)}"
+                return result
 
-    try:
-        # 用户信息
-        user_info_resp = api_get(parsed_server, USER_INFO_URL, token, proxies)
-        if user_info_resp.get("code") == 0:
-            user_data = user_info_resp.get("data", {})
-            nickname = user_data.get("nickname", "未知")
-            score = to_int(user_data.get("score"))
-            level = user_data.get("level", 1)
-            result["initialScore"] = score
-            result["userInfo"] = f"{nickname} 等级{level} 积分{score}"
-            print(f"  [用户] {result['userInfo']}")
-        else:
-            result["userInfo"] = user_info_resp.get("msg") or "获取用户信息失败"
-            print(f"  [用户] {result['userInfo']}")
+            cache = read_token_cache()
+            cache[wxid] = {"accessToken": token}
+            write_token_cache(cache)
 
-        sleep(2)
+        result["token"] = mask(token)
 
-        # 签到
-        sign_resp = api_post(parsed_server, SIGN_URL, token, proxies, {})
-        if sign_resp.get("code") == 0:
-            sign_data = sign_resp.get("data", {})
-            date = sign_data.get("date", "")
-            sign_score = to_int(sign_data.get("score"))
-            coiled_day = sign_data.get("coiledDay", 0)
-            result["signMsg"] = f"签到成功 {date} 连续{coiled_day}天 +{sign_score}积分"
-            print(f"  [签到] {result['signMsg']}")
-        else:
-            result["signMsg"] = sign_resp.get("msg") or "签到失败"
-            print(f"  [签到] {result['signMsg']}")
-
-        sleep(2)
-
-        # 最终积分
-        final_resp = api_get(parsed_server, USER_INFO_URL, token, proxies)
-        if final_resp.get("code") == 0:
-            score = to_int(final_resp.get("data", {}).get("score"))
-            result["finalScore"] = score
-            score_change = score - result["initialScore"]
-            if score_change > 0:
-                print(f"  [最终] 积分{score} (本次+{score_change})")
+        try:
+            # 用户信息
+            user_info_resp = api_get(parsed_server, USER_INFO_URL, token, proxies)
+            if user_info_resp.get("code") == 0:
+                user_data = user_info_resp.get("data", {})
+                nickname = user_data.get("nickname", "未知")
+                score = to_int(user_data.get("score"))
+                level = user_data.get("level", 1)
+                result["initialScore"] = score
+                result["userInfo"] = f"{nickname} 等级{level} 积分{score}"
+                print(f"  [用户] {result['userInfo']}")
             else:
-                print(f"  [最终] 积分{score}")
+                u_msg = user_info_resp.get("msg") or "获取用户信息失败"
+                if attempt == 0 and used_cache and is_auth_fail_msg(u_msg):
+                    print(f"  [重登] 用户信息鉴权失败({u_msg})，重新登录...")
+                    token = None
+                    continue
+                result["userInfo"] = u_msg
+                print(f"  [用户] {result['userInfo']}")
 
-        sleep(2)
+            sleep(2)
 
-        # 签到记录
-        sign_log_resp = api_get(parsed_server, f"{SIGN_LOG_URL}?pageNo=1&pageSize=10", token, proxies)
-        if sign_log_resp.get("code") == 0:
-            page_result = sign_log_resp.get("data", {}).get("pageResult", {})
-            sign_list = page_result.get("list", [])
-            if sign_list:
-                result["signDetails"] = []
-                print(f"  [明细] 最近{len(sign_list)}条签到记录：")
-                for item in sign_list[:5]:
-                    date = item.get("date", "")
-                    score = to_int(item.get("score"))
-                    coiled_day = item.get("coiledDay", 0)
-                    result["signDetails"].append({"date": date, "score": score, "coiledDay": coiled_day})
-                    print(f"    {date} 连续{coiled_day}天 +{score}积分")
+            # 签到
+            sign_resp = api_post(parsed_server, SIGN_URL, token, proxies, {})
+            if sign_resp.get("code") == 0:
+                sign_data = sign_resp.get("data", {})
+                date = sign_data.get("date", "")
+                sign_score = to_int(sign_data.get("score"))
+                coiled_day = sign_data.get("coiledDay", 0)
+                result["signMsg"] = f"签到成功 {date} 连续{coiled_day}天 +{sign_score}积分"
+                print(f"  [签到] {result['signMsg']}")
+            else:
+                result["signMsg"] = sign_resp.get("msg") or "签到失败"
+                print(f"  [签到] {result['signMsg']}")
 
-        result["success"] = True
-        return result
+            sleep(2)
 
-    except Exception as exc:
-        result["error"] = traceback.format_exc().strip()
-        print(f"  [账号] 执行失败: {exc}")
-        return result
+            # 最终积分
+            final_resp = api_get(parsed_server, USER_INFO_URL, token, proxies)
+            if final_resp.get("code") == 0:
+                score = to_int(final_resp.get("data", {}).get("score"))
+                result["finalScore"] = score
+                score_change = score - result["initialScore"]
+                if score_change > 0:
+                    print(f"  [最终] 积分{score} (本次+{score_change})")
+                else:
+                    print(f"  [最终] 积分{score}")
+
+            sleep(2)
+
+            # 签到记录
+            sign_log_resp = api_get(parsed_server, f"{SIGN_LOG_URL}?pageNo=1&pageSize=10", token, proxies)
+            if sign_log_resp.get("code") == 0:
+                page_result = sign_log_resp.get("data", {}).get("pageResult", {})
+                sign_list = page_result.get("list", [])
+                if sign_list:
+                    result["signDetails"] = []
+                    print(f"  [明细] 最近{len(sign_list)}条签到记录：")
+                    for item in sign_list[:5]:
+                        date = item.get("date", "")
+                        score = to_int(item.get("score"))
+                        coiled_day = item.get("coiledDay", 0)
+                        result["signDetails"].append({"date": date, "score": score, "coiledDay": coiled_day})
+                        print(f"    {date} 连续{coiled_day}天 +{score}积分")
+
+            result["success"] = True
+            return result
+
+        except Exception as exc:
+            result["error"] = traceback.format_exc().strip()
+            print(f"  [账号] 执行失败: {exc}")
+            return result
 
 
 def build_notify(results: List[Dict[str, Any]]) -> str:

@@ -65,6 +65,34 @@ INTEGRAL_URL = f"{BASE_URL}/App/Forward2Rights/integral?serviceDir=/Integral/Use
 
 REQUEST_TIMEOUT = 30
 
+# Token 缓存（不过期，业务鉴权失败自动重登）
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "byd_sign_token_cache.json")
+
+
+def read_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"  [缓存] 写入失败: {exc}")
+
+
+def is_auth_fail_msg(msg: Any) -> bool:
+    import re
+    return bool(re.search(r'登录|未登录|授权|session|失效|过期|token|登录态|请重新|身份', str(msg), re.IGNORECASE))
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 "
@@ -300,22 +328,47 @@ def run_account(index: int, total: int, server_entry: str) -> Dict[str, Any]:
     print(f"│ 账号 {index} / {total}: {mask(wxid or server_entry):<37}│")
     print(f"└{'─' * 50}┘")
 
-    code = get_code(server_entry)
-    if not code:
-        result["msg"] = "获取 code 失败"
-        return result
-    print(f"✅ [授权] code 获取成功")
+    # 尝试缓存 session_id（不过期，业务鉴权失败自动重登）
+    cache = read_token_cache()
+    cached = cache.get(wxid) or {}
+    session_id = cached.get("session_id", "")
+    used_cache = bool(session_id)
+    if session_id:
+        print(f"  [缓存] 使用缓存session_id: {mask(session_id)}")
 
-    try:
-        session_id = get_session_id(code)
-        print(f"✅ [登录] session_id 获取成功: {mask(session_id)}")
-    except Exception as exc:
-        print(f"❌ [登录] session_id 获取失败: {exc}")
-        result["msg"] = f"获取 session_id 失败: {exc}"
-        return result
+    for attempt in range(2):
+        if attempt == 1 or not session_id:
+            if attempt == 1:
+                print("  [重登] session失效，重新登录...")
+                cache = read_token_cache()
+                if wxid in cache:
+                    del cache[wxid]
+                    write_token_cache(cache)
+            code = get_code(server_entry)
+            if not code:
+                result["msg"] = "获取 code 失败"
+                return result
+            print(f"✅ [授权] code 获取成功")
 
-    try:
-        sign_data = do_sign(session_id)
+            try:
+                session_id = get_session_id(code)
+                print(f"✅ [登录] session_id 获取成功: {mask(session_id)}")
+            except Exception as exc:
+                print(f"❌ [登录] session_id 获取失败: {exc}")
+                result["msg"] = f"获取 session_id 失败: {exc}"
+                return result
+
+            cache = read_token_cache()
+            cache[wxid] = {"session_id": session_id}
+            write_token_cache(cache)
+
+        try:
+            sign_data = do_sign(session_id)
+        except Exception as exc:
+            print(f"❌ [签到] 签到失败: {exc}")
+            result["msg"] = f"签到失败: {exc}"
+            break
+
         ret = sign_data.get("ret")
         sign_detail = sign_data.get("data") or {}
         if ret == 200:
@@ -348,13 +401,16 @@ def run_account(index: int, total: int, server_entry: str) -> Dict[str, Any]:
                     print(f"⚠️ [积分] 查询失败: ret={i_ret}")
             except Exception as exc:
                 print(f"⚠️ [积分] 查询异常: {exc}")
+            break
         else:
             msg = sign_data.get("msg") or json.dumps(sign_data, ensure_ascii=False)[:100]
+            if attempt == 0 and used_cache and is_auth_fail_msg(msg):
+                print(f"  [重登] 登录失效({str(msg)[:60]})，重新登录...")
+                session_id = None
+                continue
             print(f"❌ [签到] 失败: {msg}")
             result["msg"] = msg
-    except Exception as exc:
-        print(f"❌ [签到] 签到失败: {exc}")
-        result["msg"] = f"签到失败: {exc}"
+            break
 
     return result
 

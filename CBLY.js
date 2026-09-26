@@ -1,6 +1,27 @@
 // name: 臭宝乐园
 // cron: 40 16,4 * * *
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+
+// Token 缓存
+const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
+const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "cbly_token_cache.json");
+
+function readTokenCache() {
+    try {
+        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+    } catch { return {}; }
+}
+
+function writeTokenCache(cache) {
+    try {
+        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+}
+
 const REQUEST_TIMEOUT_MS = 20000;
 // ====================== YYB Go 账号（环境变量 YYB_SERVER = 地址@微信账号标识，多行） ======================
 const SERVERS = (process.env.YYB_SERVER || "")
@@ -68,18 +89,51 @@ class Task {
         try {
             // 随机延迟5-25s 模拟人工操作
             await sleep(Math.floor(Math.random() * 20 + 5) * 1000);
-            const code = await getCode(this.server)
-            if (code) {
-                await this.getUserToken(code)
+
+            // 尝试缓存（不过期，鉴权失败自动重登）
+            const cache = readTokenCache();
+            const cached = cache[this.server] || {};
+            let usedCache = false;
+            if (cached.token) {
+                this.token = cached.token;
+                usedCache = true;
+                console.log(`💾 账号[${this.index}] 使用缓存token`);
             }
-            if (!this.token) {
-                console.log(`账号[${this.index}] 获取用户Token失败❌`)
-                return
+
+            for (let attempt = 0; attempt < 2; attempt++) {
+                if (attempt === 1 || !this.token) {
+                    if (attempt === 1) {
+                        console.log(`🔄 账号[${this.index}] token失效，重新登录...`);
+                        const c = readTokenCache();
+                        delete c[this.server];
+                        writeTokenCache(c);
+                    }
+                    this.token = null;
+                    const code = await getCode(this.server)
+                    if (code) {
+                        await this.getUserToken(code)
+                    }
+                    if (!this.token) {
+                        console.log(`账号[${this.index}] 获取用户Token失败❌`)
+                        return
+                    }
+                    const c = readTokenCache();
+                    c[this.server] = { token: this.token };
+                    writeTokenCache(c);
+                }
+                this.token = 'Bearer' + this.token
+
+                const infoOk = await this.getUserInfo()
+                await this.track()
+                await this.checkSign()
+
+                // 缓存token业务鉴权失败 → 清缓存重登重试一次
+                if (usedCache && attempt === 0 && !infoOk) {
+                    console.log(`⚠️ 账号[${this.index}] 鉴权失败，判定token失效`)
+                    continue;
+                }
+                break;
             }
-            this.token = 'Bearer' + this.token
-            await this.getUserInfo()
-            await this.track()
-            await this.checkSign()
         } catch (error) {
             const reason = error?.response?.data?.msg || error?.code || error?.message || String(error);
             console.log(`账号[${this.index}] 请求失败: ${reason}❌`)
@@ -134,8 +188,10 @@ class Task {
         if (result?.status == '200') {
             //打印签到结果
             console.log(`🌸账号[${this.index}]` + `[${result.data.nickName}] 积分[${result.data.points}]🎉`);
+            return true;
         } else {
             console.log(`🌸账号[${this.index}] 获取用户信息-失败:${result.msg}❌`)
+            return false;
         }
     }
     async track() {

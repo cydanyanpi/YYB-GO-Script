@@ -8,11 +8,10 @@
 =============================================
 功能:
   1. 自动调用 wolf-order/createContribution 赚取积分 (250积分/次)
-  2. 每天运行前自动检测 uniIdToken(JWT) 有效期
-  3. 即将过期/已过期时, 通过 YYB_SERVER 取码服务自动续期:
+  2. uniIdToken 本地缓存 (不过期), 通过 YYB_SERVER 取码服务登录获取:
        YYB_SERVER /wxapp/getCode -> 微信登录 code
        -> uni-id-co loginByWeixin -> 新 uniIdToken
-  4. 续期后的新 token 写入本地缓存, 并可写回青龙环境变量
+  3. 业务失败(拿不到 uid)时自动清除缓存重新登录, 新 token 写回本地缓存
 
 平台: 青龙面板 (Python3)
 原理: 基于 UniCloud (DCloud) API 逆向, HMAC-MD5 签名 (已验证通过)
@@ -28,7 +27,6 @@
     WOLF_MAX_RUNS         - 每次运行最大调用次数 (默认 20)
     WOLF_QYWX_KEY         - 企业微信Webhook Key (运行结果通知, 可选)
     WOLF_APPID            - 目标小程序appid (默认 wxe6cb23a7f02277ed = 宝妈上班, 不变)
-    WOLF_RENEW_HOURS      - 续期阈值(小时), token剩余低于此值即自动续期 (默认 12)
     QL_URL                - 青龙地址 (默认 http://127.0.0.1:5700, 脚本在青龙内运行可用)
     QL_CLIENT_ID          - 青龙应用ID (可选, 用于把新token写回青龙环境变量)
     QL_CLIENT_SECRET      - 青龙应用密钥 (可选)
@@ -38,8 +36,8 @@
 说明:
   * accessToken(x-basement-token) 每次运行自动获取, 无需手动填写
   * clientSecret 已内置, 无需填写
-  * 续期条件: token 剩余有效期 < WOLF_RENEW_HOURS (默认 12) 小时, 或 token 缺失/解析失败
-  * 续期成功后写入脚本同目录 wolf_token_cache_{账号ref}.json (按账号隔离); 下次运行优先使用各账号缓存中最新且有效的 token
+  * 缓存 token 不判断有效期, 只要存在就一直用; 业务失败(拿不到 uid)时自动清除缓存重新登录
+  * 登录成功后写入脚本同目录 token_caches/bmsb_token_cache.json (按账号 ref 隔离); 下次运行优先使用该缓存 token
 """
 import re
 
@@ -66,7 +64,6 @@ APP_NAME = "张团--小程序22"
 UID = os.environ.get("WOLF_UID", "")
 UNI_ID_TOKEN = os.environ.get("WOLF_UNI_ID_TOKEN", "")
 MAX_RUNS = int(os.environ.get("WOLF_MAX_RUNS", "20"))
-RENEW_HOURS = float(os.environ.get("WOLF_RENEW_HOURS", "12"))
 
 TARGET_APPID = os.environ.get("WOLF_APPID", "wxe6cb23a7f02277ed")
 
@@ -79,9 +76,28 @@ QL_CLIENT_SECRET = os.environ.get("QL_CLIENT_SECRET", "")
 _access_token = ""
 _token_expire_time = 0
 
-# token 缓存文件 (集中存放在脚本同目录下的专用文件夹, 不与脚本混放)
-TOKEN_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wolf_token_caches")
-CACHE_PATH = os.path.join(TOKEN_CACHE_DIR, "wolf_token_cache.json")
+# token 缓存文件 (集中存放在脚本同目录 token_caches 下, 按账号 ref 区分, 不过期)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "bmsb_token_cache.json")
+
+
+def read_token_cache():
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache):
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"  [缓存] 写入失败: {e}")
 
 
 # ============ YYB_SERVER 取码服务 (地址@微信账号标识 多行) ============
@@ -233,53 +249,7 @@ def call_api(function_target, function_args, retry_on_token_expired=True):
         return None
 
 
-# ============ token 续期 ============
-def jwt_remaining_hours(token):
-    """返回 JWT 剩余有效小时数; 无法解析返回 None"""
-    try:
-        p = token.split(".")[1]
-        p += "=" * (4 - len(p) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(p))
-        exp = payload.get("exp", 0)
-        return (exp - int(time.time())) / 3600
-    except Exception:
-        return None
-
-
-def cache_path_for(entry):
-    """按账号隔离 token 缓存: 用 entry 的 ref 部分生成独立缓存文件"""
-    _, ref = parse_yyb_go_entry(entry)
-    if not ref:
-        ref = "default"
-    safe = re.sub(r'[^A-Za-z0-9]', '_', ref)[:48]
-    os.makedirs(TOKEN_CACHE_DIR, exist_ok=True)
-    return os.path.join(TOKEN_CACHE_DIR, f"wolf_token_cache_{safe}.json")
-
-
-def load_cache(path=None):
-    try:
-        p = path or CACHE_PATH
-        if os.path.exists(p):
-            with open(p, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return None
-
-
-def save_cache(token, path=None):
-    try:
-        p = path or CACHE_PATH
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        rem = jwt_remaining_hours(token)
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump({"token": token, "saved_at": int(time.time()),
-                       "expired": int(time.time()) + (rem * 3600 if rem else 0)}, f, ensure_ascii=False, indent=2)
-        print(f"  [cache] 已写入本地缓存, 有效期剩余约 {rem:.1f}h")
-    except Exception as e:
-        print(f"  [cache] 写入失败: {e}")
-
-
+# ============ token 登录/重登 ============
 def fetch_wx_code(entry):
     """获取微信登录 code (仅通过 YYB_SERVER 取码服务)"""
     return get_yyb_go_code(entry)
@@ -328,45 +298,34 @@ def renew_token(entry):
     return new_token
 
 
-def resolve_token(entry, allow_env=True):
+def get_token(entry, allow_env=True):
     """
-    解析指定账号应使用的 token (按账号隔离缓存):
-      优先取 (env, 仅单账号) / 该账号缓存中剩余有效期最长且仍有效的一个。
-      若最佳 token 剩余 < RENEW_HOURS 或不存在, 则触发续期。
+    解析指定账号应使用的 token (按账号 ref 隔离缓存, 不过期):
+      优先取环境变量(仅单账号) / 该账号缓存中的 token。
+      缓存只要存在就一直用, 不判断有效期; 业务失败(拿不到 uid)时再清缓存重登。
     多账号模式必须 allow_env=False: 否则 WOLF_UNI_ID_TOKEN(某一个账号的身份)
     会被其它账号复用, 导致所有账号操作同一个 uid。
     返回 (token, source)
     """
-    candidates = []
-    env_tok = UNI_ID_TOKEN.strip()
-    if allow_env and env_tok:
-        candidates.append(("env", env_tok))
-    cache = load_cache(cache_path_for(entry))
-    if cache and cache.get("token"):
-        candidates.append(("cache", cache["token"]))
+    _, ref = parse_yyb_go_entry(entry)
+    cache = read_token_cache()
+    cached = cache.get(ref) or {}
 
-    best, best_src, best_rem = None, None, -1
-    for src, tok in candidates:
-        rem = jwt_remaining_hours(tok)
-        if rem is not None and rem > 0 and rem > best_rem:
-            best, best_src, best_rem = tok, src, rem
+    if allow_env and UNI_ID_TOKEN.strip():
+        print("[token] 使用环境变量 token")
+        return UNI_ID_TOKEN.strip(), "env"
+    if cached.get("token"):
+        print("[token] 使用缓存 token")
+        return cached["token"], "cache"
 
-    # 需要续期的情况
-    if best is None or best_rem < RENEW_HOURS:
-        reason = "无有效token" if best is None else f"剩余 {best_rem:.1f}h < {RENEW_HOURS}h"
-        print(f"[token] 需要续期 ({reason})")
-        new_tok = renew_token(entry)
-        if new_tok:
-            save_cache(new_tok, cache_path_for(entry))
-            return new_tok, "renewed"
-        # 续期失败, 退回已有最佳 token (若仍有用)
-        if best:
-            print(f"[token] 续期失败, 退回 {best_src} token (剩余 {best_rem:.1f}h)")
-            return best, best_src
-        return None, None
-
-    print(f"[token] 使用 {best_src} token, 剩余约 {best_rem:.1f}h")
-    return best, best_src
+    print("[token] 无可用 token, 登录获取 ...")
+    new_tok = renew_token(entry)
+    if new_tok:
+        cache = read_token_cache()
+        cache[ref] = {"token": new_tok, "updatedAt": int(time.time())}
+        write_token_cache(cache)
+        return new_tok, "renewed"
+    return None, None
 
 
 # ============ 青龙环境变量写回 (可选) ============
@@ -461,18 +420,34 @@ def run_account(entry, allow_env=True):
         return {"entry": entry, "ok": False, "reason": "无效 entry", "earned": 0, "success": 0}
     print(f"\n{'#'*60}\n# 账号: {server} @ {ref}\n{'#'*60}")
 
-    # 1) token (按账号隔离; 多账号模式禁用 env 共享)
-    print("\n[1/4] 解析并校验 uniIdToken ...")
-    token, src = resolve_token(entry, allow_env=allow_env)
+    global UNI_ID_TOKEN, UID
+
+    # 1) token (按账号 ref 隔离缓存, 不过期; 多账号模式禁用 env 共享)
+    print("\n[1/4] 解析 uniIdToken ...")
+    token, src = get_token(entry, allow_env=allow_env)
     if not token:
         print("  无法获取有效 token, 跳过该账号")
         return {"entry": entry, "ok": False, "reason": "no token", "earned": 0, "success": 0}
-    global UNI_ID_TOKEN, UID
-    UNI_ID_TOKEN = token  # 后续业务调用使用续期后的 token
+    UNI_ID_TOKEN = token  # 后续业务调用使用该 token
 
-    # 2) 提取本账号 uid
+    # 2) 提取本账号 uid (业务失败判定: 拿不到 uid 视为 token 失效, 清缓存重登写回后重试一次)
     print("\n[2/4] 获取本账号 uid ...")
     acc_uid = extract_uid()
+    if not acc_uid:
+        print("  [重登] 业务返回无 uid, 判定 token 失效, 清除缓存重新登录 ...")
+        cache = read_token_cache()
+        if ref in cache:
+            del cache[ref]
+            write_token_cache(cache)
+        new_tok = renew_token(entry)
+        if new_tok:
+            UNI_ID_TOKEN = new_tok
+            token = new_tok
+            cache = read_token_cache()
+            cache[ref] = {"token": new_tok, "updatedAt": int(time.time())}
+            write_token_cache(cache)
+            src = "renewed"
+            acc_uid = extract_uid()
     if not acc_uid:
         print("  无法获取该账号 uid, 跳过")
         return {"entry": entry, "ok": False, "reason": "no uid", "earned": 0, "success": 0}
