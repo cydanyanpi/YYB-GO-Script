@@ -10,7 +10,7 @@ const SERVERS = (process.env.YYB_SERVER || "")
     .map(s => s.trim())
     .filter(Boolean);
 if (!SERVERS.length) {
-    console.error("未配置环境变量 YYB_SERVER，请设置后重试（格式：地址@微信账号标识，多行换行）");
+    console.error("❌ 未配置环境变量 YYB_SERVER，请设置后重试（格式：地址@微信账号标识，多行换行）");
     process.exit(1);
 }
 function parseYybGoEntry(rawValue) {
@@ -18,7 +18,7 @@ function parseYybGoEntry(rawValue) {
     if (!value) return { server: "", ref: "" };
     const atIndex = value.indexOf("@");
     if (atIndex === -1) {
-        console.log("YYB_SERVER 格式应为 地址@微信账号标识，当前值: " + value);
+        console.log("⚠️ YYB_SERVER 格式应为 地址@微信账号标识，当前值: " + value);
         return { server: "", ref: "" };
     }
     let server = value.slice(0, atIndex).trim();
@@ -37,13 +37,13 @@ async function getCode(server) {
         const { data } = await axios.post(url, { ref, app_id: MINI_APP_ID }, { timeout: 20000, proxy: false });
         const code = data && data.data && data.data.result && data.data.result.code;
         if (!data || data.code !== 0 || !code) {
-            console.log(parsedServer + " 获取code失败: " + JSON.stringify(data));
+            console.log(`❌ [取码] ${parsedServer} 获取code失败: ${JSON.stringify(data)}`);
             return null;
         }
-        console.log(parsedServer + " 获取code成功");
+        console.log(`✅ [取码] ${parsedServer} 获取code成功`);
         return code;
     } catch (e) {
-        console.log(parsedServer + " 获取code异常: " + e.message);
+        console.log(`❌ [取码] ${parsedServer} 获取code异常: ${e.message}`);
         return null;
     }
 }
@@ -74,7 +74,7 @@ function writeTokenCache(cache) {
         fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
         fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf8");
     } catch (e) {
-        console.log(`写入token缓存失败: ${e.message || e}`);
+        console.log(`⚠️ [缓存] 写入失败: ${e.message || e}`);
     }
 }
 
@@ -133,6 +133,25 @@ function buildUrl(apiPath, query = {}) {
     return `${API_BASE}${apiPath}${params.toString() ? `?${params.toString()}` : ""}`;
 }
 
+// ==================== 输出美化 ====================
+function logTitle() {
+    console.log();
+    console.log("╔" + "═".repeat(48) + "╗");
+    console.log("║  🥛 飞鹤会员 自动签到                        ║");
+    console.log(`║  🕒 启动时间: ${new Date().toLocaleString("zh-CN", { hour12: false }).padEnd(22)}║`);
+    console.log(`║  🔢 账号数量: ${String(SERVERS.length).padEnd(22)}║`);
+    console.log("╚" + "═".repeat(48) + "╝");
+}
+
+function logAccountHeader(index, total, server) {
+    const { ref } = parseYybGoEntry(server);
+    console.log();
+    console.log("┌" + "─".repeat(48) + "┐");
+    console.log(`│  🧩 账号 ${index} / ${total}${" ".repeat(26)}│`);
+    console.log(`│  🔑 标识: ${String(ref || "-").padEnd(41)}│`);
+    console.log("└" + "─".repeat(48) + "┘");
+}
+
 class Task {
     constructor(account) {
         this.server = account;
@@ -147,31 +166,39 @@ class Task {
 
     async run() {
         const usedCache = !!this.getCachedToken();
+        if (usedCache) {
+            const cached = this.getCachedToken();
+            this.token = cached.token || "";
+            this.userInfo = cached.userInfo || {};
+            console.log(`💾 [缓存] 账号[${this.index}] 使用缓存token: ${maskToken(this.token)}`);
+        }
         for (let attempt = 0; attempt < 2; attempt++) {
             if (attempt === 1 || !this.token) {
                 if (attempt === 1) {
-                    console.log(`账号[${this.index}] token失效，重新登录...`);
+                    console.log(`🔄 [重登] 账号[${this.index}] token失效，重新登录...`);
                     this.removeCachedToken();
                     this.token = "";
                 }
                 await this.loginByCode();
-                if (!this.token) return;
+                if (!this.token) return false;
             }
             try {
                 await this.getIndexInfo();
                 await this.signIn();
-                return;
+                return true;
             } catch (e) {
                 const msg = String(e.message || e);
                 if (attempt === 0 && usedCache && /token|登录|授权|invalid|401|403/i.test(msg)) {
-                    console.log(`账号[${this.index}] 业务token失效，清除缓存重新登录...`);
+                    console.log(`🔄 [重登] 账号[${this.index}] 业务token失效，清除缓存重新登录...`);
                     this.removeCachedToken();
                     this.token = "";
                     continue;
                 }
-                throw e;
+                console.log(`❌ [执行] 账号[${this.index}] 执行失败: ${msg}`);
+                return false;
             }
         }
+        return false;
     }
 
     getCachedToken() {
@@ -220,6 +247,7 @@ class Task {
     }
 
     async loginByCode() {
+        console.log(`🔐 [登录] 账号[${this.index}] 使用 code 换取 token...`);
         const code = await this.getWxCode();
         const result = await this.request({
             apiPath: "/api/starMember/getUserToken",
@@ -237,7 +265,7 @@ class Task {
         };
         if (!this.token) throw new Error(`登录成功但未返回token: ${JSON.stringify(result)}`);
         this.saveCachedToken();
-        console.log(`账号[${this.index}] code登录成功: ${data.crmId || data.openId || ""} token=${maskToken(this.token)}`);
+        console.log(`✅ [登录] 账号[${this.index}] 登录成功: crmId=${data.crmId || data.openId || ""} token=${maskToken(this.token)}`);
     }
 
     async checkToken() {
@@ -263,9 +291,9 @@ class Task {
         });
         if (String(result?.code) === "200") {
             const signModule = (result.data?.modules || []).find((item) => String(item.moduleType) === "17");
-            console.log(`账号[${this.index}] 首页签到入口: ${signModule ? "已发现" : "未发现"}`);
+            console.log(`📋 [首页] 账号[${this.index}] 签到入口: ${signModule ? "已发现" : "未发现"}`);
         } else {
-            console.log(`账号[${this.index}] 首页信息查询失败: ${result?.msg || JSON.stringify(result)}`);
+            console.log(`⚠️ [首页] 账号[${this.index}] 首页信息查询失败: ${result?.msg || JSON.stringify(result)}`);
         }
     }
 
@@ -276,8 +304,7 @@ class Task {
             allowFail: true,
         });
         if (String(finish?.code) === "200") {
-            // data 为 true=本次新增上报；为 null/其它=今日已签到（幂等），均视为签到成功
-            console.log(`账号[${this.index}] 签到上报成功${finish.data === true ? "（新增）" : "（今日已签到）"}`);
+            console.log(`✅ [签到] 账号[${this.index}] 签到上报成功${finish.data === true ? "（新增）" : "（今日已签到）"}`);
         } else {
             throw new Error(`签到失败: ${finish?.msg || JSON.stringify(finish)}`);
         }
@@ -289,25 +316,37 @@ class Task {
         });
         if (String(complete?.code) === "200") {
             const points = complete.data?.awardSendPoints || complete.data?.awardPoint || "";
-            console.log(`账号[${this.index}] 签到完成确认${points ? `，获得${points}积分` : ""}`);
+            console.log(`🎁 [奖励] 账号[${this.index}] 签到完成${points ? `，获得${points}积分` : ""}`);
         } else {
-            // 非 200 通常是「今日已领过/无需再领」的幂等响应，记录但不视为失败
-            console.log(`账号[${this.index}] 签到完成确认返回(可能今日已领): ${complete?.msg || JSON.stringify(complete)}`);
+            console.log(`ℹ️ [奖励] 账号[${this.index}] 签到完成确认返回(可能今日已领): ${complete?.msg || JSON.stringify(complete)}`);
         }
     }
 }
 
 !(async () => {
-    
+    logTitle();
     if (!SERVERS.length) return;
-
+    let successCount = 0;
+    let failCount = 0;
+    let currentIdx = 1;
     for (const account of SERVERS) {
+        logAccountHeader(currentIdx, SERVERS.length, account);
         const task = new Task(account);
         try {
-            await task.run();
+            const ok = await task.run();
+            if (ok) successCount++; else failCount++;
         } catch (e) {
-            console.log(`账号[${task.index}] 运行失败: ${e.message || e}`);
+            console.log(`❌ [执行] 账号[${task.index}] 运行失败: ${e.message || e}`);
+            failCount++;
         }
+        currentIdx++;
     }
+    console.log();
+    console.log("╔" + "═".repeat(48) + "╗");
+    console.log("║  🏁 飞鹤会员任务执行完成                    ║");
+    console.log(`║  ✅ 成功: ${String(successCount).padEnd(22)}║`);
+    console.log(`║  ❌ 失败: ${String(failCount).padEnd(22)}║`);
+    console.log(`║  🕒 结束时间: ${new Date().toLocaleString("zh-CN", { hour12: false }).padEnd(22)}║`);
+    console.log("╚" + "═".repeat(48) + "╝");
 })()
-    .catch((e) => console.log(`运行异常: ${e.message || e}`))
+    .catch((e) => console.log(`❌ 运行异常: ${e.message || e}`));
