@@ -10,7 +10,7 @@ const SERVERS = (process.env.YYB_SERVER || "")
     .map(s => s.trim())
     .filter(Boolean);
 if (!SERVERS.length) {
-    console.error("未配置环境变量 YYB_SERVER，请设置后重试（格式：地址@微信账号标识，多行换行）");
+    console.error("❌ 未配置环境变量 YYB_SERVER，请设置后重试（格式：地址@微信账号标识，多行换行）");
     process.exit(1);
 }
 function parseYybGoEntry(rawValue) {
@@ -18,7 +18,7 @@ function parseYybGoEntry(rawValue) {
     if (!value) return { server: "", ref: "" };
     const atIndex = value.indexOf("@");
     if (atIndex === -1) {
-        console.log("YYB_SERVER 格式应为 地址@微信账号标识，当前值: " + value);
+        console.log("❌ YYB_SERVER 格式应为 地址@微信账号标识，当前值: " + value);
         return { server: "", ref: "" };
     }
     let server = value.slice(0, atIndex).trim();
@@ -37,13 +37,13 @@ async function getCode(server) {
         const { data } = await axios.post(url, { ref, app_id: MINI_APP_ID }, { timeout: 20000, proxy: false });
         const code = data && data.data && data.data.result && data.data.result.code;
         if (!data || data.code !== 0 || !code) {
-            console.log(parsedServer + " 获取code失败: " + JSON.stringify(data));
+            console.log(`❌ [取码] ${parsedServer} 获取code失败: ${JSON.stringify(data)}`);
             return null;
         }
-        console.log(parsedServer + " 获取code成功");
+        console.log(`✅ [取码] ${parsedServer} 获取code成功`);
         return code;
     } catch (e) {
-        console.log(parsedServer + " 获取code异常: " + e.message);
+        console.log(`❌ [取码] ${parsedServer} 获取code异常: ${e.message}`);
         return null;
     }
 }
@@ -58,6 +58,47 @@ const PAGE_VERSION = "1052";
 const AES_KEY = "Z0J7M480h6kppf67";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) MicroMessenger/3.9.12 MiniProgramEnv/Windows WindowsWechat/WMPF";
 
+function nowText() {
+    const d = new Date();
+    const pad = n => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function pad(text, width) {
+    text = String(text);
+    let w = 0;
+    for (const ch of text) w += ch.charCodeAt(0) > 127 ? 2 : 1;
+    return text + " ".repeat(Math.max(0, width - w));
+}
+
+function logTitle() {
+    console.log();
+    console.log("╔" + "=".repeat(50) + "╗");
+    console.log("║  " + pad("💼 劲友家 每日任务", 46) + "║");
+    console.log("║  " + pad(`🕒 启动时间: ${nowText()}`, 46) + "║");
+    console.log("║  " + pad(`🔢 账号数量: ${SERVERS.length}`, 46) + "║");
+    console.log("╚" + "=".repeat(50) + "╝");
+}
+
+function logAccountHeader(index, total, account) {
+    console.log();
+    console.log("┌" + "-".repeat(50) + "┐");
+    console.log("│  " + pad(`🧩 账号 ${index} / ${total}`, 46) + "│");
+    const { server, ref } = parseYybGoEntry(account);
+    console.log("│  " + pad(`🔑 标识: ${ref || server}`, 46) + "│");
+    console.log("└" + "-".repeat(50) + "┘");
+}
+
+function logFooter(successCount, failCount) {
+    console.log();
+    console.log("╔" + "=".repeat(50) + "╗");
+    console.log("║  " + pad("🏁 劲友家任务执行完成", 46) + "║");
+    console.log("║  " + pad(`✅ 成功: ${successCount}`, 46) + "║");
+    console.log("║  " + pad(`❌ 失败: ${failCount}`, 46) + "║");
+    console.log("║  " + pad(`🕒 结束时间: ${nowText()}`, 46) + "║");
+    console.log("╚" + "=".repeat(50) + "╝");
+}
+
 function readTokenCache() {
     try {
         if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
@@ -71,7 +112,7 @@ function writeTokenCache(cache) {
     try {
         fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf8");
     } catch (e) {
-        console.log(`写入token缓存失败: ${e.message || e}`);
+        console.log(`⚠️ [缓存] 写入失败: ${e.message || e}`);
     }
 }
 
@@ -102,30 +143,36 @@ class Task {
         this.points = "";
         this.task = null;
         this.record = null;
+        this.success = false;
     }
 
     async run() {
-        const cached = this.getCachedToken();
-        if (cached) {
-            this.applyToken(cached);
-            console.log(`账号[${this.index}] 使用缓存token`);
-            if (!(await this.checkToken())) {
-                this.removeCachedToken();
-                console.log(`账号[${this.index}] 缓存token失效，重新登录`);
+        try {
+            const cached = this.getCachedToken();
+            if (cached) {
+                this.applyToken(cached);
+                console.log(`💾 [缓存] 账号[${this.index}] 使用缓存token`);
+                if (!(await this.checkToken())) {
+                    this.removeCachedToken();
+                    console.log(`🔄 [重登] 账号[${this.index}] 缓存token失效，重新登录`);
+                }
             }
-        }
 
-        if (!this.token) {
-            await this.loginByWxCode();
-            if (!this.token) return;
-        }
+            if (!this.token) {
+                await this.loginByWxCode();
+                if (!this.token) return;
+            }
 
-        await this.getCustomerDetails();
-        await this.getIntegral();
-        await this.findCheckTask();
-        await this.queryRecord();
-        await this.signIn();
-        await this.getIntegral();
+            await this.getCustomerDetails();
+            await this.getIntegral();
+            await this.findCheckTask();
+            await this.queryRecord();
+            await this.signIn();
+            await this.getIntegral();
+            this.success = true;
+        } catch (e) {
+            console.log(`❌ [异常] 账号[${this.index}] ${e.message || e}`);
+        }
     }
 
     getCachedToken() {
@@ -199,6 +246,7 @@ class Task {
     async loginByWxCode() {
         try {
             const code = await this.getLoginCode();
+            if (!code) throw new Error("获取code失败");
             const data = await this.request({
                 method: "POST",
                 apiPath: "/login",
@@ -208,9 +256,9 @@ class Task {
             this.token = data?.accessToken || "";
             if (!this.token) throw new Error(`登录响应未返回 accessToken: ${JSON.stringify(data)}`);
             this.saveCachedToken();
-            console.log(`账号[${this.index}] 登录成功`);
+            console.log(`✅ [登录] 账号[${this.index}] 登录成功`);
         } catch (e) {
-            console.log(`账号[${this.index}] 登录失败: ${e.message || e}`);
+            console.log(`❌ [登录] 账号[${this.index}] 登录失败: ${e.message || e}`);
         }
     }
 
@@ -228,9 +276,9 @@ class Task {
             const data = await this.request({ apiPath: "/app/jingyoujia/customer/detail" });
             this.userInfo = data || {};
             this.saveCachedToken();
-            console.log(`账号[${this.index}] 会员: ${data?.nickName || data?.nickname || "未知"} ${maskPhone(data?.mobile || "")}`);
+            console.log(`👤 [用户] 账号[${this.index}] 会员: ${data?.nickName || data?.nickname || "未知"} ${maskPhone(data?.mobile || "")}`);
         } catch (e) {
-            console.log(`账号[${this.index}] 查询会员失败: ${e.message || e}`);
+            console.log(`❌ [用户] 账号[${this.index}] 查询会员失败: ${e.message || e}`);
             if (isTokenError(e.message || e)) this.removeCachedToken();
         }
     }
@@ -239,9 +287,9 @@ class Task {
         try {
             const data = await this.request({ apiPath: "/app/jingyoujia/customer/queryCustIntegral" });
             this.points = data?.usableIntegral ?? data?.integral ?? data?.custIntegral ?? data?.points ?? "";
-            console.log(`账号[${this.index}] 当前积分: ${this.points === "" ? JSON.stringify(data) : this.points}`);
+            console.log(`💰 [积分] 账号[${this.index}] 当前积分: ${this.points === "" ? JSON.stringify(data) : this.points}`);
         } catch (e) {
-            console.log(`账号[${this.index}] 查询积分失败: ${e.message || e}`);
+            console.log(`❌ [积分] 账号[${this.index}] 查询积分失败: ${e.message || e}`);
         }
     }
 
@@ -249,15 +297,15 @@ class Task {
         try {
             const data = await this.request({ apiPath: "/app/jingyoujia/taskContinuousRecord/findCheckTask" });
             if (!data || !data.id) {
-                console.log(`账号[${this.index}] 当前无签到活动`);
+                console.log(`ℹ️ [签到] 账号[${this.index}] 当前无签到活动`);
                 return;
             }
             this.task = data;
             const start = String(data.startTime || "").slice(0, 10);
             const end = String(data.endTime || "").slice(0, 10);
-            console.log(`账号[${this.index}] 签到活动: taskId=${data.id}${start || end ? ` ${start}-${end}` : ""}`);
+            console.log(`📅 [签到] 账号[${this.index}] 签到活动: taskId=${data.id}${start || end ? ` ${start}-${end}` : ""}`);
         } catch (e) {
-            console.log(`账号[${this.index}] 获取签到活动失败: ${e.message || e}`);
+            console.log(`❌ [签到] 账号[${this.index}] 获取签到活动失败: ${e.message || e}`);
         }
     }
 
@@ -269,16 +317,16 @@ class Task {
                 params: { taskId: this.task.id },
             });
             this.record = data || {};
-            console.log(`账号[${this.index}] 签到状态: 连续${data?.continuousNum ?? 0}天 今日=${data?.todayFinish ? "已签" : "未签"}`);
+            console.log(`📅 [签到] 账号[${this.index}] 签到状态: 连续${data?.continuousNum ?? 0}天 今日=${data?.todayFinish ? "已签" : "未签"}`);
         } catch (e) {
-            console.log(`账号[${this.index}] 查询签到状态失败: ${e.message || e}`);
+            console.log(`❌ [签到] 账号[${this.index}] 查询签到状态失败: ${e.message || e}`);
         }
     }
 
     async signIn() {
         if (!this.task?.id) return;
         if (this.record?.todayFinish) {
-            console.log(`账号[${this.index}] 今日已签到`);
+            console.log(`✅ [签到] 账号[${this.index}] 今日已签到`);
             return;
         }
         try {
@@ -290,19 +338,19 @@ class Task {
                 },
             });
             const integral = data?.currentSignIntegral ?? data?.integral ?? "";
-            console.log(`账号[${this.index}] 签到成功${integral !== "" ? `: +${integral}积分` : ""}`);
+            console.log(`✅ [签到] 账号[${this.index}] 签到成功${integral !== "" ? `: +${integral}积分` : ""}`);
             await this.finishTask();
         } catch (e) {
             const message = String(e.message || e);
             if (/已签到|重复|todayFinish/.test(message)) {
-                console.log(`账号[${this.index}] 今日已签到`);
+                console.log(`✅ [签到] 账号[${this.index}] 今日已签到`);
                 return;
             }
             if (/20230529|captcha|验证码|滑块/.test(message)) {
-                console.log(`账号[${this.index}] 签到需要验证码，已跳过`);
+                console.log(`⚠️ [签到] 账号[${this.index}] 签到需要验证码，已跳过`);
                 return;
             }
-            console.log(`账号[${this.index}] 签到失败: ${message}`);
+            console.log(`❌ [签到] 账号[${this.index}] 签到失败: ${message}`);
             if (isTokenError(message)) this.removeCachedToken();
         }
     }
@@ -319,15 +367,22 @@ class Task {
                 },
             });
         } catch (e) {
-            console.log(`账号[${this.index}] 完成任务上报失败: ${e.message || e}`);
+            console.log(`⚠️ [任务] 账号[${this.index}] 完成任务上报失败: ${e.message || e}`);
         }
     }
 }
 
 !(async () => {
-    
+    logTitle();
+    const results = [];
     for (const account of SERVERS) {
-        await new Task(account).run();
+        logAccountHeader(results.length + 1, SERVERS.length, account);
+        const task = new Task(account);
+        await task.run();
+        results.push(task);
     }
+    const successCount = results.filter(r => r.success).length;
+    const failCount = results.length - successCount;
+    logFooter(successCount, failCount);
 })()
-    .catch((e) => console.log(e.message || e))
+    .catch((e) => console.log("❌ " + (e.message || e)));
