@@ -494,20 +494,45 @@ class QueChaoBot:
             return False
         return True
 
-    async def get_user_balance(self) -> Optional[int]:
-        try:
-            response = await self.client.post(
-                "/openapi/pointsservice/api/Points/getuserbalance",
-                content="{}"
-            )
-            response_data = response.json()
-
-            if self.check_response(response_data):
-                return response_data.get("data")
-            return None
-        except Exception as e:
-            print(f"❌ [{self.server}] 获取积分失败 | 原因: {str(e)}")
-            return None
+    async def get_user_balance(self, retries: int = 2) -> Tuple[Optional[int], str]:
+        """返回 (积分, 错误类型)。错误类型: "ok" / "network" / "token_invalid" / "biz_error" """
+        last_err = ""
+        for attempt in range(retries + 1):
+            try:
+                response = await self.client.post(
+                    "/openapi/pointsservice/api/Points/getuserbalance",
+                    content="{}"
+                )
+                # HTTP 401/403 才是真 token 失效
+                if response.status_code in (401, 403):
+                    return None, "token_invalid"
+                # 空 body 或非 JSON -> 网络/网关错误，重试
+                if not response.text or not response.text.strip():
+                    last_err = f"空响应(HTTP {response.status_code})"
+                    raise ValueError(last_err)
+                response_data = response.json()
+                errcode = response_data.get("errcode")
+                # 业务码里明确 token 失效
+                if errcode in (401, 403, 40001, 40002) or "token" in str(response_data.get("errmsg", "")).lower():
+                    return None, "token_invalid"
+                if errcode == 200:
+                    return response_data.get("data"), "ok"
+                # 其他业务错误不删缓存，直接报错
+                return None, "biz_error"
+            except (json.JSONDecodeError, ValueError) as e:
+                last_err = str(e)
+                if attempt < retries:
+                    wait = 1500 * (attempt + 1)
+                    print(f"⚠️ [{self.server}] 积分接口返回非JSON/空响应，{wait//1000}s后第{attempt+1}次重试... ({last_err})")
+                    await sleep(wait)
+            except Exception as e:
+                last_err = str(e)
+                if attempt < retries:
+                    wait = 1500 * (attempt + 1)
+                    print(f"⚠️ [{self.server}] 积分接口网络异常，{wait//1000}s后第{attempt+1}次重试... ({last_err})")
+                    await sleep(wait)
+        print(f"❌ [{self.server}] 获取积分失败 | 原因: {last_err}（已重试{retries}次）")
+        return None, "network"
 
     async def daily_sign(self) -> Tuple[bool, str]:
         try:
@@ -634,12 +659,15 @@ class QueChaoBot:
 
                 # 执行业务
                 async with self:
-                    initial_balance = await self.get_user_balance()
+                    initial_balance, bal_err = await self.get_user_balance(retries=2)
                     if initial_balance is None:
-                        if attempt == 0 and used_cache:
-                            print(f"🔄 [{self.server}] [重登] 初始积分查询失败，判定token失效")
+                        # 只有真 token 失效才删缓存重登；网络错误直接报错退出，不误删缓存
+                        if bal_err == "token_invalid" and attempt == 0 and used_cache:
+                            print(f"🔄 [{self.server}] [重登] 服务端返回401/403，确认token失效")
                             continue
-                        result["error"] = "获取初始积分失败"
+                        if bal_err == "network" and attempt == 0 and used_cache:
+                            print(f"⚠️ [{self.server}] [网络] 积分接口异常（已重试），但token可能仍有效，保留缓存直接报错")
+                        result["error"] = f"获取初始积分失败({bal_err})"
                         return result
                     result["initial_score"] = initial_balance
                     print(f"💰 [{self.server}] 初始积分: {initial_balance}")
@@ -662,7 +690,7 @@ class QueChaoBot:
                     result["task_msgs"] = task_msgs
 
                     # 获取最终积分
-                    final_balance = await self.get_user_balance()
+                    final_balance, _ = await self.get_user_balance(retries=1)
                     if final_balance is not None:
                         result["final_score"] = final_balance
                         result["gained_score"] = final_balance - initial_balance
