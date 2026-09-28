@@ -222,8 +222,12 @@ def write_token_cache(cache):
 
 
 def is_auth_fail_msg(msg):
+    """只匹配明确的鉴权失效，避免把业务消息里的"登录"二字误判为token失效"""
     import re
-    return bool(re.search(r'登录|未登录|授权|token|失效|过期|登录态|请重新|身份|凭证', str(msg), re.IGNORECASE))
+    return bool(re.search(
+        r'(登录已失效|登录已过期|登录态失效|登录态过期|请重新登录|请先登录|登录超时|'
+        r'token失效|token过期|token无效|未登录|授权失效|授权过期|身份验证失败|凭证失效)',
+        str(msg), re.IGNORECASE))
 
 
 def parse_yyb_go_entry(raw_value):
@@ -505,21 +509,47 @@ def run_account(code_url, index, global_proxy_config):
         time.sleep(delay)
 
         try:
-            # 执行签到
-            data = do_sign(token, headers, proxy_config, account_name)
+            # 执行签到（网络异常或疑似鉴权失败时先内部重试一次，避免一次抖动就删缓存重登）
+            data = None
+            sign_msg = ""
+            for sign_try in range(2):
+                data = do_sign(token, headers, proxy_config, account_name)
+                if not data:
+                    if sign_try == 0:
+                        print(f"⚠️ [{account_name}] 签到请求异常，2秒后重试一次...")
+                        time.sleep(2)
+                        continue
+                    return {
+                        "account": account_name,
+                        "success": False,
+                        "proxy_status": proxy_status,
+                        "error": "签到请求异常（已重试）"
+                    }
+
+                sign_msg = data.get("msg", "完成")
+                # 只有明确的鉴权失败才考虑重登，且先重试一次确认不是服务端临时错误
+                if attempt == 0 and used_cache and is_auth_fail_msg(sign_msg):
+                    if sign_try == 0:
+                        print(f"⚠️ [{account_name}] 签到返回鉴权提示({sign_msg})，2秒后重试确认...")
+                        time.sleep(2)
+                        continue
+                    print(f"🔄 [重登] 确认token失效({sign_msg})，重新登录...")
+                    token = None
+                    break  # 跳出 sign_try，进入外层 attempt=1
+                else:
+                    break  # 正常返回或非鉴权错误，不用重试
+
+            if attempt == 0 and used_cache and token is None:
+                # 上面 break 出来的，走重登
+                continue
+
             if not data:
                 return {
                     "account": account_name,
                     "success": False,
                     "proxy_status": proxy_status,
-                    "error": "签到请求异常"
+                    "error": "签到无返回数据"
                 }
-
-            sign_msg = data.get("msg", "完成")
-            if attempt == 0 and used_cache and is_auth_fail_msg(sign_msg):
-                print(f"🔄 [重登] 签到鉴权失败({sign_msg})，重新登录...")
-                token = None
-                continue
 
             sign_data = data.get("data")
             if not isinstance(sign_data, dict):
