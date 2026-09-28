@@ -92,16 +92,16 @@ def log(*args):
 
 def log_title():
     print()
-    print("╔" + "═".repeat(48) + "╗")
+    print("╔" + "=" * 48 + "╗")
     print("║  📱 iQOO社区 每日任务                       ║")
     print(f"║  🕒 启动时间: {now_text().ljust(22)}║")
     print(f"║  🔢 账号数量: {str(len(SERVERS)).ljust(22)}║")
-    print("╚" + "═".repeat(48) + "╝")
+    print("╚" + "=" * 48 + "╝")
 
 
 def log_account_header(index, total, server):
     print()
-    print("┌" + "─".repeat(48) + "┐")
+    print("┌" + "-" * 48 + "┐")
     print(f"│  🧩 账号 {index} / {total}{' '.ljust(26 - len(str(index)) - len(str(total)))}│")
     remark = ""
     if "#" in server:
@@ -109,17 +109,17 @@ def log_account_header(index, total, server):
     _, ref = parse_yyb_entry(server)
     label = remark or ref or server
     print(f"│  🔑 标识: {label[:41].ljust(41)}│")
-    print("└" + "─".repeat(48) + "┘")
+    print("└" + "-" * 48 + "┘")
 
 
 def log_footer(success_count, fail_count):
     print()
-    print("╔" + "═".repeat(48) + "╗")
+    print("╔" + "=" * 48 + "╗")
     print("║  🏁 iQOO社区任务执行完成                    ║")
     print(f"║  ✅ 成功: {str(success_count).ljust(22)}║")
     print(f"║  ❌ 失败: {str(fail_count).ljust(22)}║")
     print(f"║  🕒 结束时间: {now_text().ljust(22)}║")
-    print("╚" + "═".repeat(48) + "╝")
+    print("╚" + "=" * 48 + "╝")
 
 
 def mask_name(value):
