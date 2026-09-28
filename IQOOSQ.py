@@ -66,7 +66,6 @@ SERVERS = [line.strip() for line in _YYB_SERVER_RAW.splitlines() if line.strip()
 if not SERVERS:
     print("❌ 未配置环境变量 YYB_SERVER（格式：地址@微信账号标识，多账号换行分隔）")
     exit(1)
-print(f"✅ 读取到 {len(SERVERS)} 个 YYB Go 账号")
 
 PLUSPLUS_TOKEN = os.getenv("PLUSPLUS_TOKEN", "")
 PROXY_API = os.getenv("PROXY_API", "")
@@ -89,6 +88,38 @@ def sleep(seconds):
 
 def log(*args):
     print(f"[{APP_NAME}]", *args)
+
+
+def log_title():
+    print()
+    print("╔" + "═".repeat(48) + "╗")
+    print("║  📱 iQOO社区 每日任务                       ║")
+    print(f"║  🕒 启动时间: {now_text().ljust(22)}║")
+    print(f"║  🔢 账号数量: {str(len(SERVERS)).ljust(22)}║")
+    print("╚" + "═".repeat(48) + "╝")
+
+
+def log_account_header(index, total, server):
+    print()
+    print("┌" + "─".repeat(48) + "┐")
+    print(f"│  🧩 账号 {index} / {total}{' '.ljust(26 - len(str(index)) - len(str(total)))}│")
+    remark = ""
+    if "#" in server:
+        remark = server.split("#", 1)[1].strip()
+    _, ref = parse_yyb_entry(server)
+    label = remark or ref or server
+    print(f"│  🔑 标识: {label[:41].ljust(41)}│")
+    print("└" + "─".repeat(48) + "┘")
+
+
+def log_footer(success_count, fail_count):
+    print()
+    print("╔" + "═".repeat(48) + "╗")
+    print("║  🏁 iQOO社区任务执行完成                    ║")
+    print(f"║  ✅ 成功: {str(success_count).ljust(22)}║")
+    print(f"║  ❌ 失败: {str(fail_count).ljust(22)}║")
+    print(f"║  🕒 结束时间: {now_text().ljust(22)}║")
+    print("╚" + "═".repeat(48) + "╝")
 
 
 def mask_name(value):
@@ -135,7 +166,7 @@ def write_token_cache(cache):
         with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        log(f"写入token缓存失败: {e}")
+        log(f"⚠️ [缓存] 写入失败: {e}")
 
 
 # ==================== 品赞代理 ====================
@@ -209,7 +240,7 @@ def build_proxy_dict(proxy_info):
     scheme = "socks5" if PROXY_TYPE == "socks5" else "http"
     proxy_url = f"{scheme}://{auth}{host}:{port}"
 
-    log(f"[代理] 生成 {scheme.upper()} 代理 {host}:{port}")
+    log(f"🌐 [代理] 生成 {scheme.upper()} 代理 {host}:{port}")
 
     return {"http": proxy_url, "https": proxy_url}
 
@@ -225,20 +256,20 @@ def validate_proxy(proxies):
                 ip = response.json().get("origin", "未知")
             except Exception:
                 ip = "未知"
-            log(f"[代理] 验证通过，出口 IP: {ip}")
+            log(f"✅ [代理] 验证通过，出口 IP: {ip}")
             return True, ip
     except Exception as exc:
-        log(f"[代理] 验证失败: {exc}")
+        log(f"⚠️ [代理] 验证失败: {exc}")
 
     return False, ""
 
 
 def get_valid_proxy(server):
     if not PROXY_API:
-        log(f"[代理] {server} 未配置 PROXY_API，使用直连")
+        log(f"ℹ️ [代理] {server} 未配置 PROXY_API，使用直连")
         return None, ""
 
-    log(f"[代理] {server} 正在获取品赞代理...")
+    log(f"🔌 [代理] {server} 正在获取品赞代理...")
 
     for index in range(1, PROXY_RETRY_TIMES + 1):
         try:
@@ -246,24 +277,24 @@ def get_valid_proxy(server):
             proxy_info = parse_proxy_response(response.text)
 
             if not proxy_info:
-                log(f"[代理] 第 {index} 次代理解析失败")
+                log(f"⚠️ [代理] 第 {index} 次代理解析失败")
                 continue
 
-            log(f"[代理] 提取到 {proxy_info['host']}:{proxy_info['port']}")
+            log(f"✅ [代理] 提取到 {proxy_info['host']}:{proxy_info['port']}")
             proxies = build_proxy_dict(proxy_info)
 
             ok, ip = validate_proxy(proxies)
             if ok:
                 return proxies, ip
 
-            log(f"[代理] 第 {index} 次代理不可用")
+            log(f"⚠️ [代理] 第 {index} 次代理不可用")
         except Exception as exc:
-            log(f"[代理] 第 {index} 次获取代理异常: {exc}")
+            log(f"⚠️ [代理] 第 {index} 次获取代理异常: {exc}")
 
         if index < PROXY_RETRY_TIMES:
             sleep(2)
 
-    log("[代理] 获取失败，使用直连")
+    log("⚠️ [代理] 获取失败，使用直连")
     return None, ""
 
 
@@ -274,10 +305,10 @@ def request_with_proxy(method, url, *, proxies=None, server="", **kwargs):
         try:
             return requests.request(method, url, proxies=proxies, **kwargs)
         except Exception as exc:
-            log(f"[代理] {server} 代理请求失败: {exc}")
+            log(f"⚠️ [代理] {server} 代理请求失败: {exc}")
             if not ENABLE_DIRECT_FALLBACK:
                 raise
-            log("[兜底] 切换直连重试")
+            log("🔄 [兜底] 切换直连重试")
 
     session = direct_session()
     return session.request(method, url, **kwargs)
@@ -286,7 +317,7 @@ def request_with_proxy(method, url, *, proxies=None, server="", **kwargs):
 
 def send_pushplus(title, content):
     if not PLUSPLUS_TOKEN:
-        log("[PushPlus] 未配置 PLUSPLUS_TOKEN，跳过推送")
+        log("ℹ️ [推送] 未配置 PLUSPLUS_TOKEN，跳过推送")
         return
 
     try:
@@ -300,9 +331,9 @@ def send_pushplus(title, content):
             },
             timeout=10,
         )
-        log("[PushPlus] 推送成功")
+        log("✅ [推送] 推送成功")
     except Exception as exc:
-        log(f"[PushPlus] 推送失败: {exc}")
+        log(f"❌ [推送] 推送失败: {exc}")
 
 
 def build_notify(results):
@@ -360,7 +391,6 @@ def get_code(entry):
         return None
 
     url = f"http://{server}/wxapp/getCode"
-    log(f"[授权] 请求 YYB Go 取码: {url}")
 
     try:
         response = direct_session().post(
@@ -378,13 +408,13 @@ def get_code(entry):
                 result = {}
         code = (result or {}).get("code")
         if data.get("code") != 0 or not code:
-            log(f"[授权] 取码失败: {json_preview(data)}")
+            log(f"❌ [取码] 取码失败: {json_preview(data)}")
             return None
 
-        log("[授权] 取码成功")
+        log("✅ [取码] 取码成功")
         return code
     except Exception as exc:
-        log(f"[授权] 取码异常: {exc}")
+        log(f"❌ [取码] 取码异常: {exc}")
         return None
 
 
@@ -398,7 +428,6 @@ class Task:
         self.server = server
         self.proxies = proxies
         self.openid = server
-        # 缓存 key 使用 YYB_SERVER 中 @ 后的 ref/wxid
         _, _ref = parse_yyb_entry(server)
         self.cache_key = _ref or server
         self.token = ""
@@ -430,10 +459,10 @@ class Task:
             cached = self.get_cached_token()
             if cached and cached.get("accessToken"):
                 self.apply_token(cached)
-                log(f"账号[{self.index}] 使用缓存token: {short_token(self.token)}")
+                log(f"💾 [缓存] 账号[{self.index}] 使用缓存token: {short_token(self.token)}")
                 if not self.check_token():
                     self.remove_cached_token()
-                    log(f"账号[{self.index}] 缓存token失效，重新登录")
+                    log(f"🔄 [重登] 账号[{self.index}] 缓存token失效，重新登录")
 
             if not self.token:
                 self.login_by_wx_code()
@@ -446,9 +475,8 @@ class Task:
             self._token_dead = False
             self._run_business(result)
 
-            # 业务执行中检测到登录失效 → 清缓存重登写回，重试一次业务
             if self._token_dead:
-                log(f"账号[{self.index}] 业务返回登录失效，清除缓存重新登录并重试一次")
+                log(f"🔄 [重登] 账号[{self.index}] 业务返回登录失效，清除缓存重新登录并重试一次")
                 self.remove_cached_token()
                 self.login_by_wx_code()
                 if self.token:
@@ -481,7 +509,7 @@ class Task:
 
         daily_tasks = self.fetch_daily_tasks()
         if not daily_tasks:
-            log(f"账号[{self.index}] 未获取到每日任务，跳过任务执行")
+            log(f"⚠️ [任务] 账号[{self.index}] 未获取到每日任务，跳过任务执行")
         else:
             need_threads = any(
                 t.get("upper_limit") != "不限次数"
@@ -503,7 +531,7 @@ class Task:
                 if remaining <= 0:
                     continue
 
-                log(f"账号[{self.index}] 任务[{task.get('access')}] 已完成{done}/{max_count}，还需{remaining}次")
+                log(f"📋 [任务] 账号[{self.index}] {task.get('access')} 已完成{done}/{max_count}，还需{remaining}次")
 
                 if rule == "view_thread":
                     for item in self.thread_list:
@@ -531,7 +559,7 @@ class Task:
                         self.comment_post(self.thread_list[0].get("threadId"))
                         remaining -= 1
                     else:
-                        log(f"账号[{self.index}] 无帖子可评论")
+                        log(f"⚠️ [任务] 账号[{self.index}] 无帖子可评论")
                 elif rule == "create_thread":
                     self.create_and_delete_thread()
 
@@ -651,7 +679,7 @@ class Task:
             result = self.request("v5/users/tasks", {}, {"method": "GET"})
             return (result.get("Data") or {}).get("perDayData") or []
         except Exception as e:
-            log(f"账号[{self.index}] 获取每日任务失败: {e}")
+            log(f"❌ [任务] 账号[{self.index}] 获取每日任务失败: {e}")
             return []
 
     def login_by_wx_code(self):
@@ -670,6 +698,7 @@ class Task:
                 "iv": iv,
                 "from": 46,
             }
+            log(f"🔐 [登录] 账号[{self.index}] 使用 code 换取 token...")
             result = self.request("v3/users/vivo/mini", payload)
             data = result.get("Data") or {}
             token = data.get("accessToken") or data.get("token") or ""
@@ -681,10 +710,11 @@ class Task:
             self.user_info = data.get("user") or data
             self.save_cached_token()
             name = self.user_info.get("nickname") or self.user_info.get("username") or self.user_id
-            log(f"账号[{self.index}] CODE登录成功: {mask_name(name)}")
+            log(f"✅ [登录] 账号[{self.index}] 登录成功: {mask_name(name)}")
         except Exception as e:
             self._login_error = str(e)
-            log(f"账号[{self.index}] CODE登录失败: {e}")
+            log(f"❌ [登录] 账号[{self.index}] 登录失败: {e}")
+
     def check_token(self):
         try:
             if not self.user_id:
@@ -707,10 +737,10 @@ class Task:
                 score = self.user_info.get("points")
             if score is None:
                 score = self.user_info.get("coolCoin", "未知")
-            log(f"账号[{self.index}] 用户:{mask_name(name)} 酷币:{score}")
+            log(f"👤 [用户] 账号[{self.index}] 用户:{mask_name(name)} 酷币:{score}")
         except Exception as e:
             message = str(e)
-            log(f"账号[{self.index}] 获取用户信息失败:{message}")
+            log(f"❌ [用户] 账号[{self.index}] 获取用户信息失败:{message}")
             if is_token_error(message):
                 self._token_dead = True
                 self.remove_cached_token()
@@ -722,44 +752,45 @@ class Task:
                 self.draw()
             else:
                 self._draw_msg = "今日已抽奖"
-                log(f"账号[{self.index}] 今日已抽奖")
+                log(f"🎰 [抽奖] 账号[{self.index}] 今日已抽奖")
         except Exception as e:
             self._draw_msg = f"查询抽奖失败: {e}"
-            log(f"账号[{self.index}] 查询抽奖次数失败:{e}")
+            log(f"❌ [抽奖] 账号[{self.index}] 查询抽奖次数失败:{e}")
 
     def draw(self):
         try:
             result = self.request("v3/luck.draw", {})
             prize = (result.get("Data") or {}).get("prize_name") or "奖励"
             self._draw_msg = f"获得{prize}"
-            log(f"账号[{self.index}] 抽奖成功 获得{prize}")
+            log(f"🎰 [抽奖] 账号[{self.index}] 抽奖成功 获得{prize}")
         except Exception as e:
             self._draw_msg = f"抽奖失败: {e}"
-            log(f"账号[{self.index}] 抽奖失败:{e}")
+            log(f"❌ [抽奖] 账号[{self.index}] 抽奖失败:{e}")
 
     def sign_in(self):
         try:
             result = self.request("v3/sign", {"from": "group"})
             data = result.get("Data") or {}
             self._sign_msg = f"已签到{data.get('serialDays')}天 获得积分{data.get('score')} 当前积分{data.get('scoreCount')}"
-            log(f"账号[{self.index}] 当前已签到{data.get('serialDays')}天 获得积分{data.get('score')} 当前积分{data.get('scoreCount')}")
+            log(f"✅ [签到] 账号[{self.index}] 已签到{data.get('serialDays')}天 获得积分{data.get('score')} 当前积分{data.get('scoreCount')}")
         except Exception as e:
             message = str(e)
             if re.search(r"已签|重复|今日|13006", message):
                 self._sign_msg = "今日已签到"
-                log(f"账号[{self.index}] 今日已签到")
+                log(f"✅ [签到] 账号[{self.index}] 今日已签到")
                 return
             self._sign_msg = f"签到失败: {message}"
-            log(f"账号[{self.index}] 签到失败:{message}")
+            log(f"❌ [签到] 账号[{self.index}] 签到失败:{message}")
             if is_token_error(message):
                 self._token_dead = True
                 self.remove_cached_token()
+
     def like_post(self, thread_id, post_id):
         try:
             self.request("v3/posts.update", {"id": thread_id, "postId": post_id, "data": {"attributes": {"isLiked": True}}})
-            log(f"账号[{self.index}] 帖子点赞成功")
+            log(f"❤️ [互动] 账号[{self.index}] 帖子点赞成功")
         except Exception as e:
-            log(f"账号[{self.index}] 帖子点赞失败:{e}")
+            log(f"❌ [互动] 账号[{self.index}] 帖子点赞失败:{e}")
         try:
             self.request("v3/posts.update", {"id": thread_id, "postId": post_id, "data": {"attributes": {"isLiked": False}}})
         except Exception:
@@ -768,23 +799,23 @@ class Task:
     def share_post(self, thread_id):
         try:
             self.request("v3/thread.share", {"threadId": thread_id})
-            log(f"账号[{self.index}] 帖子分享成功")
+            log(f"🔗 [互动] 账号[{self.index}] 帖子分享成功")
         except Exception as e:
-            log(f"账号[{self.index}] 帖子分享失败:{e}")
+            log(f"❌ [互动] 账号[{self.index}] 帖子分享失败:{e}")
 
     def view_post(self, thread_id):
         try:
             self.request("v3/view.count", {"threadId": thread_id, "type": 0}, {"method": "GET"})
-            log(f"账号[{self.index}] 帖子浏览成功")
+            log(f"👀 [互动] 账号[{self.index}] 帖子浏览成功")
         except Exception as e:
-            log(f"账号[{self.index}] 帖子浏览失败:{e}")
+            log(f"❌ [互动] 账号[{self.index}] 帖子浏览失败:{e}")
 
     def comment_post(self, thread_id):
         try:
             self.request("v3/posts.create", {"id": thread_id, "type": 0, "content": "666", "source": "", "attachments": []})
-            log(f"账号[{self.index}] 帖子评论成功")
+            log(f"💬 [互动] 账号[{self.index}] 帖子评论成功")
         except Exception as e:
-            log(f"账号[{self.index}] 帖子评论失败:{e}")
+            log(f"❌ [互动] 账号[{self.index}] 帖子评论失败:{e}")
 
     def create_and_delete_thread(self):
         try:
@@ -808,14 +839,14 @@ class Task:
             })
             thread_id = (result.get("Data") or {}).get("threadId")
             if not thread_id:
-                log(f"账号[{self.index}] 发帖成功但未获取到threadId")
+                log(f"⚠️ [发帖] 账号[{self.index}] 发帖成功但未获取到threadId")
                 return
-            log(f"账号[{self.index}] 发帖成功, threadId: {thread_id}")
+            log(f"📝 [发帖] 账号[{self.index}] 发帖成功, threadId: {thread_id}")
             sleep(2)
             self.request("v3/thread.delete", {"threadId": thread_id, "message": ""})
-            log(f"账号[{self.index}] 帖子已删除")
+            log(f"🗑️ [发帖] 账号[{self.index}] 帖子已删除")
         except Exception as e:
-            log(f"账号[{self.index}] 发帖/删除失败: {e}")
+            log(f"❌ [发帖] 账号[{self.index}] 发帖/删除失败: {e}")
 
     def get_thread_list(self):
         try:
@@ -828,21 +859,19 @@ class Task:
                 "sequence": 0,
             }, {"method": "GET"})
             self.thread_list = (result.get("Data") or {}).get("pageData") or []
-            log(f"账号[{self.index}] 获取到{len(self.thread_list)}条帖子")
+            log(f"📋 [帖子] 账号[{self.index}] 获取到{len(self.thread_list)}条帖子")
         except Exception as e:
-            log(f"账号[{self.index}] 获取帖子列表失败:{e}")
+            log(f"❌ [帖子] 账号[{self.index}] 获取帖子列表失败:{e}")
             self.thread_list = []
 
 # ==================== 主入口 ====================
 
 def main():
+    log_title()
     results = []
 
-    for server in SERVERS:
-        remark = server.split("#", 1)[1].strip() if "#" in server else ""
-        log(f"\n{'=' * 50}")
-        log(f"  开始处理: {remark or server}")
-        log(f"{'=' * 50}")
+    for idx, server in enumerate(SERVERS, 1):
+        log_account_header(idx, len(SERVERS), server)
 
         proxies, proxy_ip = get_valid_proxy(server)
         sleep(PROXY_FETCH_INTERVAL)
@@ -856,11 +885,7 @@ def main():
 
     success_count = sum(1 for r in results if r["success"])
     fail_count = len(results) - success_count
-    log(f"\n{'=' * 50}")
-    log(f"iQOO社区任务执行完成")
-    log(f"成功: {success_count}")
-    log(f"失败: {fail_count}")
-    log(f"结束: {now_text()}")
+    log_footer(success_count, fail_count)
 
     send_pushplus("iQOO社区任务完成", build_notify(results))
 
