@@ -728,10 +728,10 @@ class JtcBot:
     def check_response(self, response_data):
         """检查响应是否正常（适配最新resultCode格式）"""
         if response_data.get("resultCode") != "0" and response_data.get("code") != "0":
-            error_msg = response_data.get("message", "未知错误")
+            error_msg = response_data.get("message") or "未知错误"
             self._last_error = error_msg
             # 特殊处理："已达到最大领取次数"视为成功
-            if "已达到最大领取次数" in error_msg:
+            if "已达到最大领取次数" in str(error_msg):
                 print(f"ℹ️ [{self.server}] {error_msg}")
                 return True
             print(f"❌ [{self.server}] 请求失败 | 原因: {error_msg}")
@@ -812,16 +812,17 @@ class JtcBot:
             )
             response_data = response.json()
 
-            if "今日已签到" in response_data.get("message", ""):
+            message = response_data.get("message") or ""
+            if "今日已签到" in str(message):
                 print(f"ℹ️ [{self.server}] 今日已签到")
                 return True
             elif self.check_response(response_data):
-                reward = self.safe_get_reward(response_data.get("data", 0))
+                reward = self.safe_get_reward(response_data.get("data"), 0)
                 if reward > 0:
                     print(f"✅ [{self.server}] 签到成功 | 获得{reward}捷停币")
                 return True
             else:
-                print(f"❌ [{self.server}] 签到失败")
+                print(f"❌ [{self.server}] 签到失败 | {message}")
                 return False
         except Exception as e:
             print(f"❌ [{self.server}] 签到异常 | 原因: {str(e)}")
