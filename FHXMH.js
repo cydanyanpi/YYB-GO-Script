@@ -19,7 +19,7 @@ function writeTokenCache(cache) {
     try {
         fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
         fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
-    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+    } catch (e) { console.log(`⚠️ [缓存] 写入失败: ${e.message}`); }
 }
 // ====================== YYB Go 账号（环境变量 YYB_SERVER = 地址@微信账号标识，多行） ======================
 const SERVERS = (process.env.YYB_SERVER || "")
@@ -27,7 +27,7 @@ const SERVERS = (process.env.YYB_SERVER || "")
     .map(s => s.trim())
     .filter(Boolean);
 if (!SERVERS.length) {
-    console.error("未配置环境变量 YYB_SERVER，请设置后重试（格式：地址@微信账号标识，多行换行）");
+    console.error("❌ 未配置环境变量 YYB_SERVER，请设置后重试（格式：地址@微信账号标识，多行换行）");
     process.exit(1);
 }
 function parseYybGoEntry(rawValue) {
@@ -35,7 +35,7 @@ function parseYybGoEntry(rawValue) {
     if (!value) return { server: "", ref: "" };
     const atIndex = value.indexOf("@");
     if (atIndex === -1) {
-        console.log("YYB_SERVER 格式应为 地址@微信账号标识，当前值: " + value);
+        console.log("⚠️ YYB_SERVER 格式应为 地址@微信账号标识，当前值: " + value);
         return { server: "", ref: "" };
     }
     let server = value.slice(0, atIndex).trim();
@@ -54,13 +54,13 @@ async function getCode(server) {
         const { data } = await axios.post(url, { ref, app_id: 'wxc83b55d61c7fc51d' }, { timeout: 20000, proxy: false });
         const code = data && data.data && data.data.result && data.data.result.code;
         if (!data || data.code !== 0 || !code) {
-            console.log(parsedServer + " 获取code失败: " + JSON.stringify(data));
+            console.log(`❌ [取码] ${parsedServer} 获取code失败: ${JSON.stringify(data)}`);
             return null;
         }
-        console.log(parsedServer + " 获取code成功");
+        console.log(`✅ [取码] ${parsedServer} 获取code成功`);
         return code;
     } catch (e) {
-        console.log(parsedServer + " 获取code异常: " + e.message);
+        console.log(`❌ [取码] ${parsedServer} 获取code异常: ${e.message}`);
         return null;
     }
 }
@@ -121,6 +121,24 @@ async function getWxCode(server) {
         return await getCode(server);
     }
 
+// ==================== 输出美化 ====================
+function logTitle() {
+    console.log();
+    console.log("╔" + "═".repeat(48) + "╗");
+    console.log("║  🍼 飞鹤星妈会 自动签到                      ║");
+    console.log(`║  🕒 启动时间: ${new Date().toLocaleString("zh-CN", { hour12: false }).padEnd(22)}║`);
+    console.log(`║  🔢 账号数量: ${String(SERVERS.length).padEnd(22)}║`);
+    console.log("╚" + "═".repeat(48) + "╝");
+}
+
+function logAccountHeader(index, total, server) {
+    const { ref } = parseYybGoEntry(server);
+    console.log();
+    console.log("┌" + "─".repeat(48) + "┐");
+    console.log(`│  🧩 账号 ${index} / ${total}${" ".repeat(26)}│`);
+    console.log(`│  🔑 标识: ${String(ref || "-").padEnd(41)}│`);
+    console.log("└" + "─".repeat(48) + "┘");
+}
 
 class FeiheMom {
     constructor(openid) {
@@ -131,6 +149,7 @@ class FeiheMom {
         this.openid = openid;
         this.base = "https://momclub.feihe.com/capis";
         this.token = "";
+        this.index = userIdx++;
     }
 
     async api({ method = "GET", path, data, allowFail = false }) {
@@ -157,10 +176,11 @@ class FeiheMom {
         const cached = cache[this.server] || {};
         if (cached.accessToken) {
             this.token = cached.accessToken;
-            console.log(`💾 使用缓存token`);
-            return `token=${this.token.slice(0, 8)}***`;
+            console.log(`💾 [缓存] 账号[${this.index}] 使用缓存token: ${this.token.slice(0, 8)}***`);
+            return true;
         }
 
+        console.log(`🔐 [登录] 账号[${this.index}] 使用 code 换取 token...`);
         const code = await getWxCode(this.server);
         const res = await request({
             method: "POST",
@@ -177,7 +197,8 @@ class FeiheMom {
         c[this.server] = { accessToken: token };
         writeTokenCache(c);
 
-        return `token=${token.slice(0, 8)}***`;
+        console.log(`✅ [登录] 账号[${this.index}] 登录成功: ${token.slice(0, 8)}***`);
+        return true;
     }
 
     async query() {
@@ -186,7 +207,7 @@ class FeiheMom {
         const data = member?.data || user?.data || {};
         const score = data.score || data.points || data.integral || data.availableScore || data.totalScore;
         const name = data.nickName || data.nickname || data.memberName || data.mobile || data.phone || "";
-        return `用户=${name || "未知"} 积分=${score ?? "未知"} member=${short(member?.data || member, 120)}`;
+        console.log(`👤 [用户] 账号[${this.index}] 用户: ${name || "未知"}，积分: ${score ?? "未知"}`);
     }
 
     async sign() {
@@ -199,7 +220,10 @@ class FeiheMom {
             getByPath(todo, "data.checkInTodo") ||
             findFirst(todo?.data, (item) => item && (item.checkInExtra || /签到|打卡|check/i.test(`${item.taskName || item.name || item.title || ""}`)));
         const activityId = checkTodo?.id || checkTodo?.activityId || checkTodo?.taskId;
-        if (!activityId) return `未找到签到任务: ${short(todo)}`;
+        if (!activityId) {
+            console.log(`⚠️ [签到] 账号[${this.index}] 未找到签到任务: ${short(todo)}`);
+            return;
+        }
         const todaySigned =
             checkTodo?.todaySigned ||
             checkTodo?.signed ||
@@ -207,50 +231,61 @@ class FeiheMom {
             checkTodo?.completed ||
             checkTodo?.status === 1 ||
             checkTodo?.state === 1;
-        if (todaySigned) return `今日已签到 activityId=${activityId}`;
+        if (todaySigned) {
+            console.log(`✅ [签到] 账号[${this.index}] 今日已签到`);
+            return;
+        }
         const sign = await this.api({
             method: "POST",
             path: "/c/activity/todo/checkIn",
             data: { activityId, mockTime: Date.now() },
             allowFail: true,
         });
-        return `签到接口返回: ${short(sign)}`;
+        console.log(`✅ [签到] 账号[${this.index}] 签到完成: ${short(sign)}`);
     }
 }
 
-async function runAccount(openid, index) {
-    console.log(`\n========== ${APP.name} 账号[${index}] ${openid} ==========`);
+async function runAccount(openid, index, total) {
+    logAccountHeader(index, total, openid);
     let usedCache = !!(readTokenCache()[openid] || {}).accessToken;
     for (let attempt = 0; attempt < 2; attempt++) {
         const runner = new FeiheMom(openid);
         try {
-            console.log(`登录：${await runner.login()}`);
-            console.log(`查询：${await runner.query()}`);
-            console.log(`签到：${await runner.sign()}`);
-            return;
+            await runner.login();
+            await runner.query();
+            await runner.sign();
+            return true;
         } catch (e) {
             if (attempt === 0 && usedCache) {
-                console.log(`⚠️ 缓存token失效，清除缓存重新登录...`);
+                console.log(`🔄 [重登] 账号[${runner.index}] 缓存token失效，清除缓存重新登录...`);
                 const c = readTokenCache();
                 delete c[openid];
                 writeTokenCache(c);
                 continue;
             }
-            console.log(`执行失败：${e.message || e}`);
+            console.log(`❌ [执行] 账号[${runner.index}] 执行失败：${e.message || e}`);
+            return false;
         }
     }
+    return false;
 }
 
 (async () => {
-        if (!SERVERS.length) {
-        console.log(`未配置 ${"YYB_SERVER"}`);
-        return;
-    }
-    console.log(`共找到${SERVERS.length}个账号`);
+    logTitle();
+    let successCount = 0;
+    let failCount = 0;
     for (let i = 0; i < SERVERS.length; i++) {
-        await runAccount(SERVERS[i], i + 1);
+        const ok = await runAccount(SERVERS[i], i + 1, SERVERS.length);
+        if (ok) successCount++; else failCount++;
         await sleep(800);
     }
+    console.log();
+    console.log("╔" + "═".repeat(48) + "╗");
+    console.log("║  🏁 飞鹤星妈会任务执行完成                    ║");
+    console.log(`║  ✅ 成功: ${String(successCount).padEnd(22)}║`);
+    console.log(`║  ❌ 失败: ${String(failCount).padEnd(22)}║`);
+    console.log(`║  🕒 结束时间: ${new Date().toLocaleString("zh-CN", { hour12: false }).padEnd(22)}║`);
+    console.log("╚" + "═".repeat(48) + "╝");
 })().catch((e) => {
-    console.log(`脚本异常：${e.stack || e.message || e}`);
+    console.log(`❌ 脚本异常：${e.stack || e.message || e}`);
 });
