@@ -100,15 +100,19 @@ USER_AGENT_LIST = [
     f"Mozilla/5.0 (Linux; Android 14; 2512BPNDAC Build/UKQ1.230917.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/146.0.7680.153 Mobile Safari/537.36 XWEB/{XWEB_VERSION} MMWEBSDK/20251006 MiniProgramEnv/android"
 ]
 
-# 只保留指定的3个任务，其他全部跳过
-SKIP_TASKS = {"T02", "T03", "T04", "T05", "T06", "T07", "T08", "T09", "T10",
+# 只保留指定的任务，其他全部跳过
+SKIP_TASKS = {"T03", "T04", "T05", "T06", "T07", "T08", "T09", "T10",
               "T11", "T12", "T46", "T48", "T49", "T50", "T81", "T87"}
 
-# 强制执行的核心任务（已更新为最新编号）
+# 强制执行的核心任务
 FORCE_EXECUTE_TASKS = [
+    ("T02", "看视频"),
     ("T01", "浏览找优惠"),
     ("T47", "浏览车位优选")
 ]
+
+# 看视频任务固定停留时间（秒）
+T02_VIDEO_STAY_SECONDS = 35
 
 # ===================== 工具函数 =====================
 def sleep(ms: int) -> asyncio.Future:
@@ -911,7 +915,20 @@ class JtcBot:
         # 获取接口要求的停留时间，默认10秒
         stay_seconds = max(self.task_browse_seconds.get(task_no, 10) - 2, 5)
 
-        if task_no == "T01":  # 浏览找优惠
+        if task_no == "T02":  # 看视频（固定停留35秒）
+            print(f"⏳ [{self.server}] 进入【看视频】页面，停留{T02_VIDEO_STAY_SECONDS}秒...")
+            await self.send_data_report("PageView")
+            await sleep(1000)
+            await self.send_data_report("VideoPlayStart")
+            await sleep(2000)
+            # 模拟观看视频，固定停留35秒
+            await sleep(T02_VIDEO_STAY_SECONDS * 1000)
+            await self.send_data_report("VideoPlayEnd")
+            await sleep(500)
+            await self.send_data_report("TaskAction", {"taskNo": task_no}, extra_props={"action": "watch_video"})
+            await sleep(500)
+
+        elif task_no == "T01":  # 浏览找优惠
             print(f"⏳ [{self.server}] 进入【找优惠】页面，停留{stay_seconds}秒...")
             await self.send_data_report("PageView")
             await sleep(1000)
