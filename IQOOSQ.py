@@ -90,36 +90,45 @@ def log(*args):
     print(f"[{APP_NAME}]", *args)
 
 
+def _pad(text, width):
+    """按显示宽度补空格（中文占2宽度）"""
+    text = str(text)
+    w = 0
+    for ch in text:
+        w += 2 if ord(ch) > 127 else 1
+    return text + " " * max(0, width - w)
+
+
 def log_title():
     print()
-    print("╔" + "=" * 48 + "╗")
-    print("║  📱 iQOO社区 每日任务                       ║")
-    print(f"║  🕒 启动时间: {now_text().ljust(22)}║")
-    print(f"║  🔢 账号数量: {str(len(SERVERS)).ljust(22)}║")
-    print("╚" + "=" * 48 + "╝")
+    print("╔" + "=" * 50 + "╗")
+    print("║  " + _pad("📱 iQOO社区 每日任务", 46) + "║")
+    print("║  " + _pad(f"🕒 启动时间: {now_text()}", 46) + "║")
+    print("║  " + _pad(f"🔢 账号数量: {len(SERVERS)}", 46) + "║")
+    print("╚" + "=" * 50 + "╝")
 
 
 def log_account_header(index, total, server):
     print()
-    print("┌" + "-" * 48 + "┐")
-    print(f"│  🧩 账号 {index} / {total}{' '.ljust(26 - len(str(index)) - len(str(total)))}│")
+    print("┌" + "-" * 50 + "┐")
+    print("│  " + _pad(f"🧩 账号 {index} / {total}", 46) + "│")
     remark = ""
     if "#" in server:
         remark = server.split("#", 1)[1].strip()
     _, ref = parse_yyb_entry(server)
     label = remark or ref or server
-    print(f"│  🔑 标识: {label[:41].ljust(41)}│")
-    print("└" + "-" * 48 + "┘")
+    print("│  " + _pad(f"🔑 标识: {label}", 46) + "│")
+    print("└" + "-" * 50 + "┘")
 
 
 def log_footer(success_count, fail_count):
     print()
-    print("╔" + "=" * 48 + "╗")
-    print("║  🏁 iQOO社区任务执行完成                    ║")
-    print(f"║  ✅ 成功: {str(success_count).ljust(22)}║")
-    print(f"║  ❌ 失败: {str(fail_count).ljust(22)}║")
-    print(f"║  🕒 结束时间: {now_text().ljust(22)}║")
-    print("╚" + "=" * 48 + "╝")
+    print("╔" + "=" * 50 + "╗")
+    print("║  " + _pad("🏁 iQOO社区任务执行完成", 46) + "║")
+    print("║  " + _pad(f"✅ 成功: {success_count}", 46) + "║")
+    print("║  " + _pad(f"❌ 失败: {fail_count}", 46) + "║")
+    print("║  " + _pad(f"🕒 结束时间: {now_text()}", 46) + "║")
+    print("╚" + "=" * 50 + "╝")
 
 
 def mask_name(value):
