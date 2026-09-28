@@ -104,15 +104,16 @@ USER_AGENT_LIST = [
 SKIP_TASKS = {"T03", "T04", "T05", "T06", "T07", "T08", "T09", "T10",
               "T11", "T12", "T46", "T48", "T49", "T50", "T81", "T87"}
 
-# 强制执行的核心任务
+# 强制执行的核心任务（一次性）
 FORCE_EXECUTE_TASKS = [
-    ("T02", "看视频"),
     ("T01", "浏览找优惠"),
     ("T47", "浏览车位优选")
 ]
 
-# 看视频任务固定停留时间（秒）
-T02_VIDEO_STAY_SECONDS = 35
+# 看视频任务（T02）：可重复刷，每次看视频领一次奖励，直到达到每日上限
+T02_VIDEO_STAY_SECONDS = 35       # 每次看视频停留秒数
+T02_MAX_ROUNDS = 20               # 最多循环轮数（防死循环）
+T02_ROUND_INTERVAL = 5            # 每轮间隔秒数
 
 # ===================== 工具函数 =====================
 def sleep(ms: int) -> asyncio.Future:
@@ -1005,6 +1006,55 @@ class JtcBot:
             print(f"❌ [{self.server}] 完成【{show_title}】异常 | 原因: {str(e)}")
             return False
 
+    async def loop_watch_video(self):
+        """循环刷 T02 看视频：每轮看视频35秒→完成任务→领奖励，直到达每日上限"""
+        task_info = {"taskNo": "T02", "showTitle": "看视频", "taskStatus": "GOTO"}
+        total_reward = 0
+        print(f"\n🎬 [{self.server}] ===== 开始循环刷看视频任务（最多{T02_MAX_ROUNDS}轮）=====")
+        for round_no in range(1, T02_MAX_ROUNDS + 1):
+            print(f"\n🎬 [{self.server}] --- 第 {round_no}/{T02_MAX_ROUNDS} 轮看视频 ---")
+            # 1. 模拟看视频35秒
+            await self.simulate_task_action("T02", task_info)
+            await sleep(500)
+            # 2. 上报任务完成
+            try:
+                await self.send_data_report("GoToFinishClick", task_info)
+                await sleep(500)
+                response = await self._safe_request(
+                    "POST",
+                    "/base-gateway/integral/v2/task/complete",
+                    json={
+                        "userId": self.user_id,
+                        "taskNo": "T02",
+                        "receiveTag": True,
+                        "reqSource": "WX_XCX_JTC",
+                        "platformType": "WX_XCX_JTC",
+                        "osType": "IOS",
+                        "token": self.token
+                    }
+                )
+                response_data = response.json()
+                msg = str(response_data.get("message") or "")
+                if "已达到最大领取次数" in msg or "已达上限" in msg or "次数已用完" in msg:
+                    print(f"🏁 [{self.server}] 看视频已达每日上限，停止循环")
+                    break
+                if not self.check_response(response_data):
+                    print(f"⚠️ [{self.server}] 第{round_no}轮完成返回异常，停止循环")
+                    break
+            except Exception as e:
+                print(f"⚠️ [{self.server}] 第{round_no}轮上报异常: {e}，停止循环")
+                break
+            # 3. 领取奖励
+            await sleep(1000)
+            reward = await self.receive_task_reward("T02", task_info)
+            total_reward += reward
+            print(f"💰 [{self.server}] 第{round_no}轮获得 {reward} 捷停币，累计 {total_reward}")
+            # 4. 间隔
+            if round_no < T02_MAX_ROUNDS:
+                await sleep(T02_ROUND_INTERVAL * 1000)
+        print(f"🎬 [{self.server}] ===== 看视频循环结束，共获 {total_reward} 捷停币 =====\n")
+        return total_reward
+
     async def get_balance(self):
         """获取账户余额（使用安全请求）"""
         try:
@@ -1153,6 +1203,10 @@ class JtcBot:
                         await sleep(3000)
                         reward = await self.receive_task_reward(task_no, task_info_map.get(task_no))
                         result["total_reward"] += reward
+
+                # 7.5 循环刷看视频任务（T02，可重复）
+                video_reward = await self.loop_watch_video()
+                result["total_reward"] += video_reward
 
                 # 8. 获取最终余额
                 balance_info = await self.get_balance()
