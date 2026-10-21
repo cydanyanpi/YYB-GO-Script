@@ -47,6 +47,7 @@ let frinds = [];
 let totalAccountsfrinds = [];
 let msg = '';
 let ok = '';
+let exploreRecords = {};   // 探险收获记录: {账号备注: [皮肤名, ...]}
 
 // ===================== JSON 文件读写 =====================
 function readTokenFile() {
@@ -357,6 +358,16 @@ async function Envs() {
     console.log(`│  ✅ 成功 ${totalOk}/${zmnlxqArr.length}`);
     console.log(`└─ 完成时间: ${new Date(new Date().getTime() + 8*3600000).toLocaleString()}`);
 
+    // 探险收获清单
+    const exploreKeys = Object.keys(exploreRecords);
+    if (exploreKeys.length) {
+        console.log(`\n┌─ 🎲 今日探险收获`);
+        for (const acc of exploreKeys) {
+            console.log(`│  ${acc}：${exploreRecords[acc].join('、')}`);
+        }
+        console.log(`└─ 共 ${exploreKeys.reduce((s, k) => s + exploreRecords[k].length, 0)} 件`);
+    }
+
     if (msg) console.log(msg);
 })()
     .catch((e) => console.log(e))
@@ -662,10 +673,14 @@ function tanxian(timeout = 2000) {
                 if (result.status == 1) {
                     eqid = result.eqid;
                     msgText = `探险成功：获得【${result.winname || '未知'}】`;
-                    console.log(`   ${msgText}`);
+                    console.log(`      ${msgText}`);
+                    // 记录收获（按当前账号备注归组）
+                    const curRemark = zmnlxqArr.find(a => a.safe === zmnlxq)?.remark || '未命名';
+                    if (!exploreRecords[curRemark]) exploreRecords[curRemark] = [];
+                    exploreRecords[curRemark].push(result.winname || `装备${eqid}`);
                 } else {
                     msgText = result.msg || '探险失败';
-                    console.log(`   ${msgText}`);
+                    console.log(`      ${msgText}`);
                 }
             } catch (e) { console.log('探险数据异常：', data); }
             finally { resolve({ msg: msgText, eqid }); }
