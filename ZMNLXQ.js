@@ -3,7 +3,7 @@
 /**
  * 战马能量星球 — YYB Go 适配版
  * 接口域名：warhorsechina.cojoy.com.cn
- * 功能：签到、摸马儿、喂马、偷饲料、分享马儿、互助点赞、完善个人信息
+ * 功能：签到、摸马儿、喂马、偷饲料、分享马儿、互助点赞、完善个人信息、探险（随机皮肤+自动穿戴）
  */
 
 const $ = Env('战马能量星球');
@@ -17,10 +17,16 @@ const SERVERS = (process.env.YYB_SERVER || "")
     .filter(Boolean);
 
 function parseYybGoEntry(raw) {
-    if (!raw || !raw.includes("@")) return { server: null, ref: null };
-    const [server, ref] = raw.split("@", 2);
-    let s = server.trim().replace(/^https?:\/\//, "").replace(/\/+$/, "");
-    return { server: s, ref: ref.trim() };
+    if (!raw || !raw.includes("@")) return { server: null, ref: null, remark: '' };
+    const atIndex = raw.lastIndexOf('@');
+    let s = raw.slice(0, atIndex).trim().replace(/^https?:\/\//, "").replace(/\/+$/, "");
+    let r = raw.slice(atIndex + 1).trim();
+    let remark = '';
+    if (r.includes('#')) {
+        remark = r.split('#')[1].trim();
+        r = r.split('#')[0].trim();
+    }
+    return { server: s, ref: r, remark };
 }
 // ========================================================================================================
 
@@ -84,7 +90,7 @@ function getWxCode(server, ref) {
             try {
                 const json = JSON.parse(data);
                 if (json.code === 0 && json.data?.result?.code) resolve(json.data.result.code);
-                else { console.log(parsedServer + " 获取code失败: " + JSON.stringify(data));; resolve(null); }
+                else { console.log(`${server} 获取code失败: ${JSON.stringify(data)}`); resolve(null); }
             } catch (e) { console.log(e); resolve(null); }
         });
     });
@@ -206,13 +212,16 @@ async function Envs() {
     if (!tokenStore.accounts) tokenStore.accounts = {};
 
     for (const entry of SERVERS) {
-        const { server, ref } = parseYybGoEntry(entry);
+        const { server, ref, remark } = parseYybGoEntry(entry);
         if (!server || !ref) {
             console.log(`❌ 格式错误: ${entry}`);
             continue;
         }
         const cred = await getOrRefreshSafe(server, ref, tokenStore);
-        if (cred) zmnlxqArr.push(cred);
+        if (cred) {
+            cred.remark = remark || `账号${zmnlxqArr.length + 1}`;
+            zmnlxqArr.push(cred);
+        }
         await $.wait(2000);
     }
 
@@ -228,15 +237,20 @@ async function Envs() {
 !(async () => {
     if (!(await Envs())) return;
 
-    console.log(`目前实现功能：日常签到、摸马儿、喂马、偷饲料、分享马儿、喂饲料、互助点赞、完善个人信息`);
-    console.log(`\n=========================================\n脚本执行 - 北京时间(UTC+8)：${new Date(new Date().getTime() + 8*3600000).toLocaleString()}\n=========================================\n`);
-    console.log(`\n=================== 共找到 ${zmnlxqArr.length} 个账号 ===================`);
+    console.log(`目前实现功能：日常签到、摸马儿、喂马、偷饲料、分享马儿、喂饲料、互助点赞、完善个人信息、探险（随机皮肤+自动穿戴）`);
+    console.log(`\n═══════════════════════════════════════════`);
+    console.log(`🐎 战马能量星球 | 共 ${zmnlxqArr.length} 个账号`);
+    console.log(`🕐 执行时间(UTC+8)：${new Date(new Date().getTime() + 8*3600000).toLocaleString()}`);
+    console.log(`═══════════════════════════════════════════\n`);
+
+    let totalOk = 0;
+    const accountResults = [];
 
     if (addFriend) {
         for (let i = 0; i < zmnlxqArr.length; i++) {
             zmnlxq = zmnlxqArr[i].safe;
             zmnlxqSkey = zmnlxqArr[i].skey;
-            console.log('去加好友');
+            console.log(`┌─ 🤝 ${zmnlxqArr[i].remark || `账号${i+1}`}：互加好友`);
             await $.wait(200);
             for (let j = 0; j < zmnlxqArr.length; j++) {
                 if (i !== j) {
@@ -244,54 +258,71 @@ async function Envs() {
                     await $.wait(2000);
                 }
             }
+            console.log(`└─ ✅ 好友互加完成\n`);
         }
     }
 
     for (let i = 0; i < zmnlxqArr.length; i++) {
         zmnlxq = zmnlxqArr[i].safe;
         zmnlxqSkey = zmnlxqArr[i].skey;
-        console.log(`\n========= 开始【第 ${i+1} 个账号】执行任务=========\n`);
+        const remark = zmnlxqArr[i].remark || `账号${i+1}`;
+        console.log(`┌─ 🐎 ${remark}（${i+1}/${zmnlxqArr.length}）`);
 
-        console.log('获取信息');
+        console.log(`│  📋 获取信息`);
         await getuser();
         await $.wait(2000);
 
         if (ok == 1) {
-            console.log('签到');
+            console.log(`│  📅 签到`);
             await checkin();
             await $.wait(2000);
 
-            console.log('查询题库');
+            console.log(`│  ❓ 查询题库`);
             await gettiku();
             await $.wait(2000);
 
-            console.log('分享任务');
+            console.log(`│  📤 分享任务`);
             await getshare();
             await $.wait(2000);
 
-            console.log('加入排行榜');
+            console.log(`│  🏆 加入排行榜`);
             await joinxcx();
             await $.wait(2000);
 
-            console.log('领取小马儿');
+            console.log(`│  🐴 领取小马儿`);
             await getmaer();
             await $.wait(2000);
 
-            console.log('摸一摸');
+            console.log(`│  🤚 摸一摸`);
             await getmoyimo();
             await $.wait(2000);
 
-            console.log('马儿分享任务');
+            console.log(`│  🎁 马儿分享任务`);
             await checkslgift();
             await $.wait(2000);
 
-            console.log('去喂马');
+            console.log(`│  🍚 去喂马`);
             await getweima();
             await $.wait(2000);
 
-            console.log('去点赞');
+            console.log(`│  👍 去点赞`);
             await getranklist();
             await $.wait(2000);
+
+            console.log(`│  🎲 探险（每天3次随机皮肤）`);
+            for (let t = 1; t <= 3; t++) {
+                const tanResult = await tanxian();
+                if (tanResult.msg.includes('三次')) break;
+                if (tanResult.eqid) {
+                    await exchangequips(tanResult.eqid);
+                    await $.wait(2000);
+                }
+                await $.wait(3000);
+            }
+            console.log(`└─ ✅ 任务完成\n`);
+            totalOk++;
+        } else {
+            console.log(`└─ ❌ 账号状态异常，跳过任务\n`);
         }
     }
 
@@ -299,26 +330,32 @@ async function Envs() {
         for (let i = 0; i < zmnlxqArr.length; i++) {
             zmnlxq = zmnlxqArr[i].safe;
             zmnlxqSkey = zmnlxqArr[i].skey;
-            console.log(`\n========= 开始【第 ${i+1} 个账号】饲料互助=========\n`);
+            const remark = zmnlxqArr[i].remark || `账号${i+1}`;
+            console.log(`┌─ 🌾 ${remark}（${i+1}/${zmnlxqArr.length}）饲料互助`);
             let isCompletedTousiliao = false, isCompletedSongsiliao = false;
             for (let j = 0; j < totalAccountsfrinds.length; j++) {
                 await getotherhorseinfo(totalAccountsfrinds[j]?.id);
                 if (!isCompletedTousiliao) {
-                    console.log('去偷饲料');
+                    console.log(`│  🥷 去偷饲料`);
                     isCompletedTousiliao = await tousiliao(j);
                     await $.wait(2000);
                 }
                 if (!isCompletedSongsiliao) {
-                    console.log('去送饲料');
+                    console.log(`│  🎁 去送饲料`);
                     isCompletedSongsiliao = await songsiliao(j);
                 }
                 if (isCompletedSongsiliao && isCompletedTousiliao) {
-                    console.log('今日已到上限');
+                    console.log(`│  ✅ 今日已到上限`);
                     break;
                 }
             }
+            console.log(`└─ ✅ 饲料互助完成\n`);
         }
     }
+
+    console.log(`┌─ 📊 执行总结`);
+    console.log(`│  ✅ 成功 ${totalOk}/${zmnlxqArr.length}`);
+    console.log(`└─ 完成时间: ${new Date(new Date().getTime() + 8*3600000).toLocaleString()}`);
 
     if (msg) console.log(msg);
 })()
@@ -606,6 +643,48 @@ function getmoyimo(timeout = 2000) {
             timeout
         }, (err, resp, data) => {
             try { console.log(JSON.parse(data).msg); } catch (e) { }
+            finally { resolve(); }
+        });
+    });
+}
+
+function tanxian(timeout = 2000) {
+    return new Promise((resolve) => {
+        $.get({
+            url: `${BASE_URL}/tanxian?safe=${zmnlxq}`,
+            headers: getCommonHeaders(),
+            timeout
+        }, (err, resp, data) => {
+            let msgText = '';
+            let eqid = null;
+            try {
+                const result = JSON.parse(data);
+                if (result.status == 1) {
+                    eqid = result.eqid;
+                    msgText = `探险成功：获得【${result.winname || '未知'}】`;
+                    console.log(`   ${msgText}`);
+                } else {
+                    msgText = result.msg || '探险失败';
+                    console.log(`   ${msgText}`);
+                }
+            } catch (e) { console.log('探险数据异常：', data); }
+            finally { resolve({ msg: msgText, eqid }); }
+        });
+    });
+}
+
+function exchangequips(eqid, timeout = 2000) {
+    return new Promise((resolve) => {
+        $.get({
+            url: `${BASE_URL}/exchangequips?safe=${zmnlxq}&equipid=${eqid}`,
+            headers: getCommonHeaders(),
+            timeout
+        }, (err, resp, data) => {
+            try {
+                const result = JSON.parse(data);
+                if (result.status == 1) console.log(`   穿戴成功（${eqid}）`);
+                else console.log(`   穿戴失败：${result.msg || '未知原因'}`);
+            } catch (e) { console.log('穿戴数据异常：', data); }
             finally { resolve(); }
         });
     });
