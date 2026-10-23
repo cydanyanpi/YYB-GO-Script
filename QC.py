@@ -196,6 +196,7 @@ XWEB_VERSION = "19823"
 TOKEN_CLIENT_ID = "wechatMini"
 TOKEN_CLIENT_SECRET = "secret"
 TOKEN_GRANT_TYPE = "wechat_auth_code"
+TOKEN_GRANT_TYPE_REFRESH = "refresh_token"
 TOKEN_URL = "https://crm.nestlechinese.com/openapi/identityservice/connect/token"
 
 # UA池
@@ -374,6 +375,7 @@ class QueChaoBot:
         self.proxy_info = proxy_info
         self.base_url = "https://crm.nestlechinese.com"
         self.token = None
+        self.refresh_token = ""
         self.ua = get_ua()
         self.client = None
 
@@ -425,7 +427,8 @@ class QueChaoBot:
             res = response.json()
             if res.get("access_token") and res.get("token_type", "Bearer").lower() == "bearer":
                 self.token = res["access_token"]
-                print(f"✅ [{self.server}] 获取token成功 | 模式: {mode}")
+                self.refresh_token = res.get("refresh_token", "")
+                print(f"✅ [登录] [{self.server}] 获取token成功 | 模式: {mode}")
                 return self.token
             else:
                 raise Exception(f"业务错误: {res.get('error', '未知错误')}")
@@ -446,7 +449,8 @@ class QueChaoBot:
                     res = response.json()
                     if res.get("access_token"):
                         self.token = res["access_token"]
-                        print(f"✅ [{self.server}] 直连获取token成功")
+                        self.refresh_token = res.get("refresh_token", "")
+                        print(f"✅ [登录] [{self.server}] 直连获取token成功")
                         return self.token
                     else:
                         raise Exception(f"直连业务错误: {res.get('error', '未知错误')}")
@@ -454,6 +458,62 @@ class QueChaoBot:
                     print(f"❌ [{self.server}] 直连获取token失败 | 原因: {str(e2)}")
 
         return None
+
+    async def refresh_token_by_refresh(self) -> bool:
+        """用refresh_token换新的access_token，不用重新走微信授权码"""
+        if not self.refresh_token:
+            return False
+
+        print(f"🔄 [续期] [{self.server}] 使用refresh_token换新access_token...")
+
+        headers = {
+            "Host": "crm.nestlechinese.com",
+            "Connection": "keep-alive",
+            "User-Agent": self.ua,
+            "xweb_xhr": "1",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "*/*",
+            "Sec-Fetch-Site": "cross-site",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+            "Referer": f"https://servicewechat.com/{APPID}/{APP_VERSION}/page-frame.html",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Language": "zh-CN,zh;q=0.9"
+        }
+
+        form_data = {
+            "client_id": TOKEN_CLIENT_ID,
+            "client_secret": TOKEN_CLIENT_SECRET,
+            "grant_type": TOKEN_GRANT_TYPE_REFRESH,
+            "refresh_token": self.refresh_token
+        }
+
+        try:
+            transport = build_proxy_transport(self.proxy_info) if self.proxy_info else build_direct_transport()
+            async with httpx.AsyncClient(
+                transport=transport,
+                headers=headers,
+                timeout=20.0,
+                http2=True
+            ) as client:
+                response = await client.post(TOKEN_URL, data=form_data)
+
+            if response.status_code != 200:
+                print(f"⚠️ [续期] [{self.server}] refresh_token已失效 (HTTP {response.status_code})")
+                return False
+
+            res = response.json()
+            if res.get("access_token"):
+                self.token = res["access_token"]
+                self.refresh_token = res.get("refresh_token", self.refresh_token)
+                print(f"✅ [续期] [{self.server}] refresh_token续期成功")
+                return True
+            else:
+                print(f"⚠️ [续期] [{self.server}] refresh_token返回异常: {res.get('error', '未知')}")
+                return False
+        except Exception as e:
+            print(f"⚠️ [续期] [{self.server}] refresh_token续期失败: {str(e)}")
+            return False
 
     async def __aenter__(self):
         transport = build_proxy_transport(self.proxy_info) if self.proxy_info else build_direct_transport()
@@ -633,29 +693,39 @@ class QueChaoBot:
             cache = read_token_cache()
             cached = cache.get(ref) or {}
             self.token = cached.get("access_token", "") or None
+            self.refresh_token = cached.get("refresh_token", "") or ""
             used_cache = bool(self.token)
             if self.token:
-                print(f"💾 [{self.server}] [缓存] 使用缓存token")
+                print(f"💾 [缓存] [{self.server}] 使用缓存token")
 
             for attempt in range(2):
                 if attempt == 1 or not self.token:
                     if attempt == 1:
-                        print(f"🔄 [{self.server}] [重登] token失效，重新登录")
-                        cache = read_token_cache()
-                        if ref in cache:
-                            del cache[ref]
+                        print(f"🔄 [重登] [{self.server}] 缓存token失效")
+                        # 先试 refresh_token 续期，不用重新走微信授权码
+                        if await self.refresh_token_by_refresh():
+                            cache = read_token_cache()
+                            cache[ref] = {"access_token": self.token, "refresh_token": self.refresh_token}
                             write_token_cache(cache)
-                    code = await self.get_code()
-                    if not code:
-                        result["error"] = "获取code失败"
-                        return result
-                    self.token = await self.get_token_by_code(code)
-                    if not self.token:
-                        result["error"] = "获取token失败"
-                        return result
-                    cache = read_token_cache()
-                    cache[ref] = {"access_token": self.token}
-                    write_token_cache(cache)
+                            print(f"✅ [续期] [{self.server}] 已用refresh_token换新token，继续执行业务")
+                        else:
+                            # refresh_token 也失效，清缓存重新走完整登录
+                            print(f"🔄 [重登] [{self.server}] refresh_token也失效，重新走微信登录")
+                            cache = read_token_cache()
+                            if ref in cache:
+                                del cache[ref]
+                                write_token_cache(cache)
+                            code = await self.get_code()
+                            if not code:
+                                result["error"] = "获取code失败"
+                                return result
+                            self.token = await self.get_token_by_code(code)
+                            if not self.token:
+                                result["error"] = "获取token失败"
+                                return result
+                            cache = read_token_cache()
+                            cache[ref] = {"access_token": self.token, "refresh_token": self.refresh_token}
+                            write_token_cache(cache)
 
                 # 执行业务
                 async with self:
