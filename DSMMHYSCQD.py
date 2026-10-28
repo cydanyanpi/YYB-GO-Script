@@ -114,8 +114,10 @@ def headers(token: str = "", session_id: str = "") -> dict:
     return h
 
 
-def api_get(url: str, token: str, session_id: str = "") -> dict:
+def api_get(url: str, token: str, session_id: str = "", extra_params: dict = None) -> dict:
     params = {"app_id": APPID, "kdt_id": KDT_ID, "access_token": token}
+    if extra_params:
+        params.update(extra_params)
     try:
         r = requests.get(url, params=params, headers=headers(token, session_id),
                          timeout=30, proxies={"http": None, "https": None})
@@ -228,13 +230,19 @@ class Daishu:
                         continue
 
                 # 查当月签到
-                month = api_get(MONTH_SIGN_URL, self.token, self.session_id)
+                month = api_get(MONTH_SIGN_URL, self.token, self.session_id, {
+                    "checkin_id": CHECKIN_ID,
+                    "year": datetime.now().year,
+                    "month": datetime.now().month,
+                })
                 if month.get("code") == 0:
                     dates = month.get("data", {}).get("checkin_date", [])
                     print(f"📅 [签到] 当月已签: {len(dates)}天")
 
                 # 执行签到
-                sign = api_get(SIGN_URL, self.token, self.session_id)
+                sign = api_get(SIGN_URL, self.token, self.session_id, {
+                    "checkinId": CHECKIN_ID,
+                })
                 if sign.get("code") == 0:
                     d = sign.get("data", {})
                     if d.get("success"):
