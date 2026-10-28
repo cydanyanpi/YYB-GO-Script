@@ -1,4 +1,4 @@
-// name: 飞鹤
+// name: 飞鹤·北纬47°好物
 // cron: 16 15,3 * * *
 const axios = require("axios");
 const crypto = require("crypto");
@@ -137,7 +137,7 @@ function buildUrl(apiPath, query = {}) {
 function logTitle() {
     console.log();
     console.log("╔" + "═".repeat(48) + "╗");
-    console.log("║  🥛 飞鹤会员 自动签到                        ║");
+    console.log("║  🥛 飞鹤·北纬47°好物 自动签到                ║");
     console.log(`║  🕒 启动时间: ${new Date().toLocaleString("zh-CN", { hour12: false }).padEnd(22)}║`);
     console.log(`║  🔢 账号数量: ${String(SERVERS.length).padEnd(22)}║`);
     console.log("╚" + "═".repeat(48) + "╝");
@@ -185,6 +185,8 @@ class Task {
             try {
                 await this.getIndexInfo();
                 await this.signIn();
+                await this.getPoints();
+                await this.doAllTasks();
                 return true;
             } catch (e) {
                 const msg = String(e.message || e);
@@ -297,6 +299,93 @@ class Task {
         }
     }
 
+    async getPoints() {
+        try {
+            const result = await this.request({
+                apiPath: "/api/member/signin/getSignInfo",
+                query: { signType: 1 },
+                allowFail: true,
+            });
+            if (String(result?.code) === "200") {
+                const member = result.data?.memberDetail || {};
+                const points = member.totalPoint ?? "?";
+                console.log(`💰 [积分] 账号[${this.index}] 当前总积分: ${points}`);
+            }
+        } catch (e) {
+            // 积分查询失败不影响主流程
+        }
+    }
+
+    async doAllTasks() {
+        // 获取任务列表
+        const listResult = await this.request({
+            apiPath: "/api/member/signin/getTaskList",
+            allowFail: true,
+        });
+        if (String(listResult?.code) !== "200") {
+            console.log(`ℹ️ [任务] 账号[${this.index}] 任务列表获取失败: ${listResult?.msg || JSON.stringify(listResult)}`);
+            return;
+        }
+        const tasks = listResult.data || [];
+        if (!tasks.length) {
+            console.log(`ℹ️ [任务] 账号[${this.index}] 暂无任务`);
+            return;
+        }
+        console.log(`📋 [任务] 账号[${this.index}] 共 ${tasks.length} 个任务`);
+
+        for (const task of tasks) {
+            const taskName = task.taskName || "未知任务";
+            const taskType = task.taskType || "";
+            const isCompleted = task.isCompleted === true;
+            const totalCount = task.totalCount || 0;
+            const completedCount = task.completedCount || 0;
+            const duration = task.completeTaskDuration || 1;
+
+            if (isCompleted) {
+                console.log(`  ⏭️ [任务] ${taskName}: 已完成，跳过`);
+                continue;
+            }
+
+            const remaining = Math.max(0, totalCount - completedCount);
+            for (let i = 0; i < remaining; i++) {
+                try {
+                    // 开始任务
+                    const start = await this.request({
+                        apiPath: "/api/member/signin/tofinish",
+                        query: { taskType },
+                        allowFail: true,
+                    });
+                    if (start.msg) {
+                        console.log(`  ℹ️ [任务] ${taskName}: ${start.msg}`);
+                        break;
+                    }
+
+                    // 等待
+                    console.log(`  ⏳ [任务] ${taskName}: 等待${duration}秒...`);
+                    await sleep(duration * 1000);
+
+                    // 完成任务
+                    const finish = await this.request({
+                        apiPath: "/api/member/signin/completeTask",
+                        query: { taskType },
+                        allowFail: true,
+                    });
+                    if (finish.msg) {
+                        console.log(`  ✅ [任务] ${taskName}: ${finish.msg}`);
+                    } else if (finish.data?.awardSendPoints) {
+                        console.log(`  🎁 [任务] ${taskName}: +${finish.data.awardSendPoints}积分`);
+                    } else {
+                        console.log(`  ✅ [任务] ${taskName}: 完成`);
+                    }
+                } catch (e) {
+                    console.log(`  ❌ [任务] ${taskName} 异常: ${e.message}`);
+                    break;
+                }
+                await sleep(10000);
+            }
+        }
+    }
+
     async signIn() {
         const finish = await this.request({
             apiPath: "/api/member/signin/tofinish",
@@ -343,7 +432,7 @@ class Task {
     }
     console.log();
     console.log("╔" + "═".repeat(48) + "╗");
-    console.log("║  🏁 飞鹤会员任务执行完成                    ║");
+    console.log("║  🏁 飞鹤·北纬47°好物任务完成                ║");
     console.log(`║  ✅ 成功: ${String(successCount).padEnd(22)}║`);
     console.log(`║  ❌ 失败: ${String(failCount).padEnd(22)}║`);
     console.log(`║  🕒 结束时间: ${new Date().toLocaleString("zh-CN", { hour12: false }).padEnd(22)}║`);
