@@ -567,14 +567,16 @@ def run_account(index: int, total: int, server_entry: str) -> Dict[str, Any]:
             cache = read_token_cache()
             cache[wxid] = {"token": token, "uid": uid}
             write_token_cache(cache)
-            print(f"✅ [登录] 登录成功：uid: {mask_uid(uid)}")
+            print(f"✅ [登录] 登录成功：uid: {mask(uid)}")
 
         probe = api_post(parsed_server, SIGN_URL, token, uid, proxies)
-        probe_msg = str(probe.get("message", ""))
+        probe_msg = str(probe.get("message", "") or probe.get("msg", ""))
         probe_ok = probe.get("success", False) or probe.get("status", "1") == "0"
-        auth_like = any(k in probe_msg for k in ("登录", "未登录", "授权", "失效"))
+        status = str(probe.get("status", ""))
+        # token失效：status=-2/-1，或msg含登录/失效关键词
+        auth_like = status in ("-2", "-1", "401", "403") or any(k in probe_msg for k in ("登录", "未登录", "授权", "失效", "token"))
         if not probe_ok and auth_like and attempt == 0 and used_cache:
-            print(f"🔄 [重登] 缓存token失效：{probe_msg}")
+            print(f"🔄 [重登] 缓存token失效(status={status})，重新登录...")
             continue
         break
 
