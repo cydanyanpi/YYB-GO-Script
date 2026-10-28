@@ -144,6 +144,7 @@ class Task {
         this.task = null;
         this.record = null;
         this.success = false;
+        this._tokenDead = false;
     }
 
     async run() {
@@ -152,10 +153,6 @@ class Task {
             if (cached) {
                 this.applyToken(cached);
                 console.log(`💾 [缓存] 账号[${this.index}] 使用缓存token`);
-                if (!(await this.checkToken())) {
-                    this.removeCachedToken();
-                    console.log(`🔄 [重登] 账号[${this.index}] 缓存token失效，重新登录`);
-                }
             }
 
             if (!this.token) {
@@ -163,16 +160,31 @@ class Task {
                 if (!this.token) return;
             }
 
-            await this.getCustomerDetails();
-            await this.getIntegral();
-            await this.findCheckTask();
-            await this.queryRecord();
-            await this.signIn();
-            await this.getIntegral();
+            await this.runBusiness();
+
+            // 业务执行中检测到登录失效 → 清缓存重登重试一次
+            if (this._tokenDead) {
+                console.log(`🔄 [重登] 账号[${this.index}] 业务返回登录失效，清除缓存重新登录并重试一次`);
+                this.removeCachedToken();
+                await this.loginByWxCode();
+                if (this.token) {
+                    this._tokenDead = false;
+                    await this.runBusiness();
+                }
+            }
             this.success = true;
         } catch (e) {
             console.log(`❌ [异常] 账号[${this.index}] ${e.message || e}`);
         }
+    }
+
+    async runBusiness() {
+        await this.getCustomerDetails();
+        await this.getIntegral();
+        await this.findCheckTask();
+        await this.queryRecord();
+        await this.signIn();
+        await this.getIntegral();
     }
 
     getCachedToken() {
@@ -279,7 +291,7 @@ class Task {
             console.log(`👤 [用户] 账号[${this.index}] 会员: ${data?.nickName || data?.nickname || "未知"} ${maskPhone(data?.mobile || "")}`);
         } catch (e) {
             console.log(`❌ [用户] 账号[${this.index}] 查询会员失败: ${e.message || e}`);
-            if (isTokenError(e.message || e)) this.removeCachedToken();
+            if (isTokenError(e.message || e)) this._tokenDead = true;
         }
     }
 
@@ -296,21 +308,23 @@ class Task {
     async findCheckTask() {
         try {
             const data = await this.request({ apiPath: "/app/jingyoujia/taskContinuousRecord/findCheckTask" });
-            if (!data || !data.id) {
+            // id 可能为 null，但只要有 taskName 或积分配置就说明有签到活动
+            if (!data || (!data.id && !data.taskName && !data.showIntegralConfigs)) {
                 console.log(`ℹ️ [签到] 账号[${this.index}] 当前无签到活动`);
                 return;
             }
             this.task = data;
-            const start = String(data.startTime || "").slice(0, 10);
-            const end = String(data.endTime || "").slice(0, 10);
-            console.log(`📅 [签到] 账号[${this.index}] 签到活动: taskId=${data.id}${start || end ? ` ${start}-${end}` : ""}`);
+            console.log(`📅 [签到] 账号[${this.index}] 签到活动: ${data.taskName || "每日签到"} (${data.betweenDays || 7}天周期)`);
         } catch (e) {
             console.log(`❌ [签到] 账号[${this.index}] 获取签到活动失败: ${e.message || e}`);
         }
     }
 
     async queryRecord() {
-        if (!this.task?.id) return;
+        if (!this.task?.id) {
+            // id 为 null 时，签到状态可能不需要查记录，直接签
+            return;
+        }
         try {
             const data = await this.request({
                 apiPath: "/app/jingyoujia/taskContinuousRecord/queryRecord",
@@ -319,30 +333,30 @@ class Task {
             this.record = data || {};
             console.log(`📅 [签到] 账号[${this.index}] 签到状态: 连续${data?.continuousNum ?? 0}天 今日=${data?.todayFinish ? "已签" : "未签"}`);
         } catch (e) {
-            console.log(`❌ [签到] 账号[${this.index}] 查询签到状态失败: ${e.message || e}`);
+            // 查询失败不影响签到
         }
     }
 
     async signIn() {
-        if (!this.task?.id) return;
+        if (!this.task) return;
         if (this.record?.todayFinish) {
             console.log(`✅ [签到] 账号[${this.index}] 今日已签到`);
             return;
         }
         try {
+            // id 为 null 时不传 taskId，否则传
+            const bodyData = this.task.id ? { taskId: this.task.id } : {};
             const data = await this.request({
                 method: "POST",
                 apiPath: "/app/jingyoujia/taskContinuousRecord",
-                data: {
-                    v1: aesEncrypt(JSON.stringify({ taskId: this.task.id })),
-                },
+                data: { v1: aesEncrypt(JSON.stringify(bodyData)) },
             });
             const integral = data?.currentSignIntegral ?? data?.integral ?? "";
             console.log(`✅ [签到] 账号[${this.index}] 签到成功${integral !== "" ? `: +${integral}积分` : ""}`);
             await this.finishTask();
         } catch (e) {
             const message = String(e.message || e);
-            if (/已签到|重复|todayFinish/.test(message)) {
+            if (/已签到|重复|todayFinish|已完成/.test(message)) {
                 console.log(`✅ [签到] 账号[${this.index}] 今日已签到`);
                 return;
             }
@@ -351,7 +365,7 @@ class Task {
                 return;
             }
             console.log(`❌ [签到] 账号[${this.index}] 签到失败: ${message}`);
-            if (isTokenError(message)) this.removeCachedToken();
+            if (isTokenError(message)) this._tokenDead = true;
         }
     }
 
