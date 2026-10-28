@@ -165,9 +165,20 @@ class FeiheMom {
         if (method === "GET") opts.params = data || {};
         else opts.data = data === undefined ? {} : data;
         const res = await request(opts);
-        const ok = res.status === 200 && ["00000", "000000", "A00002"].includes(String(res.data?.code));
-        if (!ok && !allowFail) throw new Error(`HTTP ${res.status}: ${short(res.data)}`);
-        return res.data;
+        const body = res.data || {};
+        const code = String(body.code || "");
+        const msg = String(body.msg || body.message || "");
+
+        // 检测token失效
+        if (code === "A00004" || /unauthorized|未登录|登录已过期|token/i.test(msg)) {
+            const err = new Error(`token失效: ${msg || code}`);
+            err.tokenInvalid = true;
+            throw err;
+        }
+
+        const ok = res.status === 200 && ["00000", "000000", "A00002"].includes(code);
+        if (!ok && !allowFail) throw new Error(`HTTP ${res.status}: ${short(body)}`);
+        return body;
     }
 
     async login() {
@@ -241,7 +252,12 @@ class FeiheMom {
             data: { activityId, mockTime: Date.now() },
             allowFail: true,
         });
-        console.log(`✅ [签到] 账号[${this.index}] 签到完成: ${short(sign)}`);
+        const signCode = String(sign?.code || "");
+        if (["00000", "000000", "A00002"].includes(signCode)) {
+            console.log(`✅ [签到] 账号[${this.index}] 签到成功`);
+        } else {
+            console.log(`⚠️ [签到] 账号[${this.index}] 签到结果: ${sign?.msg || signCode}`);
+        }
     }
 }
 
@@ -256,8 +272,8 @@ async function runAccount(openid, index, total) {
             await runner.sign();
             return true;
         } catch (e) {
-            if (attempt === 0 && usedCache) {
-                console.log(`🔄 [重登] 账号[${runner.index}] 缓存token失效，清除缓存重新登录...`);
+            if (e.tokenInvalid && attempt === 0 && usedCache) {
+                console.log(`🔄 [重登] 账号[${runner.index}] token失效(${e.message})，清除缓存重新登录...`);
                 const c = readTokenCache();
                 delete c[openid];
                 writeTokenCache(c);
