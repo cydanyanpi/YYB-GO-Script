@@ -3,566 +3,232 @@
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
-const { SocksProxyAgent } = require('socks-proxy-agent');
-const { HttpsProxyAgent } = require('https-proxy-agent');
-const { HttpProxyAgent } = require('http-proxy-agent');
+
+// ====================== YYB Go 账号 ======================
+const SERVERS = (process.env.YYB_SERVER || "")
+    .split(/\r?\n/)
+    .map(s => s.trim())
+    .filter(Boolean);
+if (!SERVERS.length) {
+    console.error("❌ 未配置环境变量 YYB_SERVER");
+    process.exit(1);
+}
+
+const APPID = "wxb33ed03c6c715482";
+const API_BASE = "https://xiaodian.miyatech.com/api";
 
 // Token 缓存
 const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
 const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "sdl_token_cache.json");
+try { fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true }); } catch (e) {}
 
 function readTokenCache() {
     try {
         if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
-        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf8")) || {};
     } catch { return {}; }
 }
-
 function writeTokenCache(cache) {
-    try {
-        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
-        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
-    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
+    try { fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf8"); } catch (e) {}
 }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// 强制全局禁用系统代理环境变量，避免干扰
-delete process.env.HTTP_PROXY;
-delete process.env.HTTPS_PROXY;
-delete process.env.http_proxy;
-delete process.env.https_proxy;
+const HEADERS = {
+    "HH-FROM": "20230130307725",
+    "HH-APP": APPID,
+    "HH-VERSION": "0.6.1",
+    "X-VERSION": "2.3.5",
+    "HH-CI": "saas-wechat-app",
+    "appPublishType": "1",
+    "componentSend": "1",
+    "content-type": "application/json;charset=UTF-8",
+    "Referer": `https://servicewechat.com/${APPID}/72/page-frame.html`,
+};
 
-// ===================== 配置项 =====================
-// PushPlus 通知Token（青龙环境变量）
-const PLUSPLUS_TOKEN = process.env.PLUSPLUS_TOKEN || "";
-
-// 从环境变量 YYB_SERVER 读取内网服务器，支持换行分隔多个IP:端口
-let SERVERS = [];
-if (process.env.YYB_SERVER) {
-    SERVERS = process.env.YYB_SERVER
-        .split(/\r?\n/) // 兼容Windows换行\r\n、Linux换行\n
-        .map(item => item.trim())
-        .filter(item => item.length > 0); // 过滤空行、纯空格行
-}
-// 校验服务器列表，无配置直接终止脚本
-if (SERVERS.length === 0) {
-    console.error("未配置环境变量 YYB_SERVER，请设置后重试（格式：地址@微信账号标识，多行换行）");
-    process.exit(1);
-}
-console.log(`✅ 读取到 ${SERVERS.length} 个 YYB Go 账号`);
-
-// 品赞代理配置（青龙环境变量）
-const PROXY_API = process.env.PROXY_API || ""; // 代理提取API链接
-const PROXY_TYPE = process.env.PROXY_TYPE || "http"; // 代理类型: http 或 socks5
-const PROXY_RETRY_TIMES = 3; // 单个账号代理获取重试次数
-const PROXY_VALIDATE_URL = "http://httpbin.org/ip"; // 代理验证地址
-// 核心开关：每个账号独立获取专属代理（true=每个账号一个新IP，false=所有账号共用一个IP）
-const ENABLE_PER_ACCOUNT_PROXY = true;
-// 账号间代理获取间隔（毫秒，避免频繁调用代理API被限流）
-const PROXY_FETCH_INTERVAL = 3000;
-// 兜底开关：代理请求失败后，自动切换直连重试
-const ENABLE_DIRECT_FALLBACK = true;
-
-// 固定配置
-const APPID = "wxb33ed03c6c715482";
-
-// UA池（随机一个）
-const USER_AGENT_LIST = [
-    "Mozilla/5.0 (Linux; Android 14; 2512BPNDAC Build/UKQ1.230917.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/146.0.7680.153 Mobile Safari/537.36 XWEB/1460043 MMWEBSDK/20251006 MiniProgramEnv/android",
-    "Mozilla/5.0 (Linux; Android 13; Redmi K60 Build/TKQ1.221114.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/130.0.6723.102 Mobile Safari/537.36 XWEB/1300003 MMWEBSDK/20250901 MiniProgramEnv/android",
-    "Mozilla/5.0 (Linux; Android 12; MI 11 Build/SKQ1.211006.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/125.0.6422.111 Mobile Safari/537.36 XWEB/1250002 MMWEBSDK/20250801 MiniProgramEnv/android",
-    "Mozilla/5.0 (Linux; Android 14; Honor Magic6 Build/UP1.240507.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/145.0.7560.128 Mobile Safari/537.36 XWEB/1450004 MMWEBSDK/20251001 MiniProgramEnv/android"
-];
-
-// ===================== 工具函数 =====================
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function random(min, max) {
-    return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
-function getUA() {
-    return USER_AGENT_LIST[Math.floor(Math.random() * USER_AGENT_LIST.length)];
-}
-
-// ====================== 品赞IP代理系统（每个账号独立获取）======================
-// 解析代理API响应（支持品赞等多种格式）
-function parseProxyResponse(text) {
-    text = text.trim();
-    if (!text) return null;
-
-    try {
-        const data = JSON.parse(text);
-        let proxyObj = null;
-        
-        // 品赞标准格式
-        if (data.data && Array.isArray(data.data) && data.data.length > 0) {
-            proxyObj = data.data[0];
-        } 
-        // 普通JSON格式
-        else if (data.ip && data.port) {
-            proxyObj = data;
-        }
-        // 嵌套格式
-        else if (data.result && data.result.ip && data.result.port) {
-            proxyObj = data.result;
-        }
-
-        if (proxyObj) {
-            return {
-                host: proxyObj.ip,
-                port: proxyObj.port,
-                username: proxyObj.user || proxyObj.username || "",
-                password: proxyObj.pass || proxyObj.password || ""
-            };
-        }
-    } catch (e) {}
-
-    // 纯文本格式 ip:port 或 ip:port:user:pass
-    if (text.includes(":")) {
-        const parts = text.split(":");
-        if (parts.length >= 2) {
-            return {
-                host: parts[0],
-                port: parseInt(parts[1]),
-                username: parts[2] || "",
-                password: parts[3] || ""
-            };
-        }
-    }
-
-    return null;
-}
-
-// 生成代理Agent（支持HTTP/SOCKS5）
-function buildProxyAgent(proxyInfo) {
-    if (!proxyInfo) return null;
-    
-    const { host, port, username, password } = proxyInfo;
-    let auth = "";
-    if (username && password) {
-        auth = `${encodeURIComponent(username)}:${encodeURIComponent(password)}@`;
-    }
-
-    try {
-        if (PROXY_TYPE === "socks5") {
-            const proxyUrl = `socks5://${auth}${host}:${port}`;
-            console.log(`🔧 生成SOCKS5代理：socks5://${auth}${host}:${port}`);
-            return {
-                httpAgent: new SocksProxyAgent(proxyUrl),
-                httpsAgent: new SocksProxyAgent(proxyUrl)
-            };
-        } else {
-            // HTTP/HTTPS代理
-            const httpProxyUrl = `http://${auth}${host}:${port}`;
-            const httpsProxyUrl = `http://${auth}${host}:${port}`;
-            console.log(`🔧 生成HTTP代理：${httpProxyUrl}`);
-            return {
-                httpAgent: new HttpProxyAgent(httpProxyUrl),
-                httpsAgent: new HttpsProxyAgent(httpsProxyUrl)
-            };
-        }
-    } catch (e) {
-        console.log(`❌ 生成代理Agent失败：${e.message}`);
-        return null;
-    }
-}
-
-// 验证代理是否可用
-async function validateProxy(agent) {
-    if (!agent) return false;
-    try {
-        const axiosConfig = {
-            method: "get",
-            url: PROXY_VALIDATE_URL,
-            timeout: 15000,
-            ...agent,
-            maxRedirects: 5
-        };
-        const response = await axios(axiosConfig);
-        const isSuccess = response.status === 200;
-        if (isSuccess) {
-            console.log(`✅ 代理验证通过，出口IP：${response.data?.origin || "未知"}`);
-        }
-        return isSuccess;
-    } catch (e) {
-        console.log(`⚠️ 代理验证失败，原因：${e.message}`);
-        return false;
-    }
-}
-
-// 获取有效代理（每个账号独立调用）
-async function getValidProxy(accountName) {
-    if (!PROXY_API) {
-        console.log(`ℹ️ [${accountName}] 未配置代理API，使用直连`);
-        return null;
-    }
-
-    console.log(`🔌 [${accountName}] 正在从品赞API获取专属代理 (${PROXY_TYPE})...`);
-    
-    for (let i = 0; i < PROXY_RETRY_TIMES; i++) {
-        try {
-            // 获取代理API用直连，避免循环依赖
-            const response = await axios.get(PROXY_API, { 
-                timeout: 15000,
-                proxy: false
-            });
-            const proxyInfo = parseProxyResponse(response.data);
-            
-            if (!proxyInfo) {
-                console.log(`⚠️ [${accountName}] 第${i+1}次获取代理失败：响应格式无法解析`);
-                continue;
-            }
-
-            console.log(`✅ [${accountName}] 提取到专属代理：${proxyInfo.host}:${proxyInfo.port}`);
-            
-            // 生成代理Agent并验证
-            const agent = buildProxyAgent(proxyInfo);
-            const isValid = await validateProxy(agent);
-            if (isValid) {
-                return agent;
-            } else {
-                console.log(`⚠️ [${accountName}] 第${i+1}次获取的代理不可用，正在重试...`);
-            }
-        } catch (e) {
-            console.log(`⚠️ [${accountName}] 第${i+1}次获取代理异常：${e.message}`);
-        }
-        
-        if (i < PROXY_RETRY_TIMES - 1) {
-            await new Promise(r => setTimeout(r, 2000));
-        }
-    }
-
-    console.log(`❌ [${accountName}] 连续多次获取代理失败，使用直连`);
-    return null;
-}
-
-// 为业务请求添加代理配置
-function addProxyToAxiosConfig(axiosConfig, proxyAgent) {
-    if (!proxyAgent) return axiosConfig;
-    return {
-        ...axiosConfig,
-        ...proxyAgent,
-        timeout: axiosConfig.timeout || 20000
-    };
-}
-
-// ===================== PushPlus通知函数 =====================
-async function sendPlusPlusNotification(title, content) {
-    if (!PLUSPLUS_TOKEN) return;
-    try {
-        await axios.post("https://www.pushplus.plus/send", {
-            token: PLUSPLUS_TOKEN,
-            title: title,
-            content: content,
-            template: "txt"
-        }, { timeout: 5000 });
-        console.log("✅ 通知推送成功");
-    } catch (e) {
-        console.log("❌ 通知推送失败：", e.message);
-    }
-}
-
-// ===================== 业务逻辑函数 =====================
-// 获取code 【强制直连，不走代理】
-function parseYybGoEntry(rawValue) {
-    const value = String(rawValue || "").trim();
-    if (!value) return { server: "", ref: "" };
-
-    const atIndex = value.indexOf("@");
-    if (atIndex === -1) {
-        console.log(`❌ [配置] YYB_SERVER 格式应为 地址@微信账号标识，当前值: ${value}`);
-        return { server: "", ref: "" };
-    }
-
-    let server = value.slice(0, atIndex).trim();
-    const ref = value.slice(atIndex + 1).trim();
-
-    if (server.startsWith("http://")) {
-        server = server.slice(7);
-    } else if (server.startsWith("https://")) {
-        server = server.slice(8);
-    }
+function parseYybGoEntry(raw) {
+    const v = String(raw || "").trim();
+    if (!v) return { server: "", ref: "" };
+    const i = v.indexOf("@");
+    if (i === -1) return { server: "", ref: "" };
+    let server = v.slice(0, i).trim();
+    const ref = v.slice(i + 1).trim();
+    if (server.startsWith("http://")) server = server.slice(7);
+    else if (server.startsWith("https://")) server = server.slice(8);
     server = server.replace(/\/+$/, "");
-
-    if (!server || !ref) {
-        console.log(`❌ [配置] YYB_SERVER 缺少地址或微信账号标识，当前值: ${value}`);
-        return { server: "", ref: "" };
-    }
-
     return { server, ref };
 }
 
 async function getCode(server) {
-    const { server: parsedServer, ref } = parseYybGoEntry(server);
-    if (!parsedServer || !ref) return null;
-
-    const url = `http://${parsedServer}/wxapp/getCode`;
-
+    const { server: s, ref } = parseYybGoEntry(server);
+    if (!s || !ref) return null;
     try {
-        const { data } = await axios.post(url, {
-            ref,
-            app_id: APPID
-        }, {
-            timeout: 20000,
-            proxy: false
-        });
+        const { data } = await axios.post(`http://${s}/wxapp/getCode`, { ref, app_id: APPID }, { timeout: 20000, proxy: false });
         const code = data?.data?.result?.code;
         if (data?.code !== 0 || !code) {
-            console.log(`❌ ${parsedServer} 获取code失败: ${JSON.stringify(data)}`);
+            console.log(`❌ [取码] 获取code失败: ${JSON.stringify(data).slice(0, 100)}`);
             return null;
         }
-        console.log(`✅ ${parsedServer} 获取code成功`);
+        console.log(`✅ [取码] 获取code成功`);
         return code;
     } catch (e) {
-        console.log(`❌ ${parsedServer} 获取code异常: ${e.message}`);
+        console.log(`❌ [取码] 获取code异常: ${e.message}`);
         return null;
     }
 }
 
+// ====================== 输出美化 ======================
+function logTitle() {
+    console.log();
+    console.log("╔" + "═".repeat(48) + "╗");
+    console.log("║  🥃 三得利 自动签到                          ║");
+    console.log(`║  🕒 启动时间: ${new Date().toLocaleString("zh-CN", { hour12: false }).padEnd(22)}║`);
+    console.log(`║  🔢 账号数量: ${String(SERVERS.length).padEnd(22)}║`);
+    console.log("╚" + "═".repeat(48) + "╝");
+}
+function logAccountHeader(index, total, server) {
+    const { ref } = parseYybGoEntry(server);
+    console.log();
+    console.log("┌" + "─".repeat(48) + "┐");
+    console.log(`│  🧩 账号 ${index} / ${total}${" ".repeat(26)}│`);
+    console.log(`│  🔑 标识: ${String(ref || "-").padEnd(41)}│`);
+    console.log("└" + "─".repeat(48) + "┘");
+}
+function logEnd(successCount, failCount) {
+    console.log();
+    console.log("╔" + "═".repeat(48) + "╗");
+    console.log("║  🏁 三得利任务完成                            ║");
+    console.log(`║  ✅ 成功: ${String(successCount).padEnd(22)}║`);
+    console.log(`║  ❌ 失败: ${String(failCount).padEnd(22)}║`);
+    console.log(`║  🕒 结束时间: ${new Date().toLocaleString("zh-CN", { hour12: false }).padEnd(22)}║`);
+    console.log("╚" + "═".repeat(48) + "╝");
+}
 
-// 登录 【走代理+直连兜底】
-async function wxLogin(jsCode, UA, proxyAgent, server) {
-    const baseConfig = {
-        method: 'post',
-        url: 'https://xiaodian.miyatech.com/api/user/login/wx-jc',
-        headers: {
-            'content-type': 'application/json;charset=UTF-8',
-            'HH-FROM': '20230130307725',
-            'HH-APP': APPID,
-            'HH-VERSION': '0.6.1',
-            'X-VERSION': '2.3.5',
-            'HH-CI': 'saas-wechat-app',
-            'appPublishType': '1',
-            'componentSend': '1',
-            'User-Agent': UA,
-            'Referer': `https://servicewechat.com/${APPID}/72/page-frame.html`
-        },
-        data: {
-            jsCode: jsCode,
-            clientId: "saas-wechat-app",
-            myUnionId: "",
-            appPublishType: 1
-        },
-        timeout: 20000
-    };
+class SanDele {
+    constructor(server, index) {
+        this.server = server;
+        this.index = index;
+        this.token = "";
+    }
 
-    try {
-        let response = null;
-        // 优先代理
-        if (proxyAgent) {
-            console.log(`🌐 [${server}] 正在使用专属代理发起登录请求...`);
-            try {
-                response = await axios(addProxyToAxiosConfig(baseConfig, proxyAgent));
-            } catch (e) {
-                console.log(`⚠️ [${server}] 代理登录失败，切换直连重试...`);
-                response = await axios({ ...baseConfig, proxy: false });
-            }
-        } else {
-            response = await axios({ ...baseConfig, proxy: false });
+    async api(path, body = {}, auth = true) {
+        const headers = { ...HEADERS };
+        if (auth && this.token) headers["Authorization"] = `Bearer ${this.token}`;
+        const res = await axios.post(`${API_BASE}${path}`, body, {
+            headers, timeout: 20000, proxy: false, validateStatus: () => true,
+        });
+        return res.data;
+    }
+
+    async login() {
+        const code = await getCode(this.server);
+        if (!code) return false;
+        const res = await this.api("/user/login/wx-jc", {
+            jsCode: code, clientId: "saas-wechat-app", myUnionId: "", appPublishType: 1,
+        }, false);
+        if (res?.code !== 200 || !res.data?.tokenInfo?.access_token) {
+            console.log(`❌ [登录] 账号[${this.index}] 登录失败: ${res?.msg || "未知"}`);
+            return false;
         }
-
-        return response.data;
-    } catch (e) {
-        console.log(`❌ [${server}] 登录异常: ${e.message}`);
-        return null;
+        this.token = res.data.tokenInfo.access_token;
+        const c = readTokenCache();
+        c[this.server] = { access_token: this.token };
+        writeTokenCache(c);
+        console.log(`✅ [登录] 账号[${this.index}] 登录成功`);
+        return true;
     }
-}
 
-// 通用请求 【走代理+直连兜底】
-async function commonPost(url, body, token, UA, proxyAgent, server) {
-    const baseConfig = {
-        method: 'post',
-        url: `https://xiaodian.miyatech.com/api${url}`,
-        headers: {
-            'content-type': 'application/json;charset=UTF-8',
-            'HH-FROM': '20230130307725',
-            'HH-APP': APPID,
-            'HH-VERSION': '0.6.1',
-            'X-VERSION': '2.3.5',
-            'HH-CI': 'saas-wechat-app',
-            'appPublishType': '1',
-            'componentSend': '1',
-            'User-Agent': UA,
-            'Referer': `https://servicewechat.com/${APPID}/72/page-frame.html`,
-            'Authorization': `Bearer ${token}`
-        },
-        data: body,
-        timeout: 20000
-    };
-
-    try {
-        let response = null;
-        // 优先代理
-        if (proxyAgent) {
-            try {
-                response = await axios(addProxyToAxiosConfig(baseConfig, proxyAgent));
-            } catch (e) {
-                console.log(`⚠️ [${server}] 代理请求失败，切换直连重试...`);
-                response = await axios({ ...baseConfig, proxy: false });
-            }
-        } else {
-            response = await axios({ ...baseConfig, proxy: false });
+    async signIn() {
+        const res = await this.api("/coupon/auth/signIn", { miniappId: 159 });
+        if (res?.code === 200) {
+            console.log(`✅ [签到] 账号[${this.index}] 签到成功: ${res.data?.integralToastText || ""}`);
+            return true;
         }
-
-        return response.data;
-    } catch (e) {
-        console.log(`❌ [${server}] 请求异常: ${e.message}`);
-        return null;
-    }
-}
-
-// 单个账号执行逻辑
-async function runAccount(server, globalProxyAgent) {
-    let result = {
-        server: server,
-        success: false,
-        signMsg: "",
-        collectMsg: "",
-        score: 0,
-        error: "",
-        proxyStatus: "未使用代理"
-    };
-
-    console.log(`\n===== 三得利 - ${server} 账号 =====`);
-    const UA = getUA();
-
-    // 核心逻辑：每个账号独立获取专属代理
-    let proxyAgent = globalProxyAgent;
-    if (ENABLE_PER_ACCOUNT_PROXY) {
-        proxyAgent = await getValidProxy(server);
-        result.proxyStatus = proxyAgent ? "使用专属代理" : "使用直连";
-        // 代理获取后加间隔，避免频繁请求
-        await sleep(PROXY_FETCH_INTERVAL);
+        const msg = res?.msg || "";
+        // 正常的"已签到"状态，不算失败也不算token失效
+        if (/已签到|已获得|已签过|重复签到|今日已签/.test(msg)) {
+            console.log(`ℹ️ [签到] 账号[${this.index}] ${msg}`);
+            return true;
+        }
+        // 真token失效才抛错重登
+        if (res?.code === 401 || /未登录|登录已过期|token.*(无效|过期|失效)|请重新登录/i.test(msg)) {
+            const err = new Error(msg || "token失效");
+            err.tokenInvalid = true;
+            throw err;
+        }
+        console.log(`⚠️ [签到] 账号[${this.index}] 签到结果: ${msg || "未知"}`);
+        return false;
     }
 
-    try {
-        // 启动延迟（防风控）
-        let startDelay = random(2000, 6000);
-        console.log(`⏳ [${server}] 启动延迟 ${startDelay / 1000}s`);
-        await sleep(startDelay);
+    async collect() {
+        const res = await this.api("/user/auth/user/collect/record/save", { sceneValue: "1104" });
+        if (res?.code === 200) {
+            console.log(`✅ [收藏] 账号[${this.index}] 收藏成功: ${res.data?.integralToastText || ""}`);
+            return;
+        }
+        const msg = res?.msg || "";
+        if (/已获取|已领取|已完成|已收藏/.test(msg)) {
+            console.log(`ℹ️ [收藏] 账号[${this.index}] ${msg}`);
+        } else {
+            console.log(`⚠️ [收藏] 账号[${this.index}] 收藏结果: ${msg || "未知"}`);
+        }
+    }
 
-        let token = null;
-        let usedCache = false;
+    async getScore() {
+        const res = await this.api("/user/member/info", {});
+        const score = res?.data?.currentScore ?? "未知";
+        console.log(`💰 [积分] 账号[${this.index}] 当前积分: ${score}`);
+    }
 
-        // 尝试缓存（不过期，签到失败自动重登）
+    async run() {
+        // 读缓存
         const cache = readTokenCache();
-        const cached = cache[server] || {};
+        const cached = cache[this.server] || {};
         if (cached.access_token) {
-            token = cached.access_token;
-            usedCache = true;
-            console.log(`💾 [${server}] 使用缓存token`);
+            this.token = cached.access_token;
+            console.log(`💾 [缓存] 账号[${this.index}] 使用缓存token`);
         }
 
         for (let attempt = 0; attempt < 2; attempt++) {
-            if (attempt === 1 || !token) {
+            try {
                 if (attempt === 1) {
-                    console.log(`🔄 [${server}] token失效，重新登录...`);
+                    console.log(`🔄 [重登] 账号[${this.index}] token失效，清除缓存重新登录...`);
                     const c = readTokenCache();
-                    delete c[server];
+                    delete c[this.server];
                     writeTokenCache(c);
+                    if (!await this.login()) return false;
                 }
-                let code = await getCode(server);
-                if (!code) {
-                    result.error = "获取code失败";
-                    return result;
+                if (!this.token) {
+                    if (!await this.login()) return false;
                 }
-                let login = await wxLogin(code, UA, proxyAgent, server);
-                if (!login || login.code != 200) {
-                    result.error = login?.msg || "登录失败";
-                    return result;
+
+                await sleep(1000);
+                await this.signIn();
+                await sleep(1000);
+                await this.collect();
+                await sleep(1000);
+                await this.getScore();
+                return true;
+            } catch (e) {
+                if (e.tokenInvalid && attempt === 0) {
+                    console.log(`🔄 [重登] 账号[${this.index}] token失效(${e.message})，准备重新登录...`);
+                    continue;
                 }
-                token = login.data.tokenInfo.access_token;
-                console.log(`✅ [${server}] 登录成功`);
-                const c = readTokenCache();
-                c[server] = { access_token: token };
-                writeTokenCache(c);
+                console.log(`❌ [执行] 账号[${this.index}] 失败: ${e.message}`);
+                return false;
             }
-
-            await sleep(random(3000, 8000));
-
-            // 签到
-            let sign = await commonPost('/coupon/auth/signIn', {"miniappId":159}, token, UA, proxyAgent, server);
-            if (sign?.code == 200) {
-                result.signMsg = `签到成功：${sign.data.integralToastText}`;
-                console.log(`✅ [${server}] 签到成功：${sign.data.integralToastText}`);
-            } else if (attempt === 0 && usedCache) {
-                console.log(`⚠️ [${server}] 签到返回: ${sign?.msg}，判定token失效`);
-                continue;
-            } else {
-                result.signMsg = `签到失败：${sign?.msg || "未知错误"}`;
-                console.log(`❌ [${server}] 签到失败：${sign?.msg || "未知错误"}`);
-            }
-
-            await sleep(random(2000, 5000));
-
-            // 收藏
-            let save = await commonPost('/user/auth/user/collect/record/save', {"sceneValue":"1104"}, token, UA, proxyAgent, server);
-            if (save?.code == 200) {
-                result.collectMsg = `收藏成功：${save.data.integralToastText}`;
-                console.log(`✅ [${server}] 收藏成功：${save.data.integralToastText}`);
-            } else {
-                result.collectMsg = `收藏失败：${save?.msg || "未知错误"}`;
-                console.log(`❌ [${server}] 收藏失败：${save?.msg || "未知错误"}`);
-            }
-            await sleep(random(2000, 5000));
-
-            // 查询积分
-            let info = await commonPost('/user/member/info', {}, token, UA, proxyAgent, server);
-            result.score = info?.data?.currentScore || 0;
-            console.log(`🎯 [${server}] 当前积分：${result.score}`);
-
-            result.success = true;
-            console.log(`✅ [${server}] 账号执行完成`);
-            break;
         }
-
-    } catch (e) {
-        result.error = e.message;
-        console.log(`❌ [${server}] 执行异常：`, e.message);
+        return false;
     }
-
-    return result;
 }
 
-// ===================== 主程序 =====================
 (async () => {
-    console.log('===== 三得利动态code签到（环境变量YYB_SERVER读取内网+双端口+每个账号独立代理版）=====\n');
-
-    // 兼容旧逻辑：如果关闭了单账号代理，就全局获取一个共用代理
-    let globalProxyAgent = null;
-    if (!ENABLE_PER_ACCOUNT_PROXY) {
-        globalProxyAgent = await getValidProxy("全局共用");
+    logTitle();
+    let successCount = 0, failCount = 0;
+    for (let i = 0; i < SERVERS.length; i++) {
+        logAccountHeader(i + 1, SERVERS.length, SERVERS[i]);
+        const ok = await new SanDele(SERVERS[i], i + 1).run();
+        if (ok) successCount++; else failCount++;
+        await sleep(1500);
     }
-
-    const results = [];
-    // 顺序执行所有服务器
-    for (const server of SERVERS) {
-        const res = await runAccount(server, globalProxyAgent);
-        results.push(res);
-        // 账号间间隔2秒
-        await sleep(2000);
-    }
-
-    // 汇总结果并推送通知
-    let notifyContent = "### 三得利多账号任务执行结果\n";
-    results.forEach(res => {
-        notifyContent += `\n#### ${res.server}
-- 代理状态：${res.proxyStatus}
-- 执行状态：${res.success ? "成功" : "失败"}
-`;
-        if (res.success) {
-            notifyContent += `- 签到结果：${res.signMsg}
-- 收藏结果：${res.collectMsg}
-- 当前积分：${res.score}分
-`;
-        } else {
-            notifyContent += `- 失败原因：${res.error}
-`;
-        }
-    });
-
-    await sendPlusPlusNotification("三得利多账号任务完成", notifyContent);
-    console.log('\n===== 所有账号执行完成 =====');
-})();
+    logEnd(successCount, failCount);
+})().catch(e => console.log(`❌ 脚本异常: ${e.message}`));
