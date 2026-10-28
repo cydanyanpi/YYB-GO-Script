@@ -216,9 +216,118 @@ class FeiheMom {
         const member = await this.api({ path: "/c/user/memberInfo", allowFail: true });
         const user = await this.api({ path: "/p/user/userInfo", allowFail: true });
         const data = member?.data || user?.data || {};
+        this.memberId = data.memberId || data.member_id || data.crmId || data.id || "";
+        this.gameOpenId = this.memberId;
+        this.nickname = data.nickname || data.nickName || data.mobile || "";
         const score = data.score || data.points || data.integral || data.availableScore || data.totalScore;
-        const name = data.nickName || data.nickname || data.memberName || data.mobile || data.phone || "";
-        console.log(`👤 [用户] 账号[${this.index}] 用户: ${name || "未知"}，积分: ${score ?? "未知"}`);
+        console.log(`👤 [用户] 账号[${this.index}] 用户: ${this.nickname || "未知"}，积分: ${score ?? "未知"}，memberId: ${this.memberId || "无"}`);
+    }
+
+    async receiveTask(activityId) {
+        try {
+            await this.api({
+                method: "POST",
+                path: "/c/activity/todo/receive",
+                data: { activityId, mockTime: Date.now() },
+                allowFail: true,
+            });
+        } catch {}
+    }
+
+    async completeTask(task) {
+        const activityId = task.id;
+        const taskName = task.name || "未知任务";
+        await this.receiveTask(activityId);
+        await sleep(1500);
+        const result = await this.api({
+            method: "POST",
+            path: "/c/activity/todo/complete",
+            data: { activityId, mockTime: Date.now() },
+            allowFail: true,
+        });
+        const code = String(result?.code || "");
+        if (["00000", "000000", "A00002"].includes(code)) {
+            const credits = result?.data?.credits || "";
+            console.log(`  ✅ [任务] ${taskName}: 完成${credits ? ` (+${credits}积分)` : ""}`);
+            return true;
+        }
+        console.log(`  ℹ️ [任务] ${taskName}: ${result?.msg || result?.message || "未完成"}`);
+        return false;
+    }
+
+    async completeGameTask(task) {
+        const taskName = task.name || "连连看";
+        const activityId = task.id;
+        if (!this.gameOpenId) {
+            console.log(`  ⏭️ [任务] ${taskName}: 无openid，跳过游戏`);
+            return false;
+        }
+        try {
+            // 游戏登录
+            const gameNickname = encodeURIComponent(this.nickname || "");
+            const loginRes = await axios.post(
+                `https://momclub.feihe.com/pmall/v1/api/auth/login?openid=${this.gameOpenId}&nickname=${gameNickname}`,
+                null,
+                {
+                    headers: {
+                        "User-Agent": USER_AGENT,
+                        authorization: "",
+                        "content-length": "0",
+                        origin: "https://momclub.feihe.com",
+                        referer: `https://momclub.feihe.com/h5/game/?wxNickName=${gameNickname}&crmId=${this.memberId}&memberid=${this.gameOpenId}&programLogin=1`,
+                    },
+                    timeout: 15000,
+                    validateStatus: () => true,
+                    transformRequest: () => "",
+                }
+            );
+            const loginData = loginRes.data;
+            if (String(loginData?.code) !== "10000") {
+                console.log(`  ⚠️ [任务] ${taskName}: 游戏登录失败 ${JSON.stringify(loginData).slice(0, 150)}`);
+                return false;
+            }
+            const gameToken = loginData.data.accessToken;
+            const gameHeaders = {
+                "User-Agent": USER_AGENT,
+                authorization: gameToken,
+                "content-type": "application/json",
+                referer: `https://momclub.feihe.com/h5/game/?wxNickName=${gameNickname}&crmId=${this.memberId}&memberid=${this.gameOpenId}&programLogin=1`,
+            };
+
+            await this.receiveTask(activityId);
+            await sleep(1000);
+
+            // 玩3关
+            for (let level = 1; level <= 3; level++) {
+                await axios.post(`https://momclub.feihe.com/pmall/v1/api/game/level/startLevel?level=${level}`, null, {
+                    headers: gameHeaders, timeout: 15000, validateStatus: () => true, transformRequest: () => "",
+                });
+                await sleep(4000);
+                await axios.post(`https://momclub.feihe.com/pmall/v1/api/game/level/complete?levelId=${level}`, null, {
+                    headers: gameHeaders, timeout: 15000, validateStatus: () => true, transformRequest: () => "",
+                });
+                console.log(`  🎮 [任务] ${taskName}: 第${level}关完成`);
+                await sleep(2000);
+            }
+
+            // 完成任务
+            const result = await this.api({
+                method: "POST",
+                path: "/c/activity/todo/complete",
+                data: { activityId, mockTime: Date.now() },
+                allowFail: true,
+            });
+            const code = String(result?.code || "");
+            if (["00000", "000000", "A00002"].includes(code)) {
+                const credits = result?.data?.credits || "";
+                console.log(`  ✅ [任务] ${taskName}: 游戏完成${credits ? ` (+${credits}积分)` : ""}`);
+                return true;
+            }
+            return false;
+        } catch (e) {
+            console.log(`  ❌ [任务] ${taskName}: 游戏异常 ${e.message}`);
+            return false;
+        }
     }
 
     async sign() {
@@ -227,36 +336,66 @@ class FeiheMom {
             data: { mockTime: Date.now() },
             allowFail: true,
         });
-        const checkTodo =
-            getByPath(todo, "data.checkInTodo") ||
-            findFirst(todo?.data, (item) => item && (item.checkInExtra || /签到|打卡|check/i.test(`${item.taskName || item.name || item.title || ""}`)));
-        const activityId = checkTodo?.id || checkTodo?.activityId || checkTodo?.taskId;
-        if (!activityId) {
-            console.log(`⚠️ [签到] 账号[${this.index}] 未找到签到任务: ${short(todo)}`);
-            return;
-        }
-        const todaySigned =
-            checkTodo?.todaySigned ||
-            checkTodo?.signed ||
-            checkTodo?.finish ||
-            checkTodo?.completed ||
-            checkTodo?.status === 1 ||
-            checkTodo?.state === 1;
-        if (todaySigned) {
-            console.log(`✅ [签到] 账号[${this.index}] 今日已签到`);
-            return;
-        }
-        const sign = await this.api({
-            method: "POST",
-            path: "/c/activity/todo/checkIn",
-            data: { activityId, mockTime: Date.now() },
-            allowFail: true,
-        });
-        const signCode = String(sign?.code || "");
-        if (["00000", "000000", "A00002"].includes(signCode)) {
-            console.log(`✅ [签到] 账号[${this.index}] 签到成功`);
+        const todoData = todo?.data || {};
+
+        // ===== 签到 =====
+        const checkTodo = todoData.checkInTodo;
+        if (checkTodo?.id) {
+            const joinRecord = checkTodo.checkInExtra?.joinRecord || [];
+            const todayRecord = joinRecord.find((r) => r.today);
+            if (todayRecord?.joined) {
+                console.log(`✅ [签到] 账号[${this.index}] 今日已签到 (+${todayRecord.credits || 0}积分)`);
+            } else {
+                const sign = await this.api({
+                    method: "POST",
+                    path: "/c/activity/todo/checkIn",
+                    data: { activityId: checkTodo.id, mockTime: Date.now() },
+                    allowFail: true,
+                });
+                const code = String(sign?.code || "");
+                if (["00000", "000000", "A00002"].includes(code)) {
+                    const credits = sign?.data?.credits || "";
+                    console.log(`✅ [签到] 账号[${this.index}] 签到成功${credits ? ` (+${credits}积分)` : ""}`);
+                } else {
+                    console.log(`⚠️ [签到] 账号[${this.index}] ${sign?.msg || sign?.message || "已签到"}`);
+                }
+            }
         } else {
-            console.log(`⚠️ [签到] 账号[${this.index}] 签到结果: ${sign?.msg || signCode}`);
+            console.log(`ℹ️ [签到] 账号[${this.index}] 无签到活动`);
+        }
+
+        // ===== 其他任务 =====
+        const taskList = todoData.taskTodo || [];
+        if (taskList.length) {
+            const skipTypes = new Set(["Perfect", "AddQw", "FirstOrder"]);
+            const gameKeywords = ["游戏", "连连看", "玩一"];
+            console.log(`📋 [任务] 账号[${this.index}] 共 ${taskList.length} 个任务`);
+
+            for (const task of taskList) {
+                const extra = task.taskTodoExtra || {};
+                const taskType = extra.type || "";
+                const taskName = task.name || "未知";
+                const status = String(extra.status || "");
+                const completeCount = extra.completeCount || 0;
+                const completeLimit = extra.completeLimit || 1;
+
+                if (skipTypes.has(taskType)) {
+                    console.log(`  ⏭️ [任务] ${taskName}: 需手动完成，跳过`);
+                    continue;
+                }
+                if (status === "3" || completeCount >= completeLimit) {
+                    console.log(`  ✅ [任务] ${taskName}: 已完成`);
+                    continue;
+                }
+
+                const isGame = gameKeywords.some((kw) => taskName.includes(kw));
+                if (isGame) {
+                    await this.completeGameTask(task);
+                } else {
+                    await this.completeTask(task);
+                }
+                await sleep(3000);
+            }
         }
     }
 }
