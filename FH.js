@@ -1,5 +1,6 @@
 // name: 飞鹤·北纬47°好物
 // cron: 16 15,3 * * *
+#小程序://飞鹤丨北纬47度好物/dIs1dmyVLMr2mqI
 const axios = require("axios");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -102,19 +103,15 @@ function buildSignedHeaders({ data = null, token = "" } = {}) {
         fhNonceStr: randomString(16),
         fhTimestamp: Math.floor(Date.now() / 1000),
         token,
-        source: 1,
-        "Content-Type": "application/json",
+        source: "1",
         OrderUpdate: 1,
         visit: "",
     };
-    const dataSignValue = data && typeof data === "object" ? JSON.stringify(data) : data ? String(data) : "";
-    const signKeys = ["fhAppid", "fhNonceStr", "fhTimestamp", dataSignValue].sort();
-    const signText = signKeys.reduce((text, key) => {
-        if (Object.prototype.hasOwnProperty.call(headers, key)) {
-            return text + key + headers[key];
-        }
-        return text + key;
-    }, "");
+    if (data) headers["Content-Type"] = "application/json";
+    // 签名: fhAppid{appid}fhNonceStr{nonce}fhTimestamp{ts}{body}{appKey}
+    // body为空时和py一致，不为空时把body加进去
+    const bodyStr = data && typeof data === "object" ? JSON.stringify(data) : data ? String(data) : "";
+    const signText = `fhAppid${APP_ID}fhNonceStr${headers.fhNonceStr}fhTimestamp${headers.fhTimestamp}${bodyStr}`;
 
     return {
         ...headers,
@@ -184,9 +181,14 @@ class Task {
             }
             try {
                 await this.getIndexInfo();
+                const pointsBefore = await this.getPoints();
                 await this.signIn();
-                await this.getPoints();
                 await this.doAllTasks();
+                const pointsAfter = await this.getPoints();
+                if (pointsBefore !== null && pointsAfter !== null) {
+                    const earned = pointsAfter - pointsBefore;
+                    console.log(`📊 [汇总] 账号[${this.index}] 今日获取: ${earned >= 0 ? "+" : ""}${earned}积分（${pointsBefore} → ${pointsAfter}）`);
+                }
                 return true;
             } catch (e) {
                 const msg = String(e.message || e);
@@ -234,7 +236,7 @@ class Task {
             timeout: 15000,
             validateStatus: () => true,
         };
-        if (method !== "GET") options.data = data || {};
+        if (method !== "GET" && data) options.data = data;
 
         const { status, data: result } = await axios.request(options);
         const ok = status === 200 && String(result?.code) === "200";
@@ -308,11 +310,13 @@ class Task {
             });
             if (String(result?.code) === "200") {
                 const member = result.data?.memberDetail || {};
-                const points = member.totalPoint ?? "?";
+                const points = Number(member.totalPoint) || 0;
                 console.log(`💰 [积分] 账号[${this.index}] 当前总积分: ${points}`);
+                return points;
             }
+            return null;
         } catch (e) {
-            // 积分查询失败不影响主流程
+            return null;
         }
     }
 
@@ -387,27 +391,22 @@ class Task {
     }
 
     async signIn() {
-        const finish = await this.request({
-            apiPath: "/api/member/signin/tofinish",
-            query: { taskType: SIGN_TASK_TYPE },
+        const sign = await this.request({
+            method: "POST",
+            apiPath: "/api/member/signin/sign",
             allowFail: true,
         });
-        if (String(finish?.code) === "200") {
-            console.log(`✅ [签到] 账号[${this.index}] 签到上报成功${finish.data === true ? "（新增）" : "（今日已签到）"}`);
+        if (String(sign?.code) === "200") {
+            const data = sign.data || {};
+            const points = data.awardSendPoints || data.awardPoint || data.points || "";
+            console.log(`✅ [签到] 账号[${this.index}] 签到成功${points ? ` (+${points}积分)` : ""}`);
         } else {
-            throw new Error(`签到失败: ${finish?.msg || JSON.stringify(finish)}`);
-        }
-
-        const complete = await this.request({
-            apiPath: "/api/member/signin/completeTask",
-            query: { taskType: SIGN_TASK_TYPE },
-            allowFail: true,
-        });
-        if (String(complete?.code) === "200") {
-            const points = complete.data?.awardSendPoints || complete.data?.awardPoint || "";
-            console.log(`🎁 [奖励] 账号[${this.index}] 签到完成${points ? `，获得${points}积分` : ""}`);
-        } else {
-            console.log(`ℹ️ [奖励] 账号[${this.index}] 签到完成确认返回(可能今日已领): ${complete?.msg || JSON.stringify(complete)}`);
+            const msg = sign?.msg || JSON.stringify(sign);
+            if (/已签|重复|今天/.test(msg)) {
+                console.log(`ℹ️ [签到] 账号[${this.index}] 今日已签到`);
+            } else {
+                console.log(`⚠️ [签到] 账号[${this.index}] ${msg}`);
+            }
         }
     }
 }
