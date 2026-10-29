@@ -1,6 +1,5 @@
-// name: 飞鹤·北纬47°好物
+// name: 飞鹤
 // cron: 16 15,3 * * *
-#小程序://飞鹤丨北纬47度好物/dIs1dmyVLMr2mqI
 const axios = require("axios");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -436,5 +435,7 @@ class Task {
     console.log(`║  ❌ 失败: ${String(failCount).padEnd(22)}║`);
     console.log(`║  🕒 结束时间: ${new Date().toLocaleString("zh-CN", { hour12: false }).padEnd(22)}║`);
     console.log("╚" + "═".repeat(48) + "╝");
+    console.log();
+    console.log("🔗 小程序: #小程序://飞鹤丨北纬47度好物/dIs1dmyVLMr2mqI");
 })()
     .catch((e) => console.log(`❌ 运行异常: ${e.message || e}`));
