@@ -1,43 +1,57 @@
 // name: 米其林会员
 // cron: 0 11,23 * * *
+
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 
-// Token 缓存
-const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
-const TOKEN_CACHE_FILE = path.join(TOKEN_CACHE_DIR, "mqlhy_token_cache.json");
+const APP_ID = "wx14413dafd16b9540";
+const BASE = "https://ulp.michelin.com.cn";
 
-function readTokenCache() {
-    try {
-        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
-        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf-8")) || {};
-    } catch { return {}; }
-}
-
-function writeTokenCache(cache) {
-    try {
-        fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
-        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
-    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
-}
-// ====================== YYB Go 账号（环境变量 YYB_SERVER = 地址@微信账号标识，多行） ======================
 const SERVERS = (process.env.YYB_SERVER || "")
     .split(/\r?\n/)
     .map(s => s.trim())
     .filter(Boolean);
 if (!SERVERS.length) {
-    console.error("未配置环境变量 YYB_SERVER，请设置后重试（格式：地址@微信账号标识，多行换行）");
+    console.error("❌ 未配置环境变量 YYB_SERVER，请设置后重试（格式：地址@微信账号标识，多行换行）");
     process.exit(1);
+}
+
+const SCRIPT_DIR = __dirname;
+const CACHE_FILE = path.join(SCRIPT_DIR, "token_caches", "mqlhy_token_cache.json");
+
+function readCache() {
+    try {
+        if (!fs.existsSync(CACHE_FILE)) return {};
+        return JSON.parse(fs.readFileSync(CACHE_FILE, "utf-8")) || {};
+    } catch (e) { return {}; }
+}
+function writeCache(c) {
+    try {
+        fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
+        fs.writeFileSync(CACHE_FILE, JSON.stringify(c, null, 2), "utf-8");
+    } catch (e) {}
+}
+function nowText() {
+    const d = new Date();
+    const p = n => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function mask(v) {
+    v = String(v || "");
+    return v.length <= 16 ? v : v.slice(0, 8) + "..." + v.slice(-8);
+}
+function padStr(str, width) {
+    str = String(str);
+    let len = 0;
+    for (const ch of str) len += ch.charCodeAt(0) > 255 ? 2 : 1;
+    return str + " ".repeat(Math.max(0, width - len));
 }
 function parseYybGoEntry(rawValue) {
     const value = String(rawValue || "").trim();
     if (!value) return { server: "", ref: "" };
     const atIndex = value.indexOf("@");
-    if (atIndex === -1) {
-        console.log("YYB_SERVER 格式应为 地址@微信账号标识，当前值: " + value);
-        return { server: "", ref: "" };
-    }
+    if (atIndex === -1) return { server: "", ref: "" };
     let server = value.slice(0, atIndex).trim();
     const ref = value.slice(atIndex + 1).trim();
     if (server.startsWith("http://")) server = server.slice(7);
@@ -49,287 +63,350 @@ function parseYybGoEntry(rawValue) {
 async function getCode(server) {
     const { server: parsedServer, ref } = parseYybGoEntry(server);
     if (!parsedServer || !ref) return null;
-    const url = "http://" + parsedServer + "/wxapp/getCode";
     try {
-        const { data } = await axios.post(url, { ref, app_id: 'wx14413dafd16b9540' }, { timeout: 20000, proxy: false });
+        const { data } = await axios.post("http://" + parsedServer + "/wxapp/getCode",
+            { ref, app_id: APP_ID }, { timeout: 20000, proxy: false });
         const code = data && data.data && data.data.result && data.data.result.code;
-        if (!data || data.code !== 0 || !code) {
-            console.log(parsedServer + " 获取code失败: " + JSON.stringify(data));
-            return null;
-        }
-        console.log(parsedServer + " 获取code成功");
+        if (!data || data.code !== 0 || !code) return null;
         return code;
-    } catch (e) {
-        console.log(parsedServer + " 获取code异常: " + e.message);
-        return null;
-    }
+    } catch (e) { return null; }
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+const defaultUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.31(0x18001e31) NetType/WIFI Language/zh_CN miniProgram";
+
 let userIdx = 1;
 
-const strSplitor = "#";
-
-const defaultUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.31(0x18001e31) NetType/WIFI Language/zh_CN miniProgram"
+function logTitle() {
+    console.log();
+    console.log("╔" + "═".repeat(48) + "╗");
+    console.log("║  🚗 米其林会员 自动签到                        ║");
+    console.log("║  🕒 启动时间: " + padStr(nowText(), 25) + "║");
+    console.log("║  🔢 账号数量: " + padStr(String(SERVERS.length), 25) + "║");
+    console.log("╚" + "═".repeat(48) + "╝");
+}
+function logAccount(i, total, server) {
+    const { ref } = parseYybGoEntry(server);
+    console.log();
+    console.log("┌" + "─".repeat(48) + "┐");
+    console.log("│  🧩 账号 " + padStr(`${i} / ${total}`, 40) + "│");
+    console.log("│  🔑 标识: " + padStr(ref || "-", 39) + "│");
+    console.log("└" + "─".repeat(48) + "┘");
+}
+function logEnd(ok, fail) {
+    console.log();
+    console.log("╔" + "═".repeat(48) + "╗");
+    console.log("║  🏁 米其林任务完成                            ║");
+    console.log("║  ✅ 成功: " + padStr(String(ok), 26) + "║");
+    console.log("║  ❌ 失败: " + padStr(String(fail), 26) + "║");
+    console.log("║  🕒 结束时间: " + padStr(nowText(), 24) + "║");
+    console.log("╚" + "═".repeat(48) + "╝");
+}
 
 class Task {
     constructor(env) {
         this.server = env;
         const _yyb = parseYybGoEntry(this.server);
         this.ref = _yyb.ref;
-        this.openid = _yyb.ref;
-        this.index = userIdx++
-        this.user = env.split(strSplitor);
-        this.token = null
-        this.wcsid = this.openid
-        this.isSign = false
-        this._authFail = false
+        this.index = userIdx++;
+        this.token = null;
+        this.fromCache = false;
+        this.tokenInvalid = false;
+        this.paperStatus = true;
+        this.stdAnswers = [];
+        this.questionList = [];
     }
 
     async run() {
-        //随机延迟5-30s 模拟人工操作
-       await await sleep(Math.floor(Math.random() * 20 + 5) * 1000);
-
-        // 尝试缓存（不过期，业务失败自动重登）
-        let usedCache = false;
-        const cache = readTokenCache();
-        const cached = cache[this.server] || {};
-        if (cached.access_token) {
-            this.token = cached.access_token;
-            usedCache = true;
-            console.log(`💾 账号[${this.index}] 使用缓存token`);
+        const cache = readCache();
+        const cached = cache[this.ref] || {};
+        if (cached.token) {
+            this.token = cached.token;
+            this.fromCache = true;
+            console.log("💾 [缓存] 使用缓存token: " + mask(this.token));
         }
 
         for (let attempt = 0; attempt < 2; attempt++) {
-            if (attempt === 1 || !this.token) {
-                if (attempt === 1) {
-                    console.log(`🔄 账号[${this.index}] token失效，重新登录...`);
-                    const c = readTokenCache();
-                    delete c[this.server];
-                    writeTokenCache(c);
+            try {
+                if (attempt === 1 || !this.token) {
+                    if (attempt === 1) {
+                        console.log("🔄 [重登] token失效，清除缓存重新登录...");
+                        const c = readCache();
+                        if (this.ref in c) { delete c[this.ref]; writeCache(c); }
+                    }
+                    if (!await this.login()) return false;
                 }
-                let code = await getCode(this.server)
-                if (code) {
-                    await this.getUserToken(code)
-                }
-                if (!this.token) {
-                    console.log(`账号[${this.index}] 获取用户Token失败❌`)
-                    return
-                }
-                const c = readTokenCache();
-                c[this.server] = { access_token: this.token };
-                writeTokenCache(c);
-            }
-            this.token = 'Bearer ' + this.token
-            this._authFail = false;
 
-            await this.getUserInfo()
-            await this.doPaper()
-            for (let i = 0; i < 10; i++) {
-                await this.share();
+                const ok = await this.biz();
+                if (ok) {
+                    const c = readCache();
+                    c[this.ref] = { token: this.token };
+                    writeCache(c);
+                    return true;
+                }
+                if (this.tokenInvalid && attempt === 0 && this.fromCache) {
+                    this.token = null;
+                    continue;
+                }
+                return false;
+            } catch (e) {
+                console.log("❌ [执行] 异常: " + e.message);
+                if (attempt === 0 && this.fromCache) { this.token = null; continue; }
+                return false;
             }
+        }
+        return false;
+    }
 
-            if (usedCache && attempt === 0 && this._authFail) {
-                console.log(`⚠️ 账号[${this.index}] token失效，准备重登`);
-                continue;
+    async login() {
+        await sleep(Math.floor(Math.random() * 20 + 5) * 1000);
+        const code = await getCode(this.server);
+        if (!code) {
+            console.log("❌ [取码] 获取code失败");
+            return false;
+        }
+        try {
+            const { data: result } = await axios.request({
+                method: "GET",
+                url: `${BASE}/bff/wechat/login/${code}`,
+                headers: { "User-Agent": defaultUA, "Referer": `https://servicewechat.com/${APP_ID}/130/page-frame.html` },
+                timeout: 20000,
+            });
+            const accessToken = result?.data?.token?.access_token;
+            if (!accessToken) {
+                console.log("❌ [登录] 登录失败: " + JSON.stringify(result).slice(0, 150));
+                return false;
             }
-            break;
+            this.token = accessToken;
+            console.log("✅ [登录] 登录成功: " + mask(this.token));
+            return true;
+        } catch (e) {
+            console.log("❌ [登录] 异常: " + e.message);
+            return false;
         }
     }
-    async share() {
-        const options = {
-            method: 'POST',
-            url: `https://ulp.michelin.com.cn/op/points/share/have`,
-            headers: {
-                "Host": "ulp.michelin.com.cn",
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 15_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.31(0x18001f37) NetType/WIFI Language/zh_CN",
-                "Authorization": this.token,
-            },
-            data: { "type": "ARTICLE", "code": "COM-MHT-93" }
-        };
-        //post方法
-        let { data: result } = await axios.request(options);
 
-        console.log(`转发:${result?.code != 200 ? "转发失败" + result?.message : "转发成功!"}`)
-        if (result && result.code != 200) this._authFail = true;
-    }
-    async getUserToken(code) {
-        let options = {
-            method: 'GET',
-            url: `https://ulp.michelin.com.cn/bff/wechat/login/${code}`,
-            headers: {
-                "Host": "ulp.michelin.com.cn",
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 15_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.31(0x18001f37) NetType/WIFI Language/zh_CN",
-                "Referer": "https://servicewechat.com/wx14413dafd16b9540/130/page-frame.html"
-            }
-
+    async biz() {
+        // 查积分
+        const points = await this.getUserInfo();
+        if (points === null) return false;
+        // 问卷答题
+        await this.doPaper();
+        // 分享10次
+        let shareOk = 0;
+        for (let i = 0; i < 10; i++) {
+            if (await this.share()) shareOk++;
+            await sleep(Math.floor(Math.random() * 2000) + 1000);
         }
-        let {
-            data: result
-        } = await axios.request(options);
-
-        this.token = result?.data?.token?.access_token;
-        console.log(`🌸账号[${this.index}] 获取用户Token成功:${this.token}`)
-
+        console.log("📤 [分享] 完成 " + shareOk + "/10 次转发");
+        return true;
     }
 
     async getUserInfo() {
         try {
-            let { data: result } = await axios.request({
-                method: 'GET',
-                url: `https://ulp.michelin.com.cn/bff/profile`,
-                headers: {
-                    "Host": "ulp.michelin.com.cn",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781 NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF XWEB/50249",
-                    "Authorization": this.token,
-                }
+            const { data: result } = await axios.request({
+                method: "GET",
+                url: `${BASE}/bff/profile`,
+                headers: { "User-Agent": defaultUA, "Authorization": "Bearer " + this.token },
+                timeout: 20000,
             });
-
-            if (result?.data?.points) {
-                console.log(`账号[${this.index}] 获取用户积分成功:${result?.data?.points}`)
-            } else {
-                console.log(`账号[${this.index}] 获取用户积分失败❌`)
-                if (result && result.code != 200) this._authFail = true;
+            if (result?.data?.points !== undefined && result?.data?.points !== null) {
+                console.log("👤 [用户] 当前积分: " + result.data.points);
+                return result.data.points;
             }
-
+            if (String(result?.code) === "401" || String(result?.code) === "403") {
+                this.tokenInvalid = true;
+                return null;
+            }
+            console.log("⚠️ [用户] 积分查询异常: " + JSON.stringify(result).slice(0, 120));
+            return null;
         } catch (e) {
-            this.ckStatus = false;
-            console.log(`❌查询积分失败！原因为:${e}`);
+            if (e.response && [401, 403].includes(e.response.status)) {
+                this.tokenInvalid = true;
+                return null;
+            }
+            console.log("❌ [用户] 积分查询失败: " + e.message);
+            return null;
         }
     }
+
+    async share() {
+        try {
+            const { data: result } = await axios.request({
+                method: "POST",
+                url: `${BASE}/op/points/share/have`,
+                headers: {
+                    "User-Agent": defaultUA,
+                    "Authorization": "Bearer " + this.token,
+                    "Content-Type": "application/json",
+                },
+                data: { "type": "ARTICLE", "code": "COM-MHT-93" },
+                timeout: 20000,
+            });
+            if (String(result?.code) === "200") {
+                console.log("  ✅ [转发] 转发成功");
+                return true;
+            }
+            if (String(result?.code) === "401" || String(result?.code) === "403") this.tokenInvalid = true;
+            console.log("  ℹ️ [转发] " + (result?.message || "转发失败"));
+            return false;
+        } catch (e) {
+            if (e.response && [401, 403].includes(e.response.status)) {
+                this.tokenInvalid = true;
+                return false;
+            }
+            console.log("  ❌ [转发] 异常: " + e.message);
+            return false;
+        }
+    }
+
     async doPaper() {
-        //获取问卷
         await this.getPaper();
-        //是否已完成问卷
-        if (this.paperStatus) {
-            //获取本期问卷题目
-            await this.getOpenTpaper(this.npsPaperCode);
-            let index = 1;
-            for (let question of this.questionList) {
-                console.log(`问题${index}:${question?.questionChoise?.stemHtml}\n`);
-                let options = question?.questionChoise.options;
-                for (let option of options) {
-                    console.log(`- ${option.optionHtml}`);
-                }
-                let theQuestion = question.questionChoise.npsQuestionPk;
-                //查找对应题目答案
-                let detail = this.stdAnswers.find(answer => theQuestion == answer.npsQuestionChoisePk) || {};
-                let answer = options.find(o => o.npsQuestionChoiseOptionPk == detail.npsQuestionChoiseOptionPk);
-                if (!answer) answer = options[0]; // 如果没有找到匹配的答案，默认选择第一个选项
-                //提交答案
-                let answerRes = await this.answer(theQuestion, answer?.npsQuestionChoiseOptionPk);
-                console.log(`\n答案: ${answer.optionHtml} => ${answerRes}`);
-            }
-            //提交问卷
-            await this.paperScore(this.paperCode);
-        } else {
-            console.log(`答题任务:本周奖励领取已达到上限，跳过执行`);
+        if (!this.paperStatus) {
+            console.log("ℹ️ [问卷] 本周奖励已领取，跳过答题");
+            return;
         }
+        await this.getOpenTpaper(this.npsPaperCode);
+        if (!this.questionList.length) {
+            console.log("⚠️ [问卷] 未获取到题目，跳过答题");
+            return;
+        }
+        let index = 1;
+        for (const question of this.questionList) {
+            const stem = question?.questionChoise?.stemHtml || "未知题目";
+            const options = question?.questionChoise?.options || [];
+            const theQuestion = question.questionChoise.npsQuestionPk;
+            const detail = this.stdAnswers.find(a => theQuestion == a.npsQuestionChoisePk) || {};
+            let answer = options.find(o => o.npsQuestionChoiseOptionPk == detail.npsQuestionChoiseOptionPk);
+            if (!answer) answer = options[0];
+            if (!answer) {
+                console.log("  ⏭️ [问卷] 第" + index + "题无选项，跳过");
+                index++;
+                continue;
+            }
+            const res = await this.answer(theQuestion, answer.npsQuestionChoiseOptionPk);
+            console.log("  📝 [问卷] 第" + index + "题: " + res);
+            index++;
+        }
+        await this.paperScore(this.paperCode);
     }
 
-    //获取本期答卷
     async getPaper() {
-
-        const options = {
-            method: 'POST',
-            url: `https://ulp.michelin.com.cn/campaign/paper/user`,
-            headers: {
-                "Host": "ulp.michelin.com.cn",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781 NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF XWEB/50249",
-                "Authorization": this.token,
-            },
-            data: {}
-        };
-
-        let { data: result } = await axios.request(options);
-        if (result?.code == 200) {
-            console.log(`帐号[${this.index}]本次调查问卷为${result?.data?.npsPaperCode}，总共${result?.data?.questionNum}道题目,状态为${result?.data?.status}`);
-            //如果已经答题，则跳过执行答题任务
-            if (result?.data?.status == 'DONE') this.paperStatus = false;
-            //获取本期问卷期数
-            this.npsPaperCode = result?.data?.npsPaperCode;
-            //获取本期问卷验证编号
-            this.paperCode = result?.data?.paperCode;
-        } else {
-            this.ckStatus = false;
-            this._authFail = true;
-        }
-
-    }
-    //获取问卷题目
-    async getOpenTpaper(npsPaperCode) {
-
-        let options = {
-            method: 'GET',
-            url: `https://ulp.michelin.com.cn/npspaper/nps-admin/open/api/cp/public/get_open_tpaper/${npsPaperCode}`,
-            headers: {
-                "Host": "ulp.michelin.com.cn",
-                "User-Agent": "",
-                "Authorization": this.token,
+        try {
+            const { data: result } = await axios.request({
+                method: "POST",
+                url: `${BASE}/campaign/paper/user`,
+                headers: {
+                    "User-Agent": defaultUA,
+                    "Authorization": "Bearer " + this.token,
+                    "Content-Type": "application/json",
+                },
+                data: {},
+                timeout: 20000,
+            });
+            if (String(result?.code) === "200") {
+                const d = result?.data || {};
+                console.log("📋 [问卷] 问卷" + d.npsPaperCode + "，共" + d.questionNum + "题，状态:" + d.status);
+                this.paperStatus = d.status !== "DONE";
+                this.npsPaperCode = d.npsPaperCode;
+                this.paperCode = d.paperCode;
+            } else if (String(result?.code) === "401" || String(result?.code) === "403") {
+                this.tokenInvalid = true;
+            } else {
+                console.log("⚠️ [问卷] 获取问卷失败: " + (result?.message || JSON.stringify(result).slice(0, 100)));
             }
+        } catch (e) {
+            if (e.response && [401, 403].includes(e.response.status)) {
+                this.tokenInvalid = true;
+                return;
+            }
+            console.log("❌ [问卷] 获取问卷异常: " + e.message);
         }
+    }
 
-        //post方法
-        let result = await axios.request(options);
-        if (result?.success) {
-            //答案
-            this.stdAnswers = result?.data?.stdAnswers;
-            //题目
-            this.questionList = result?.data?.questionList;
-        } else {
-            console.log(`🔴帐号[${this.index}]获取问卷列表失败！${result?.message}`)
+    async getOpenTpaper(npsPaperCode) {
+        try {
+            const { data: result } = await axios.request({
+                method: "GET",
+                url: `${BASE}/npspaper/nps-admin/open/api/cp/public/get_open_tpaper/${npsPaperCode}`,
+                headers: { "User-Agent": "", "Authorization": "Bearer " + this.token },
+                timeout: 20000,
+            });
+            if (result?.success) {
+                const payload = result?.data || {};
+                const tpaper = payload.tpaper || payload;
+                this.stdAnswers = payload.stdAnswers || tpaper.stdAnswers || [];
+                this.questionList = payload.questionList || tpaper.questionList || tpaper.questions || [];
+                if (!this.questionList.length) {
+                    console.log("🔍 [调试] getOpenTpaper返回: " + JSON.stringify(payload).slice(0, 600));
+                }
+            } else {
+                console.log("❌ [问卷] 获取题目失败: " + (result?.message || JSON.stringify(result).slice(0, 100)));
+            }
+        } catch (e) {
+            if (e.response && [401, 403].includes(e.response.status)) {
+                this.tokenInvalid = true;
+                return;
+            }
+            console.log("❌ [问卷] 获取题目异常: " + e.message);
         }
-
     }
 
     async answer(question, answer) {
         try {
-            const options = {
-                url: `https://ulp.michelin.com.cn/campaign/paper/user/answer`,
-                method: 'POST',
+            const { data: result } = await axios.request({
+                method: "POST",
+                url: `${BASE}/campaign/paper/user/answer`,
                 headers: {
-                    "Host": "ulp.michelin.com.cn",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781 NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF XWEB/50249",
-                    "Authorization": this.token,
+                    "User-Agent": defaultUA,
+                    "Authorization": "Bearer " + this.token,
+                    "Content-Type": "application/json",
                 },
-                data: { "answerOptionId": [`${answer}`], "paperCode": `${this.paperCode}`, "questionId": `${question}` }
-            };
-            //post方法
-            let { data: result } = await axios.request(options);
-            return result?.code == 200 ? "回答成功！" : `回答失败！${result?.message}`
+                data: { "answerOptionId": [`${answer}`], "paperCode": `${this.paperCode}`, "questionId": `${question}` },
+                timeout: 20000,
+            });
+            return String(result?.code) === "200" ? "回答成功" : "回答失败: " + (result?.message || "");
         } catch (e) {
-            console.log(`❌回答问题失败！原因为:${e}`);
+            if (e.response && [401, 403].includes(e.response.status)) {
+                this.tokenInvalid = true;
+                return "token失效";
+            }
+            return "回答异常: " + e.message;
         }
     }
 
     async paperScore(paperCode) {
         try {
-            const options = {
-                url: `https://ulp.michelin.com.cn/campaign/paper/score/${paperCode}`,
-                data: {}
-            };
-            //post方法
-            let { data: res } = await axios.request(options);
-            console.log(`提交问卷:本期问卷正确率为${res?.data?.score}%,排名${res.data.rank}`);
+            const { data: res } = await axios.request({
+                method: "POST",
+                url: `${BASE}/campaign/paper/score/${paperCode}`,
+                headers: {
+                    "User-Agent": defaultUA,
+                    "Authorization": "Bearer " + this.token,
+                    "Content-Type": "application/json",
+                },
+                data: {},
+                timeout: 20000,
+            });
+            console.log("🏆 [问卷] 提交成功，正确率" + res?.data?.score + "%，排名" + res?.data?.rank);
         } catch (e) {
-            console.log(`❌提交问卷失败！原因为:${e}`);
+            if (e.response && [401, 403].includes(e.response.status)) {
+                this.tokenInvalid = true;
+                return;
+            }
+            console.log("❌ [问卷] 提交问卷失败: " + e.message);
         }
     }
-
 }
 
 !(async () => {
-    if (true) {
-        for (let user of SERVERS) {
-            await new Task(user).run();
-        }
-    } else {
-        
-        console.log(`${"YYB_SERVER"}未配置微信SERVER配置 搭建可看仓库目录下的readme.md❌`)
-        return
+    logTitle();
+    let ok = 0, fail = 0;
+    for (let i = 0; i < SERVERS.length; i++) {
+        logAccount(i + 1, SERVERS.length, SERVERS[i]);
+        if (await new Task(SERVERS[i]).run()) ok++;
+        else fail++;
+        await sleep(2000);
     }
-
-})()
-    .catch((e) => console.log(e))
-    
-
-
+    logEnd(ok, fail);
+})().catch(e => console.log("❌ " + e.message));
