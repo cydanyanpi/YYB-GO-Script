@@ -237,6 +237,7 @@ class TencentMap {
         this.account = parseAccount(rawAccount);
         this.loginInfo = {};
         this.userInfo = {};
+        this.needRelogin = false;
     }
 
     async miniLogin() {
@@ -286,6 +287,11 @@ class TencentMap {
             data: body,
         });
         if (status !== 200 || Number(data?.err_code) !== 0) {
+            if (Number(data?.err_code) === 10205) {
+                console.log("⚠️ 用户信息：缓存凭据不完整（token缺失），准备重新登录");
+                this.needRelogin = true;
+                return;
+            }
             console.log(`用户信息：查询失败 HTTP ${status}: ${short(data)}`);
             return;
         }
@@ -400,6 +406,11 @@ class TencentMap {
                     writeTokenCache(c);
                 }
                 await this.queryUser();
+                if (this.needRelogin && usedCache && attempt === 0) {
+                    const err = new Error("缓存凭据不完整，重新登录补齐");
+                    err.authFail = true;
+                    throw err;
+                }
                 await this.queryBalance("签到前现金余额");
                 await this.queryAssets();
                 await this.checkin();
