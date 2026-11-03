@@ -178,6 +178,13 @@ def mask_account(value: Any) -> str:
     return f"{value[:6]}...{value[-4:]}"
 
 
+def _pad_str(value: Any, width: int) -> str:
+    """按显示宽度补齐（中文按2字符宽）。"""
+    text = str(value)
+    length = sum(2 if ord(ch) > 255 else 1 for ch in text)
+    return text + " " * max(0, width - length)
+
+
 class ProxyManager:
     """代理管理器（环境变量 sf_proxy_api_url）"""
     def __init__(self, api_url: str):
@@ -517,6 +524,7 @@ class SFHttpClient:
         self.session = requests.Session()
         self.session.verify = False
         self.proxy_display = '无代理'
+        self.auth_failed = False
         self._setup_proxy(fixed_proxy)
         self.headers = {
             'Host': 'mcs-mimp-web.sf-express.com',
@@ -550,6 +558,22 @@ class SFHttpClient:
         signature = hashlib.md5(data.encode()).hexdigest()
         return {'sysCode': SYS_CODE, 'timestamp': timestamp, 'signature': signature}
 
+    @staticmethod
+    def _detect_auth_fail(payload: Any) -> bool:
+        """检测接口返回是否属于登录凭证失效。"""
+        if not isinstance(payload, dict):
+            return False
+        code = payload.get("code")
+        if code in (401, 403, "401", "403", "A00004"):
+            return True
+        msg = str(payload.get("errorMessage") or payload.get("msg") or "")
+        for kw in ("未登录", "登录已过期", "登录失效", "请先登录", "登录超时",
+                   "token无效", "token失效", "session失效", "Session失效",
+                   "认证失败", "授权失败", "Unauthorized", "invalid session"):
+            if kw in msg:
+                return True
+        return False
+
     def request(self, url: str, data: Optional[Dict] = None, extra_headers: Optional[Dict[str, str]] = None) -> Optional[Dict]:
         proxy_retry_count = 0
         retry_count = 0
@@ -560,7 +584,10 @@ class SFHttpClient:
             try:
                 resp = self.session.post(url, headers=headers, json=data or {}, timeout=PROXY_TIMEOUT)
                 resp.raise_for_status()
-                return resp.json()
+                payload = resp.json()
+                if self._detect_auth_fail(payload):
+                    self.auth_failed = True
+                return payload
             except requests.exceptions.RequestException as e:
                 retry_count += 1
                 error_str = str(e)
@@ -954,45 +981,63 @@ class MemberDayExecutor:
 
 
 # ==================== 核心处理器 ====================
-def run_account(account_raw: str, index: int) -> Dict[str, Any]:
+def run_account(wxid: str, cookie: str, index: int) -> Dict[str, Any]:
     logger = Logger()
-    parts = account_raw.split('#', 1)
-    account_url = parts[0].strip()
-    fixed_proxy = parts[1].strip() if len(parts) > 1 else ""
-    if fixed_proxy.startswith("proxy="):
-        fixed_proxy = fixed_proxy[len("proxy="):]
-    
-    http = SFHttpClient(fixed_proxy)
-    success, user_id, phone = http.login(account_url)
-    if not success:
-        return {'success': False, 'phone': '未登录账号'}
-        
-    masked = phone[:3] + "****" + phone[7:] if len(phone) >= 7 else phone
-    logger.success(f"账号 [{index + 1}] ➔ 【{masked}】激活认证成功")
-    
-    result = {'success': True, 'phone': masked, 'index': index, 'points_earned': 0, 'member_day_prizes': []}
-    
-    if ENABLE_DAILY_TASK:
-        logger.task("开始执行日常积分任务（签到 + 做任务 + 领积分）")
-        daily = DailyTaskExecutor(http, logger, user_id)
-        # 签到前查询当前积分
-        daily.query_points()
-        daily.logger.points(daily.total_points, "当前积分")
-        # 小程序签到
-        daily.sign_in()
-        time.sleep(1)
-        # 签到日历
-        daily.new_sign_in()
-        time.sleep(1)
-        pb, pa = daily.run()
-        result['points_earned'] = pa - pb
-        logger.info(f"日常任务积分变化: {pb} -> {pa} ({(pa - pb):+d})")
-        
-    if ENABLE_MEMBER_DAY and 26 <= datetime.now().day <= 28:
-        md = MemberDayExecutor(http, logger, user_id)
-        result['member_day_prizes'] = md.run().get('lottery_prizes', [])
-        
-    return result
+    masked_phone = "未知"
+
+    for attempt in range(2):
+        http = SFHttpClient("")
+        ok, user_id, phone = http.login(cookie)
+        if not ok:
+            return {'success': False, 'phone': '未登录账号'}
+
+        masked_phone = phone[:3] + "****" + phone[7:] if len(phone) >= 7 else phone
+        logger.success(f"账号 [{index}] ➔ 【{masked_phone}】激活认证成功")
+
+        result = {'success': True, 'phone': masked_phone, 'index': index, 'points_earned': 0, 'member_day_prizes': []}
+
+        if ENABLE_DAILY_TASK:
+            logger.task("开始执行日常积分任务（签到 + 做任务 + 领积分）")
+            daily = DailyTaskExecutor(http, logger, user_id)
+            # 签到前查询当前积分
+            daily.query_points()
+            daily.logger.points(daily.total_points, "当前积分")
+            # 小程序签到
+            daily.sign_in()
+            time.sleep(1)
+            # 签到日历
+            daily.new_sign_in()
+            time.sleep(1)
+            pb, pa = daily.run()
+            result['points_earned'] = pa - pb
+            logger.info(f"日常任务积分变化: {pb} -> {pa} ({(pa - pb):+d})")
+
+        if ENABLE_MEMBER_DAY and 26 <= datetime.now().day <= 28:
+            md = MemberDayExecutor(http, logger, user_id)
+            result['member_day_prizes'] = md.run().get('lottery_prizes', [])
+
+        # 执行中途发现凭证失效：清缓存重新换取并重试一次
+        if http.auth_failed and attempt == 0:
+            logger.warning(f"账号 [{index}] 执行中凭证失效，重新换取Cookie重试...")
+            cache = read_token_cache()
+            if wxid in cache:
+                del cache[wxid]
+                write_token_cache(cache)
+            try:
+                new_cookie = AutoCookieManager().get_cookie_for_wxid(wxid)
+            except Exception:
+                new_cookie = None
+            if new_cookie and "_login_mobile_" in new_cookie:
+                cookie = new_cookie
+                logger.success(f"账号 [{index}] 重新换取Cookie成功，重试一次")
+                continue
+            logger.error(f"账号 [{index}] 重新换取Cookie失败")
+            result['success'] = False
+            result['error'] = '凭证失效且重新换取失败'
+            return result
+        return result
+
+    return {'success': False, 'phone': masked_phone, 'error': '登录失效'}
 
 
 def _auto_fetch_cookies() -> List[str]:
@@ -1038,68 +1083,53 @@ def dispatch_summary(logger: Logger, results: List[Dict[str, Any]]) -> None:
     failed = total - success
     total_earned = sum(int(r.get("points_earned") or 0) for r in results if r.get("success"))
 
-    lines = [
-        "==============================",
-        f"🕒 执行时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"📊 统计数据：成功 {success} / 总计 {total}",
-        f"✅ 成功账号：{success} 个",
-        f"❌ 失败账号：{failed} 个",
-        f"💰 累计积分：+{total_earned}",
-        "==============================",
-    ]
+    print()
+    print("╔" + "═" * 48 + "╗")
+    print("║  🏁 顺丰速运任务完成                            ║")
+    print("║  ✅ 成功: " + _pad_str(str(success), 26) + "║")
+    print("║  ❌ 失败: " + _pad_str(str(failed), 26) + "║")
+    print("║  💰 积分: " + _pad_str("+" + str(total_earned), 26) + "║")
+    print("║  🕒 结束时间: " + _pad_str(datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 22) + "║")
+    print("╚" + "═" * 48 + "╝")
 
     for idx, r in enumerate(results, 1):
         ok = bool(r.get("success"))
-        account_icon = "👤"
         account = r.get("phone") or "未知账号"
-        lines.extend([
-            f"{account_icon} 【账号{idx}】{account}",
-            f"{'✅' if ok else '❌'} 状态：{'执行成功' if ok else '执行失败'}",
-        ])
-
+        print()
+        print(f"👤 账号{idx} {account}: {'✅ 执行成功' if ok else '❌ 执行失败'}")
         if ok:
-            lines.append(f"💰 积分：+{int(r.get('points_earned') or 0)}")
+            print(f"   💰 积分: +{int(r.get('points_earned') or 0)}")
             prizes = r.get("member_day_prizes") or []
             if prizes:
-                lines.append(f"🎁 会员日：{', '.join(str(p) for p in prizes)}")
+                print(f"   🎁 会员日: {', '.join(str(p) for p in prizes)}")
         else:
-            lines.append(f"⚠️ 原因：{r.get('error') or '登录失效'}")
-
-        lines.append("------------------------------")
-
-    print("\n[执行报表]\n" + "\n".join(lines))
+            print(f"   ⚠️ 原因: {r.get('error') or '登录失效'}")
 
 
 def main():
     account_list = _auto_fetch_cookies() if SF_AUTO_COOKIE else []
-    
+
     if not account_list:
         print("❌ 未捕获到在线顺丰账号凭证，请检查 YYB_SERVER 配置")
         return 1
 
-    print("==================================================")
-    print(f"🎉 顺丰速运任务启动... 共加载 {len(account_list)} 个账户")
-    print("==================================================")
+    print()
+    print("╔" + "═" * 48 + "╗")
+    print("║  📦 顺丰速运 自动任务                          ║")
+    print("║  🕒 启动时间: " + _pad_str(datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 25) + "║")
+    print("║  🔢 账号数量: " + _pad_str(str(len(account_list)), 25) + "║")
+    print("╚" + "═" * 48 + "╝")
 
     results: List[Dict[str, Any]] = []
-    for idx, (wxid, raw) in enumerate(account_list):
-        result = run_account(raw, idx)
+    for idx, (wxid, raw) in enumerate(account_list, 1):
+        print()
+        print("┌" + "─" * 48 + "┐")
+        print("│  🧩 账号 " + _pad_str(f"{idx} / {len(account_list)}", 40) + "│")
+        print("│  🔑 标识: " + _pad_str(mask_account(wxid), 39) + "│")
+        print("└" + "─" * 48 + "┘")
+        result = run_account(wxid, raw, idx)
         if not result.get('success'):
             result.setdefault('error', result.get('phone') or '登录失效')
-            # 缓存 cookie 失效：清除该账号缓存后重新获取凭证并重试一次
-            cache = read_token_cache()
-            if wxid in cache:
-                print(f"🔄 [重登] 账号{idx + 1} cookie失效，重新登录")
-                del cache[wxid]
-                write_token_cache(cache)
-                try:
-                    new_cookie = AutoCookieManager().get_cookie_for_wxid(wxid)
-                except Exception:
-                    new_cookie = None
-                if new_cookie:
-                    result = run_account(new_cookie, idx)
-                    if not result.get('success'):
-                        result.setdefault('error', result.get('phone') or '登录失效')
         results.append(result)
         time.sleep(2)
 
@@ -1110,3 +1140,4 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+#（注：内容由AI生成）
