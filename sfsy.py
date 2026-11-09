@@ -382,7 +382,6 @@ class AutoCookieManager:
         cache = read_token_cache()
         cached_cookie = (cache.get(wxid) or {}).get("cookie", "")
         if cached_cookie:
-            _log_global(f"💾 {wxid[:10]}*** [缓存] 使用缓存cookie")
             return cached_cookie
 
         code = self._get_wx_code(wxid, SF_WX_APPID)
@@ -569,7 +568,8 @@ class SFHttpClient:
         msg = str(payload.get("errorMessage") or payload.get("msg") or "")
         for kw in ("未登录", "登录已过期", "登录失效", "请先登录", "登录超时",
                    "token无效", "token失效", "session失效", "Session失效",
-                   "认证失败", "授权失败", "Unauthorized", "invalid session"):
+                   "认证失败", "授权失败", "Unauthorized", "invalid session",
+                   "用户信息失效", "请退出重新进入"):
             if kw in msg:
                 return True
         return False
@@ -1056,6 +1056,7 @@ def _auto_fetch_cookies() -> List[str]:
 
     for index, wxid in enumerate(wxids, 1):
         try:
+            hit_cache = bool((read_token_cache().get(wxid) or {}).get("cookie"))
             cookie = mgr.get_cookie_for_wxid(wxid)
         except Exception as exc:
             cookie = None
@@ -1064,7 +1065,10 @@ def _auto_fetch_cookies() -> List[str]:
         if cookie and "_login_mobile_" in cookie:
             cookies.append((wxid, cookie))
             AUTO_COOKIE_INDEX_BY_VALUE[cookie] = index
-            _log_global(f"👤 账号[{index}] {mask_account(wxid)} 自动换 Cookie 成功")
+            if hit_cache:
+                _log_global(f"💾 账号[{index}] {mask_account(wxid)} 使用缓存Cookie")
+            else:
+                _log_global(f"🧠 账号[{index}] {mask_account(wxid)} 自动换 Cookie 成功")
             continue
 
         _log_global(f"❌ 账号[{index}] {mask_account(wxid)} 自动换 Cookie 失败")
@@ -1140,4 +1144,3 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
-#（注：内容由AI生成）
