@@ -2,31 +2,43 @@
 # -*- coding: utf-8 -*-
 # name: 鸿星尔克
 # cron: 18 9,21 * * *
+"""
+鸿星尔克小程序 自动签到
+
+环境变量：
+- YYB_SERVER        必填；YYB Go 地址@微信账号标识，多账号每行一条，可带 #备注
+- HXEK_NOTIFY       默认 1；0=关闭青龙 notify.py 通知
+- PLUSPLUS_TOKEN    可选；配置后额外走 PushPlus 推送
+
+缓存：脚本目录 token_caches/hxek_token_cache.json，按「地址|标识」隔离，不设固定过期
+"""
 
 import hashlib
+import importlib.util
 import json
 import os
 import random
+import re
 import time
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 
 import requests
 
-try:
-    import notify
-except ImportError:
-    notify = None
-
 APP_NAME = "鸿星尔克"
 APP_ID = "wxa1f1fa3785a47c7d"
 ENTERPRISE_ID = "ff8080817d9fbda8017dc20674f47fb6"
 SECRET = "damogic8888"
+LOGIN_URL = "https://hope.demogic.com/gic-wx-app/on_login.json"
+SIGN_URL = "https://hope.demogic.com/gic-wx-app/member_sign.json"
 
-SERVERS = [line.strip() for line in os.getenv("YYB_SERVER", "").splitlines() if line.strip()]
-if not SERVERS:
-    print("❌ 未配置环境变量 YYB_SERVER")
-    exit(1)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_CACHE_FILE = os.path.join(BASE_DIR, "token_caches", "hxek_token_cache.json")
+NOTIFY_ENABLED = os.getenv("HXEK_NOTIFY", "1") != "0"
+PLUSPLUS_TOKEN = os.getenv("PLUSPLUS_TOKEN", "")
+
+BOX_WIDTH = 48
+BOX_INNER = 46
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -36,29 +48,69 @@ UA = (
     "UnifiedPCWindowsWechat(0xf2541923) XWEB/19823"
 )
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "hxek_token_cache.json")
+# 只有明确的会员/登录失效提示才清缓存重登，业务失败（活动结束、太火爆）不重登
+AUTH_PATTERN = re.compile(
+    r"未登录|登录失效|登录已过期|请重新登录|token\s*(无效|过期|失效)"
+    r"|memberId\s*(无效|不存在|错误)|会员不存在|用户不存在|账号异常"
+    r"|-4011|\b401\b|\b403\b",
+    re.I,
+)
 
 
-def read_token_cache() -> dict:
-    try:
-        if not os.path.exists(TOKEN_CACHE_FILE):
-            return {}
-        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f) or {}
-    except Exception:
-        return {}
+# ====================== 日志与边框 ======================
+def log(*args):
+    print(*args, flush=True)
 
 
-def write_token_cache(cache: dict) -> None:
-    try:
-        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
-        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+def _display_width(text):
+    width = 0
+    for ch in str(text):
+        code = ord(ch)
+        if code in (0xfe0f, 0xfe0e, 0x200d):
+            continue
+        width += 2 if code > 0xff else 1
+    return width
 
 
+def _pad(text, width):
+    text = str(text)
+    while _display_width(text) > width:
+        text = text[:-1]
+    return text + " " * max(0, width - _display_width(text))
+
+
+def box_top(title):
+    print()
+    print("╔" + "═" * BOX_WIDTH + "╗")
+    print("║  " + _pad(title, BOX_INNER) + "║")
+
+
+def box_line(label, value):
+    print("║  " + _pad(f"{label}: {value}", BOX_INNER) + "║")
+
+
+def box_bottom():
+    print("╚" + "═" * BOX_WIDTH + "╝")
+
+
+def account_frame(index, total, title, source):
+    print()
+    print("┌" + "─" * BOX_WIDTH + "┐")
+    print("│  " + _pad(f"🧩 账号 {index} / {total}　{title}", BOX_INNER) + "│")
+    print("│  " + _pad(f"🔗 来源: {source}", BOX_INNER) + "│")
+    print("└" + "─" * BOX_WIDTH + "┘")
+
+
+def hr():
+    print()
+    print("-" * BOX_WIDTH)
+
+
+def now_text():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ====================== 工具 ======================
 def china_ts() -> str:
     return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -68,18 +120,109 @@ def mask_id(mid: str) -> str:
     return mid if len(mid) <= 6 else f"{mid[:3]}****{mid[-3:]}"
 
 
-def parse_yyb(raw: str):
-    raw = (raw or "").strip()
-    if not raw or "@" not in raw:
-        return None, None
-    server, ref = raw.split("@", 1)
-    server = server.strip().replace("http://", "").replace("https://", "").rstrip("/")
-    return server, ref.strip()
+def to_number(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
-def get_wx_code(server_entry: str) -> str | None:
-    server, ref = parse_yyb(server_entry)
+def fmt_points(value):
+    return str(value) if value is not None and value != "?" else "未知"
+
+
+def brief(value, limit=120):
+    text = str(value or "").replace("\n", " ")
+    return text[: limit - 1] + "…" if len(text) > limit else text
+
+
+def parse_entry(raw):
+    """解析 地址@标识[#备注]，返回 (server, ref, note)"""
+    value = str(raw or "").strip()
+    note = ""
+    body = value
+    hash_pos = value.rfind("#")
+    at_pos = value.rfind("@")
+    if hash_pos > at_pos:
+        body = value[:hash_pos].strip()
+        note = value[hash_pos + 1:].strip()
+    if at_pos <= 0:
+        return "", "", note
+    server = body[:at_pos].strip()
+    ref = body[at_pos + 1:].strip()
+    server = re.sub(r"^https?://", "", server, flags=re.I).rstrip("/")
+    return server, ref, note
+
+
+def parse_yyb(raw):
+    server, ref, _ = parse_entry(raw)
+    return server, ref
+
+
+def cache_key(server, ref):
+    return f"{server}|{ref}"
+
+
+# ====================== 缓存 ======================
+def read_token_cache() -> dict:
+    try:
+        if not os.path.exists(TOKEN_CACHE_FILE):
+            return {}
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_token_cache(cache: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        log(f"   ⚠️ [缓存] 写入失败（不影响执行）：{exc}")
+
+
+def read_cache_entry(ck, ref, raw):
+    cache = read_token_cache()
+    if (cache.get(ck) or {}).get("memberId"):
+        return cache[ck]
+    # 兼容旧版仅按标识存的缓存：读到即迁移
+    for key in (ref, raw):
+        entry = cache.get(key) or {}
+        if entry.get("memberId"):
+            cache[ck] = entry
+            for k in (ref, raw):
+                cache.pop(k, None)
+            write_token_cache(cache)
+            log("   🗂️ [缓存] 已将旧缓存键迁移为「地址|标识」")
+            return entry
+    return {}
+
+
+def save_cache_entry(ck, member_id):
+    cache = read_token_cache()
+    cache[ck] = {"memberId": member_id, "updatedAt": now_text()}
+    write_token_cache(cache)
+
+
+def drop_cache_entry(ck):
+    cache = read_token_cache()
+    if ck in cache:
+        cache.pop(ck, None)
+        write_token_cache(cache)
+
+
+# ====================== 取码 ======================
+def get_wx_code(server_entry: str):
+    server, ref, _ = parse_entry(server_entry)
     if not server or not ref:
+        log("   ❌ [配置] YYB_SERVER 格式应为 地址@微信账号标识[#备注]")
         return None
     try:
         resp = requests.post(
@@ -88,17 +231,29 @@ def get_wx_code(server_entry: str) -> str | None:
             timeout=20, proxies={"http": None, "https": None},
         )
         data = resp.json()
-        code = (((data.get("data") or {}).get("result") or {}).get("code"))
-        if data.get("code") == 0 and code:
-            print(f"✅ [取码] 获取code成功")
+        result = (data.get("data") or {}).get("result")
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:
+                result = {}
+        code = (result or {}).get("code")
+        try:
+            code_num = int(str(data.get("code")))
+        except (TypeError, ValueError):
+            code_num = -1
+        if code_num == 0 and code:
+            log("   ✅ [取码] 取码成功")
             return code
-        print(f"❌ [取码] 获取code失败")
+        log(f"   ❌ [取码] 取码失败：{brief(data)}")
         return None
     except Exception as e:
-        print(f"❌ [取码] 获取code异常: {e}")
+        log(f"   ❌ [取码] 取码异常：{e}")
+        log(f"   💡 [提示] 请检查 YYB 服务地址 http://{server} 是否在线、{ref} 是否已登录")
         return None
 
 
+# ====================== 业务接口 ======================
 def make_sign(ts: str, rand: int, member_id: str = "-1") -> str:
     raw = f"timestamp={ts}transId={APP_ID}{ts}secret={SECRET}random={rand}memberId={member_id}"
     return hashlib.md5(raw.encode()).hexdigest()
@@ -113,7 +268,7 @@ def build_sys_info() -> str:
     }, ensure_ascii=False, separators=(",", ":"))
 
 
-def extract_member_id(data) -> str | None:
+def extract_member_id(data):
     if not isinstance(data, dict):
         return None
     for path in [
@@ -132,7 +287,7 @@ def extract_member_id(data) -> str | None:
     return None
 
 
-def login_by_code(server: str, code: str) -> str | None:
+def login_by_code(server: str, code: str):
     ts = china_ts()
     rand = random.randint(1000000, 9999999)
     sign = make_sign(ts, rand, "-1")
@@ -144,7 +299,8 @@ def login_by_code(server: str, code: str) -> str | None:
         "random": str(rand), "appid": APP_ID,
         "transId": f"{APP_ID}{ts}", "sign": sign, "timestamp": ts,
         "gicWxaVersion": "3.9.74",
-        "launchOptions": json.dumps({"path": "pages/authorize/authorize", "query": {}, "scene": 1027}, ensure_ascii=False, separators=(",", ":")),
+        "launchOptions": json.dumps({"path": "pages/authorize/authorize", "query": {}, "scene": 1027},
+                                    ensure_ascii=False, separators=(",", ":")),
     }
     headers = {
         "User-Agent": UA, "channelEntrance": "wx_app", "xweb_xhr": "1",
@@ -152,31 +308,31 @@ def login_by_code(server: str, code: str) -> str | None:
         "Referer": f"https://servicewechat.com/{APP_ID}/89/page-frame.html",
     }
     try:
-        print(f"🔐 [登录] 正在换取memberId...")
-        res = requests.post("https://hope.demogic.com/gic-wx-app/on_login.json",
-                            headers=headers, data=urlencode(body), timeout=30)
+        log("   🔐 [登录] 正在换取 memberId...")
+        res = requests.post(LOGIN_URL, headers=headers, data=urlencode(body),
+                            timeout=30, proxies={"http": None, "https": None})
         data = res.json()
         mid = extract_member_id(data)
         if mid:
-            print(f"✅ [登录] 登录成功: {mask_id(mid)}")
+            log(f"   ✅ [登录] 登录成功：{mask_id(mid)}")
             return mid
-        print(f"❌ [登录] 登录失败: {str(data)[:150]}")
+        log(f"   ❌ [登录] 登录失败：{brief(data, 150)}")
         return None
     except Exception as e:
-        print(f"❌ [登录] 登录异常: {e}")
+        log(f"   ❌ [登录] 登录异常：{e}")
         return None
 
 
 def sign_once(member_id: str) -> dict:
     ts = china_ts()
     rand = random.randint(1000000, 9999999)
-    trans_id = f"{APP_ID}{ts}"
     sign = make_sign(ts, rand, member_id)
     body = {
         "memberId": member_id, "cliqueId": "-1", "cliqueMemberId": "-1", "useClique": "0",
         "enterpriseId": ENTERPRISE_ID, "random": str(rand), "sign": sign,
-        "timestamp": ts, "transId": trans_id, "gicWxaVersion": "3.9.74",
-        "launchOptions": json.dumps({"path": "pages/authorize/authorize", "scene": 1256}, ensure_ascii=False, separators=(",", ":")),
+        "timestamp": ts, "transId": f"{APP_ID}{ts}", "gicWxaVersion": "3.9.74",
+        "launchOptions": json.dumps({"path": "pages/authorize/authorize", "scene": 1256},
+                                    ensure_ascii=False, separators=(",", ":")),
     }
     headers = {
         "User-Agent": UA, "channelEntrance": "wx_app", "xweb_xhr": "1",
@@ -184,124 +340,235 @@ def sign_once(member_id: str) -> dict:
         "Accept": "*/*", "Referer": f"https://servicewechat.com/{APP_ID}/89/page-frame.html",
     }
     try:
-        res = requests.post("https://hope.demogic.com/gic-wx-app/member_sign.json",
-                            headers=headers, data=urlencode(body), timeout=30)
+        res = requests.post(SIGN_URL, headers=headers, data=urlencode(body),
+                            timeout=30, proxies={"http": None, "https": None})
         if not res.ok:
-            return {"ok": False, "msg": f"HTTP {res.status_code}"}
+            return {"ok": False, "msg": f"HTTP {res.status_code}", "auth": res.status_code in (401, 403)}
         data = res.json()
-        errcode = data.get("errcode")
+        errcode = to_number(data.get("errcode"))
         if errcode == 0:
             result = data.get("response") or {}
             ms = result.get("memberSign") or {}
             integral = ms.get("integralCount", "?")
             continuous = ms.get("continuousCount", "?")
             points = result.get("points", "?")
-            return {"ok": True, "msg": f"签到成功 +{integral}积分，连续{continuous}天", "points": points}
-        errmsg = data.get("errmsg") or (data.get("response") or {}).get("errmsg") or ""
-        # 判断是否已签到
+            return {"ok": True, "msg": f"签到成功 +{integral}积分，连续{continuous}天",
+                    "points": points, "auth": False}
+        errmsg = str(data.get("errmsg") or (data.get("response") or {}).get("errmsg") or "")
         if "已签" in errmsg or "重复" in errmsg:
-            return {"ok": True, "msg": "今日已签到", "points": "?"}
-        return {"ok": False, "msg": f"签到失败: {errmsg}"}
+            text = "今日已签到" if ("今日已签" in errmsg or "今天已签" in errmsg) else f"今日已签到（{errmsg}）"
+            return {"ok": True, "msg": text, "points": "?", "auth": False}
+        return {"ok": False, "msg": f"签到失败：{errmsg or brief(data)}", "auth": bool(AUTH_PATTERN.search(errmsg))}
     except Exception as e:
-        return {"ok": False, "msg": str(e)}
+        return {"ok": False, "msg": f"请求异常：{e}", "auth": False}
 
 
-# ====================== 输出美化 ======================
-def log_title():
-    print()
-    print("╔" + "═".repeat(48) + "╗")
-    print("║  👟 鸿星尔克 自动签到                          ║")
-    print(f"║  🕒 启动时间: {datetime.now().strftime('%Y/%m/%d %H:%M:%S').ljust(22)}║")
-    print(f"║  🔢 账号数量: {str(len(SERVERS)).ljust(22)}║")
-    print("╚" + "═".repeat(48) + "╝")
+# ====================== 单账号 ======================
+def run_account(idx: int, total: int, server_entry: str) -> dict:
+    server, ref, note = parse_entry(server_entry)
+    title = f"标识 {ref}" + (f"（{note}）" if note else "")
+    account_frame(idx, total, title or "标识 未解析", f"{server}@{ref}" if ref else server_entry)
 
+    result = {
+        "index": idx,
+        "source": f"{server}@{ref}" if ref else server_entry,
+        "name": note or ref or f"账号{idx}",
+        "success": False,
+        "loginSource": "",
+        "member": "-",
+        "signMsg": "-",
+        "points": "未知",
+        "error": "",
+    }
 
-def log_account(idx, total, server):
-    _, ref = parse_yyb(server)
-    print()
-    print("┌" + "─".repeat(48) + "┐")
-    print(f"│  🧩 账号 {idx} / {total}{' '*26}│")
-    print(f"│  🔑 标识: {str(ref or '-').ljust(41)}│")
-    print("└" + "─".repeat(48) + "┘")
+    if not server or not ref:
+        result["error"] = "YYB_SERVER 格式错误（应为 地址@微信账号标识）"
+        log(f"   ❌ [配置] {result['error']}")
+        return result
 
-
-def log_end(ok, fail):
-    print()
-    print("╔" + "═".repeat(48) + "╗")
-    print("║  🏁 鸿星尔克任务完成                          ║")
-    print(f"║  ✅ 成功: {str(ok).ljust(22)}║")
-    print(f"║  ❌ 失败: {str(fail).ljust(22)}║")
-    print(f"║  🕒 结束时间: {datetime.now().strftime('%Y/%m/%d %H:%M:%S').ljust(22)}║")
-    print("╚" + "═".repeat(48) + "╝")
-
-
-def run_account(idx: int, total: int, server_entry: str) -> bool:
-    server, ref = parse_yyb(server_entry)
-    log_account(idx, total, server_entry)
-
-    member_id = None
-    used_cache = False
-
-    # 读缓存
-    cache = read_token_cache()
-    cached = cache.get(ref) or {}
-    if cached.get("memberId"):
-        member_id = cached["memberId"]
-        used_cache = True
-        print(f"💾 [缓存] 使用缓存memberId: {mask_id(member_id)}")
+    ck = cache_key(server, ref)
+    member_id = ""
 
     for attempt in range(2):
-        try:
-            if attempt == 1 or not member_id:
-                if attempt == 1:
-                    print(f"🔄 [重登] memberId失效，清除缓存重新登录...")
-                    if ref in cache:
-                        del cache[ref]
-                        write_token_cache(cache)
-                if not member_id:
-                    code = get_wx_code(server_entry)
-                    if not code:
-                        return False
-                    member_id = login_by_code(server, code)
-                    if not member_id:
-                        return False
-                    cache = read_token_cache()
-                    cache[ref] = {"memberId": member_id}
-                    write_token_cache(cache)
+        # ---------- ① 复用缓存 ----------
+        if attempt == 0 and not member_id:
+            entry = read_cache_entry(ck, ref, server_entry)
+            if entry.get("memberId"):
+                member_id = entry["memberId"]
+                log(f"   💾 [缓存] 复用已保存的 memberId：{mask_id(member_id)}")
+                result["loginSource"] = "缓存"
+                result["member"] = mask_id(member_id)
 
-            time.sleep(random.uniform(1, 2))
-            result = sign_once(member_id)
-            if result["ok"]:
-                print(f"✅ [签到] {result['msg']}" + (f" | 余额: {result['points']}" if result.get("points") and result["points"] != "?" else ""))
+        # ---------- ② 没有缓存 → 取码登录 ----------
+        if not member_id:
+            code = get_wx_code(server_entry)
+            if not code:
+                result["error"] = "取码失败（检查 YYB 服务地址与账号标识）"
+                log("   ❌ [登录] 取码失败，跳过该账号")
+                return result
+            member_id = login_by_code(server, code)
+            if not member_id:
+                result["error"] = "登录失败（on_login 未返回 memberId，见上方日志）"
+                log("   ❌ [登录] 登录失败，跳过该账号")
+                return result
+            save_cache_entry(ck, member_id)
+            result["loginSource"] = "新登录"
+            result["member"] = mask_id(member_id)
+
+        # ---------- ③ 签到 ----------
+        time.sleep(random.uniform(1, 2))
+        sign = sign_once(member_id)
+        result["signMsg"] = sign["msg"]
+        if sign.get("points", "?") != "?":
+            result["points"] = fmt_points(sign.get("points"))
+            log(f"   💰 [积分] 当前 {result['points']} 分")
+
+        if sign["ok"]:
+            log(f"   ✅ [签到] {sign['msg']}")
+            result["success"] = True
+            log("   ✅ [完成] 该账号任务执行完成")
+            return result
+
+        log(f"   ❌ [签到] {sign['msg']}")
+        # 只有明确的会员/登录失效才清缓存重登；业务失败直接判失败
+        if sign.get("auth") and attempt == 0:
+            log("   🔄 [重试] 会员凭证失效，清理缓存重登后重跑一次")
+            drop_cache_entry(ck)
+            member_id = ""
+            continue
+
+        result["error"] = sign["msg"]
+        log("   ⚠️ [完成] 签到未成功")
+        return result
+
+    result["error"] = result["error"] or "重试后仍未完成（详见上方日志）"
+    return result
+
+
+# ====================== 通知 ======================
+def build_notify(results):
+    lines = [f"### {APP_NAME} 每日签到"]
+    for r in results:
+        flag = "✅" if r["success"] else "❌"
+        lines.append("")
+        lines.append(f"#### {flag} 账号 {r['index']} · {r['source']}")
+        if r["loginSource"]:
+            lines.append(f"- 登录：{r['loginSource']}")
+            lines.append(f"- 会员：{r['member']}")
+            lines.append(f"- 签到：{r['signMsg'] or '无结果'}")
+            lines.append(f"- 积分：{r['points']}")
+        if not r["success"]:
+            lines.append(f"- 失败原因：{r['error'] or '未知'}")
+    return "\n".join(lines)
+
+
+def send_qinglong_notify(title, content):
+    if not NOTIFY_ENABLED:
+        log("   ℹ️ [通知] HXEK_NOTIFY=0，已关闭通知")
+        return False
+    for candidate in (
+        "/ql/data/scripts/notify.py",
+        "/ql/scripts/notify.py",
+        "/ql/data/notify.py",
+        os.path.join(BASE_DIR, "notify.py"),
+    ):
+        if not os.path.exists(candidate):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("hxek_ql_notify", candidate)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            sender = getattr(module, "send", None) or getattr(module, "sendNotify", None)
+            if callable(sender):
+                sender(title, content)
+                log("   📨 [通知] 已通过青龙 notify.py 推送")
                 return True
-            else:
-                if attempt == 0 and used_cache:
-                    print(f"🔄 [重登] 签到失败({result['msg']})，重新登录...")
-                    continue
-                print(f"❌ [签到] {result['msg']}")
-                return False
-        except Exception as e:
-            print(f"❌ [执行] 异常: {e}")
-            return False
+        except Exception as exc:
+            log(f"   ⚠️ [通知] 加载 {candidate} 失败：{exc}")
     return False
 
 
-def main():
-    log_title()
-    ok_count = 0
-    fail_count = 0
-    for i, srv in enumerate(SERVERS):
-        if run_account(i + 1, len(SERVERS), srv):
-            ok_count += 1
-        else:
-            fail_count += 1
-        time.sleep(2)
-    log_end(ok_count, fail_count)
+def send_pushplus(title, content):
+    if not PLUSPLUS_TOKEN:
+        log("   ℹ️ [推送] 未配置 PLUSPLUS_TOKEN，跳过 PushPlus")
+        return
+    try:
+        requests.post("https://www.pushplus.plus/send", json={
+            "token": PLUSPLUS_TOKEN, "title": title, "content": content, "template": "txt",
+        }, timeout=10, proxies={"http": None, "https": None})
+        log("   📨 [推送] PushPlus 推送成功")
+    except Exception as e:
+        log(f"   ⚠️ [推送] PushPlus 推送失败：{e}")
 
-    if notify:
-        lines = [f"鸿星尔克签到: ✅{ok_count} ❌{fail_count}"]
-        notify.send(APP_NAME, "\n".join(lines))
+
+# ====================== 主入口 ======================
+def main():
+    servers = [line.strip() for line in os.getenv("YYB_SERVER", "").splitlines() if line.strip()]
+
+    box_top(f"👟 {APP_NAME} 自动签到")
+    if not servers:
+        box_line("⚠️ 状态", "未配置 YYB_SERVER")
+        box_bottom()
+        log("格式：YYB Go 地址@微信账号标识，多账号每行一条，可带 #备注")
+        return []
+    box_line("🕒 启动时间", now_text())
+    box_line("🔢 账号数量", f"{len(servers)} 个")
+    box_line("💾 缓存", "token_caches/hxek_token_cache.json")
+    box_bottom()
+
+    results = []
+    for idx, entry in enumerate(servers, 1):
+        try:
+            results.append(run_account(idx, len(servers), entry))
+        except Exception as exc:
+            server, ref, note = parse_entry(entry)
+            log(f"   ❌ [异常] 该账号执行异常：{exc}")
+            results.append({
+                "index": idx,
+                "source": f"{server}@{ref}" if ref else entry,
+                "name": note or ref or f"账号{idx}",
+                "success": False,
+                "loginSource": "",
+                "member": "-",
+                "signMsg": "-",
+                "points": "未知",
+                "error": f"执行异常：{exc}",
+            })
+        hr()
+        if idx < len(servers):
+            log("   ⏳ 等待2秒后执行下一个账号...")
+            time.sleep(2)
+
+    print()
+    for r in results:
+        icon = "✅" if r["success"] else "❌"
+        title = f"【账号 {r['index']} · {r['source']}】"
+        if r["name"] and r["name"] != r["source"]:
+            title = f"【账号 {r['index']} · {r['source']}（{r['name']}）】"
+        log(f"{icon} {title}")
+        if r["loginSource"]:
+            log(f"   🔐 [登录] {r['loginSource']}")
+            log(f"   🆔 [会员] {r['member']}")
+            log(f"   📅 [签到] {r['signMsg'] or '-'}")
+            log(f"   💰 [积分] {r['points']}")
+        if not r["success"]:
+            log(f"   ⚠️ [失败] {r['error'] or '未知原因'}")
+
+    ok_count = sum(1 for r in results if r["success"])
+    fail_count = len(results) - ok_count
+
+    box_top(f"🏁 {APP_NAME} 执行汇总")
+    box_line("📊 执行结果", f"成功 {ok_count} / 失败 {fail_count} / 共 {len(results)}")
+    box_bottom()
+
+    content = build_notify(results)
+    send_qinglong_notify(f"{APP_NAME}每日签到", content)
+    send_pushplus(f"{APP_NAME}每日签到", content)
+    return results
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log(f"❌ 程序异常: {e}")
