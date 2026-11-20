@@ -437,6 +437,14 @@ def notify(message):
 
 
 def summary_box(results, targets) -> None:
+    """逐账号明细在前，汇总框收尾。"""
+    print()
+    for i, (r, (_, ref)) in enumerate(zip(results, targets), 1):
+        icon = "✅" if r["success"] else "❌"
+        print(f"{icon} 账号{i}（{ref}）：{r['status'] or r['error']}")
+        if r["success"]:
+            print(f"   🎯 活动ID {r['aggr']}")
+
     ok = sum(1 for r in results if r["success"])
     fail = len(results) - ok
     box_top("🏁 长虹智慧家居 任务完成")
@@ -444,12 +452,6 @@ def summary_box(results, targets) -> None:
     box_line("❌ 失败", fail)
     box_line("🕒 结束时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     box_bottom()
-
-    for i, (r, (_, ref)) in enumerate(zip(results, targets), 1):
-        icon = "✅" if r["success"] else "❌"
-        print(f"{icon} 账号{i}（{ref}）：{r['status'] or r['error']}")
-        if r["success"]:
-            print(f"   🎯 活动ID {r['aggr']}")
 
 
 def main():
@@ -489,4 +491,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-#（注：内容由AI生成）
