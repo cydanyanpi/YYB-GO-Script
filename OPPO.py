@@ -132,6 +132,109 @@ def points_text(amount) -> str:
     return str(amount)
 
 
+# =============================================================================
+# 日志美化
+# =============================================================================
+BOX_WIDTH = 48
+BOX_INNER = 46
+
+
+def now_text() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _pad_str(value, width: int) -> str:
+    text = str(value)
+    length = 0
+    for ch in text:
+        if ch in ("\ufe0f", "\ufe0e", "\u200d"):
+            continue
+        length += 2 if ord(ch) > 255 else 1
+    return text + " " * max(0, width - length)
+
+
+def box_top(title: str) -> None:
+    log("")
+    log("╔" + "═" * BOX_WIDTH + "╗")
+    log("║  " + _pad_str(title, BOX_INNER) + "║")
+
+
+def box_line(label: str, value) -> None:
+    log("║  " + _pad_str(f"{label}: {value}", BOX_INNER) + "║")
+
+
+def box_bottom() -> None:
+    log("╚" + "═" * BOX_WIDTH + "╝")
+
+
+def account_frame(index: int, total: int, title: str, source: str) -> None:
+    log("")
+    log("┌" + "─" * BOX_WIDTH + "┐")
+    log("│  " + _pad_str(f"🧩 账号 {index} / {total}　{title}", BOX_INNER) + "│")
+    log("│  " + _pad_str(f"🔗 来源: {source}", BOX_INNER) + "│")
+    log("└" + "─" * BOX_WIDTH + "┘")
+
+
+def hr() -> None:
+    log("")
+    log("-" * BOX_WIDTH)
+
+
+# =============================================================================
+# 登录态失效判定（只认明确凭证类提示，避免把业务错误误判为登录失效）
+# =============================================================================
+AUTH_HINTS = (
+    "未登录", "登录已失效", "登录失效", "请重新登录", "重新登录",
+    "session失效", "session已失效", "NEWOPPOSID", "凭证失效",
+)
+
+
+def is_auth_error(data: Any) -> bool:
+    if not isinstance(data, dict) or data.get("_error"):
+        return False
+    if data.get("code") in (401, 403):
+        return True
+    msg = str(data.get("message") or data.get("errorMessage") or data.get("msg") or "")
+    return any(hint in msg for hint in AUTH_HINTS)
+
+
+def brief_error(value: Any, limit: int = 80) -> str:
+    text = str(value or "").replace("\n", " ").strip()
+    if not text:
+        return "未知错误"
+    return text[: limit - 1] + "…" if len(text) > limit else text
+
+
+# =============================================================================
+# 青龙 notify.py 推送
+# =============================================================================
+def send_qinglong_notify(title: str, content: str) -> bool:
+    if os.getenv("OPPO_NOTIFY", "1") == "0":
+        log("   ℹ️ [通知] OPPO_NOTIFY=0，已关闭通知")
+        return False
+    for path in (
+        "/ql/data/scripts/notify.py",
+        "/ql/scripts/notify.py",
+        "/ql/data/notify.py",
+        os.path.join(_SCRIPT_DIR, "notify.py"),
+    ):
+        if not os.path.exists(path):
+            continue
+        try:
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location("oppo_ql_notify", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            sender = getattr(module, "send", None) or getattr(module, "sendNotify", None)
+            if callable(sender):
+                sender(title, content)
+                return True
+        except Exception as exc:
+            log(f"   ⚠️ [通知] 加载 {path} 失败：{exc}")
+    return False
+
+
 def generate_sign(params: Dict[str, Any]) -> Tuple[str, int, str]:
     """生成 MD5 签名，返回 (sign, timestamp, nonce)"""
     data = params.copy()
@@ -254,10 +357,10 @@ def validate_proxy(proxies: Optional[Dict[str, str]]) -> Tuple[bool, str]:
 
 def get_valid_proxy(account_name: str) -> Tuple[Optional[Dict[str, str]], str]:
     if not PROXY_API:
-        log(f"⚠️ [代理] {account_name} 未配置 PROXY_API，使用直连")
+        log("   ℹ️ [代理] 未配置 PROXY_API，使用直连")
         return None, ""
 
-    log(f"🌐 [代理] {account_name} 正在获取品赞代理...")
+    log("   🌐 [代理] 正在获取品赞代理...")
 
     for index in range(1, PROXY_RETRY_TIMES + 1):
         try:
@@ -265,24 +368,24 @@ def get_valid_proxy(account_name: str) -> Tuple[Optional[Dict[str, str]], str]:
             proxy_info = parse_proxy_response(response.text)
 
             if not proxy_info:
-                log(f"⚠️ [代理] 第 {index} 次代理解析失败")
+                log(f"   ⚠️ [代理] 第 {index} 次代理解析失败")
                 continue
 
-            log(f"✅ [代理] 提取到 {proxy_info['host']}:{proxy_info['port']}")
+            log(f"   ✅ [代理] 提取到 {proxy_info['host']}:{proxy_info['port']}")
             proxies = build_proxy_dict(proxy_info)
 
             ok, ip = validate_proxy(proxies)
             if ok:
                 return proxies, ip
 
-            log(f"⚠️ [代理] 第 {index} 次代理不可用")
+            log(f"   ⚠️ [代理] 第 {index} 次代理不可用")
         except Exception as exc:
-            log(f"⚠️ [代理] 第 {index} 次获取代理异常: {exc}")
+            log(f"   ⚠️ [代理] 第 {index} 次获取代理异常：{exc}")
 
         if index < PROXY_RETRY_TIMES:
             time.sleep(2)
 
-    log("⚠️ [代理] 获取失败，使用直连")
+    log("   ⚠️ [代理] 获取失败，使用直连")
     return None, ""
 
 
@@ -312,20 +415,28 @@ def request_with_proxy(
 # =============================================================================
 # 本地 code 服务（铛铛一下同款接口）
 # =============================================================================
-def parse_yyb_entry(raw: str) -> Tuple[str, str]:
-    """解析 YYB_SERVER 条目：地址@微信账号标识[#备注] → (server, ref)"""
-    raw = raw.strip()
-    if "#" in raw:
-        raw = raw.split("#", 1)[0].strip()
-    if "@" not in raw:
-        log(f"❌ YYB_SERVER 格式应为 地址@微信账号标识，当前值：{raw}")
-        return "", ""
-    server, ref = raw.split("@", 1)
-    server = server.strip().lstrip("http://").lstrip("https://").rstrip("/")
+def parse_entry(raw: str) -> Tuple[str, str, str]:
+    """解析 YYB_SERVER 条目：地址@微信账号标识[#备注] → (服务器地址, 标识, 备注)"""
+    value = str(raw or "").strip()
+    note = ""
+    if "#" in value:
+        value, note = value.split("#", 1)
+        value, note = value.strip(), note.strip()
+    if "@" not in value:
+        log(f"   ❌ [配置] YYB_SERVER 格式应为 地址@微信账号标识，当前值：{raw}")
+        return "", "", note
+    server, ref = value.rsplit("@", 1)
+    # 用正则剥协议头，避免 lstrip 按字符集误删 https 的 s
+    server = re.sub(r"^https?://", "", server.strip(), flags=re.IGNORECASE).rstrip("/")
     ref = ref.strip()
     if not server or not ref:
-        log(f"❌ YYB_SERVER 缺少地址或微信账号标识，当前值：{raw}")
-        return "", ""
+        log(f"   ❌ [配置] YYB_SERVER 缺少地址或账号标识，当前值：{raw}")
+        return "", "", note
+    return server, ref, note
+
+
+def parse_yyb_entry(raw: str) -> Tuple[str, str]:
+    server, ref, _ = parse_entry(raw)
     return server, ref
 
 
@@ -336,7 +447,7 @@ def get_code(entry: str) -> Optional[str]:
         return None
 
     url = f"http://{server}/wxapp/getCode"
-    log(f"🔐 [授权] 请求 YYB Go 取码: {url}")
+    log(f"   🧾 [授权] 取码请求 {url}")
 
     try:
         response = direct_session().post(
@@ -353,14 +464,19 @@ def get_code(entry: str) -> Optional[str]:
             except Exception:
                 result = {}
         code = (result or {}).get("code")
-        if data.get("code") != 0 or not code:
-            log(f"❌ [授权] 取码失败: {json_preview(data)}")
+        # YYB 可能把 code 返回成字符串 "0"，统一按数字比较
+        try:
+            code_ok = int(str(data.get("code")))
+        except Exception:
+            code_ok = -1
+        if code_ok != 0 or not code:
+            log(f"   ❌ [授权] 取码失败（{brief_error(data.get('msg') or data.get('message') or data.get('code'))}）")
             return None
 
-        log("✅ [授权] 取码成功")
+        log("   ✅ [授权] 取码成功")
         return code
     except Exception as e:
-        log(f"❌ [授权] 取码异常: {e}")
+        log(f"   ❌ [授权] 取码异常：{e}")
         return None
 
 
@@ -399,17 +515,17 @@ def login(code: str, proxies: Optional[Dict[str, str]] = None,
         data = resp.json()
         # ★ 修正：判断 success 字段
         if not data.get("success"):
-            log(f"❌ pre-auth 失败: {data}")
+            log(f"   ❌ [登录] pre-auth 未通过（{brief_error(data.get('message') or data.get('errorMessage') or data.get('code'))}）")
             return None, None, ""
 
         inner = data["data"]
         openid_ret = inner["openId"]
         encrypted_session = inner.get("encryptedSession")
         if not encrypted_session:
-            log("❌ pre-auth 返回无 encryptedSession")
+            log("   ❌ [登录] pre-auth 未返回 encryptedSession")
             return None, None, ""
 
-        log(f"✅ pre-auth 成功, openid: {openid_ret}")
+        log(f"   ✅ [登录] pre-auth 通过（openid {mask(openid_ret)}）")
     except Exception as e:
         log(f"❌ pre-auth 异常: {e}")
         return None, None, ""
@@ -434,7 +550,7 @@ def login(code: str, proxies: Optional[Dict[str, str]] = None,
         )
         info = resp2.json()
         if info.get("code") != 200:
-            log(f"❌ 换取 session 失败: {info}")
+            log(f"   ❌ [登录] 换取 session 失败（{brief_error(info.get('message') or info.get('code'))}）")
             return None, None, openid_ret
 
         inner2 = info["data"]
@@ -444,7 +560,7 @@ def login(code: str, proxies: Optional[Dict[str, str]] = None,
             log("❌ member/info 返回缺少 sessionId/aesSessionId")
             return None, None, openid_ret
 
-        log("✅ 获取最终凭证成功")
+        log("   ✅ [登录] 获取最终凭证成功")
         return session_id, aes_key, openid_ret
     except Exception as e:
         log(f"❌ member/info 请求异常: {e}")
@@ -457,7 +573,12 @@ def login(code: str, proxies: Optional[Dict[str, str]] = None,
 def read_token_cache() -> Dict[str, Any]:
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"accounts": {}, "activity_ids": {}}
+        data.setdefault("accounts", {})
+        data.setdefault("activity_ids", {})
+        return data
     except Exception:
         return {"accounts": {}, "activity_ids": {}}
 
@@ -467,8 +588,43 @@ def write_token_cache(cache: Dict[str, Any]) -> None:
         os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log(f"⚠️ 缓存保存失败: {e}")
+    except Exception as exc:
+        log(f"   ⚠️ [缓存] 保存失败（不影响本次执行）：{exc}")
+
+
+def cache_key(server: str, ref: str) -> str:
+    """缓存键：地址|标识，避免不同 YYB 地址下同名标识串号。"""
+    return f"{server}|{ref}"
+
+
+def read_cache_entry(cache: Dict[str, Any], server: str, ref: str) -> Dict[str, Any]:
+    accounts = cache.setdefault("accounts", {})
+    ck = cache_key(server, ref)
+    entry = accounts.get(ck)
+    if isinstance(entry, dict) and entry.get("sessionId"):
+        return entry
+    # 兼容旧版仅按 ref 存的缓存：读到就迁移到新键
+    legacy = accounts.get(ref)
+    if isinstance(legacy, dict) and legacy.get("sessionId"):
+        accounts[ck] = legacy
+        accounts.pop(ref, None)
+        write_token_cache(cache)
+        return legacy
+    return {}
+
+
+def save_cache_entry(cache: Dict[str, Any], server: str, ref: str, entry: Dict[str, Any]) -> None:
+    accounts = cache.setdefault("accounts", {})
+    accounts[cache_key(server, ref)] = {**entry, "updatedAt": now_text()}
+    write_token_cache(cache)
+
+
+def drop_cache_entry(cache: Dict[str, Any], server: str, ref: str) -> None:
+    accounts = cache.setdefault("accounts", {})
+    ck = cache_key(server, ref)
+    if ck in accounts:
+        accounts.pop(ck, None)
+        write_token_cache(cache)
 
 
 def get_cached_activity_ids(cache: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
@@ -548,6 +704,8 @@ class OppoMiniClient:
         self.credits_action_id = credits_action_id
         self.proxies = proxies
         self.server = server
+        self.auth_expired = False
+        self.last_error = ""
         self.session = requests.Session()
         self.session.headers.update(self._build_headers())
 
@@ -574,9 +732,18 @@ class OppoMiniClient:
                 server=self.server,
                 timeout=BROWSE_TIMEOUT,
             )
-            return resp.json()
-        except Exception as e:
-            return {"_error": str(e)}
+            return self._note(resp.json())
+        except Exception as exc:
+            self.last_error = str(exc)
+            return {"_error": str(exc)}
+
+    def _note(self, data: Any) -> dict:
+        if isinstance(data, dict):
+            if is_auth_error(data):
+                self.auth_expired = True
+            if data.get("_error"):
+                self.last_error = str(data.get("_error"))
+        return data
 
     def _post(self, url: str, json_body: dict = None) -> dict:
         headers = dict(self.session.headers)
@@ -591,9 +758,10 @@ class OppoMiniClient:
                 server=self.server,
                 timeout=BROWSE_TIMEOUT,
             )
-            return resp.json()
-        except Exception as e:
-            return {"_error": str(e)}
+            return self._note(resp.json())
+        except Exception as exc:
+            self.last_error = str(exc)
+            return {"_error": str(exc)}
 
     def is_login_valid(self) -> bool:
         data = self._get(API_CREDIT)
@@ -705,16 +873,16 @@ class OppoMiniClient:
                  "details": [], "manual_hint": False}
         tasks = self.task_list()
         if not tasks:
-            log("⚠️ 任务列表为空")
+            log("   ⚠️ [任务] 任务列表为空")
             return stats
 
         browse = [t for t in tasks if int(t.get("taskType") or -1) == TASK_TYPE_BROWSE]
         other = [t for t in tasks if int(t.get("taskType") or -1) != TASK_TYPE_BROWSE]
-        log(f"📋 共【{len(tasks)}】个任务，可自动浏览【{len(browse)}】个")
+        log(f"   📋 [任务] 共【{len(tasks)}】个，可自动浏览【{len(browse)}】个")
 
         for t in other:
             name = str(t.get("taskName") or t.get("taskId") or "未知任务")
-            log(f"⏭️ [{name}] 已跳过（非浏览任务）")
+            log(f"   ⏭️ [任务] {name} 已跳过（非浏览任务）")
             stats["skipped"] += 1
             stats["manual_hint"] = True
 
@@ -729,26 +897,26 @@ class OppoMiniClient:
                 continue
 
             if status == TASK_STATUS_DONE:
-                log(f"✅ [{name}] 已完成")
+                log(f"   ✅ [任务] {name} 已完成")
                 stats["skipped"] += 1
                 continue
 
             if status == TASK_STATUS_TODO:
                 wait_s = self.browse_seconds(task)
-                log(f"🔎 发现任务: {name}（待完成，奖励约【{award_show}】）")
+                log(f"   🔎 [任务] {name}（待完成，奖励约【{award_show}】）")
                 if simulate_wait:
-                    log(f"👀 [{name}] 浏览等待 {wait_s} 秒")
+                    log(f"   👀 [任务] {name} 浏览等待 {wait_s}s")
                     time.sleep(wait_s + 0.5)
                 if not self.report_browse(task):
                     stats["failed"] += 1
-                    log(f"❌ [{name}] 提交失败")
+                    log(f"   ❌ [任务] {name} 提交失败")
                     continue
                 stats["done"] += 1
-                log(f"📤 [{name}] 提交成功")
+                log(f"   📤 [任务] {name} 提交成功")
                 time.sleep(0.8)
                 status = TASK_STATUS_CLAIMABLE
             else:
-                log(f"🔎 发现任务: {name}（待领奖，奖励约【{award_show}】）")
+                log(f"   🔎 [任务] {name}（待领奖，奖励约【{award_show}】）")
 
             ok, pts, msg = self.receive_award(task)
             if ok:
@@ -756,18 +924,18 @@ class OppoMiniClient:
                 stats["points"] += pts
                 if pts:
                     stats["details"].append(f"{name} +{pts}")
-                    log(f"🎁 [{name}] 奖励领取成功（+{pts}）")
+                    log(f"   🎁 [任务] {name} 领奖成功（+{pts}）")
                 else:
                     stats["details"].append(f"{name} 领奖成功")
-                    log(f"🎁 [{name}] 奖励领取成功")
+                    log(f"   🎁 [任务] {name} 领奖成功")
             else:
                 if any(k in msg for k in ("已领", "已完成", "重复", "已经")):
                     stats["skipped"] += 1
-                    log(f"⏭️ [{name}] 已跳过（{msg}）")
+                    log(f"   ⏭️ [任务] {name} 已跳过（{msg}）")
                 else:
                     stats["failed"] += 1
                     stats["details"].append(f"领奖失败: {name} > {msg}")
-                    log(f"❌ 奖励领取失败: {name} > {msg}")
+                    log(f"   ❌ [任务] {name} 领奖失败：{msg}")
             time.sleep(0.6)
 
         return stats
@@ -778,7 +946,7 @@ class OppoMiniClient:
 # =============================================================================
 def send_pushplus(title: str, content: str) -> None:
     if not PLUSPLUS_TOKEN:
-        log("⚠️ [PushPlus] 未配置 PLUSPLUS_TOKEN，跳过推送")
+        log("   ℹ️ [推送] 未配置 PLUSPLUS_TOKEN，跳过 PushPlus")
         return
 
     try:
@@ -792,9 +960,9 @@ def send_pushplus(title: str, content: str) -> None:
             },
             timeout=10,
         )
-        log("✅ [PushPlus] 推送成功")
+        log("   ✅ [推送] PushPlus 推送成功")
     except Exception as exc:
-        log(f"❌ [PushPlus] 推送失败: {exc}")
+        log(f"   ❌ [推送] PushPlus 推送失败：{exc}")
 
 
 # =============================================================================
@@ -802,134 +970,185 @@ def send_pushplus(title: str, content: str) -> None:
 # =============================================================================
 def run_account(server: str, sign_act_id: str, task_act_id: str,
                 cache: dict, index: int) -> dict:
-    remark = server.split("#", 1)[1].strip() if "#" in server else ""
-    nickname = remark or f"账号{index}"
-    # 缓存 key 使用 YYB_SERVER 中 @ 后的 ref/wxid
-    _, cache_ref = parse_yyb_entry(server)
-    cache_key = cache_ref or server
-    log_blank()
-    log(f"👤 账号【{index}】> 【{nickname}】来源 {server}")
+    server_addr, ref, note = parse_entry(server)
+    title = f"标识 {ref}" + (f"（{note}）" if note else "")
+    account_frame(index, len(SERVERS), title or server, f"{server_addr or server}@{ref}" if ref else server)
 
-    result = {"name": nickname, "success": False, "user": nickname, "server": server,
-              "proxyStatus": "未使用代理", "proxyIp": "-",
-              "points_before": None, "points_after": None,
-              "sign_points": 0, "task_points": 0, "sign_already": False}
+    result = {
+        "index": index,
+        "name": note or ref or f"账号{index}",
+        "source": f"{server_addr}@{ref}" if ref else server,
+        "success": False,
+        "login_source": "",
+        "user": "",
+        "level": "",
+        "points_before": None,
+        "points_after": None,
+        "sign_points": 0,
+        "task_points": 0,
+        "sign_already": False,
+        "sign": "",
+        "tasks": "",
+        "points_delta": 0,
+        "error": "",
+        "proxyStatus": "未使用代理",
+        "proxyIp": "-",
+    }
 
     # 品赞代理：业务请求代理优先，失败直连兜底
     proxies, proxy_ip = get_valid_proxy(server)
     result["proxyStatus"] = "使用品赞代理" if proxies else "使用直连"
     result["proxyIp"] = proxy_ip or "-"
+    log(f"   🌐 [代理] {result['proxyStatus']}" + (f"（{proxy_ip}）" if proxy_ip else ""))
 
-    time.sleep(PROXY_FETCH_INTERVAL)
-    delay = random.randint(2, 6)
-    log(f"⏳ [延迟] 启动延迟 {delay}s")
+    if PROXY_API:
+        time.sleep(PROXY_FETCH_INTERVAL)
+    delay = random.randint(2, 5)
+    log(f"   ⏳ [等待] 启动延迟 {delay}s")
     time.sleep(delay)
 
-    # 检查缓存凭证
-    cached = cache.get("accounts", {}).get(cache_key)
-    session_id = aes_key = None
-    openid = ""
-    if cached:
-        session_id = cached.get("sessionId")
-        aes_key = cached.get("aesSessionId")
-        openid = cached.get("openid") or ""
-        if session_id and aes_key:
-            client = OppoMiniClient(session_id, aes_key, openid, sign_act_id, task_act_id,
-                                    proxies=proxies, server=server)
-            if client.is_login_valid():
-                log("✅ 缓存凭证有效")
-            else:
-                log("⚠️ 缓存凭证失效，重新登录")
-                session_id = aes_key = None
+    if not ref:
+        result["error"] = "YYB_SERVER 配置格式错误（应为 地址@账号标识）"
+        log(f"   ❌ [配置] {result['error']}")
+        return result
 
-    if not session_id or not aes_key:
-        log_section("🔐 微信登录")
-        code = get_code(server)
-        if not code:
-            log("❌ 获取 code 失败，跳过该账号")
-            result["error"] = "获取 code 失败"
-            return result
-        session_id, aes_key, openid_ret = login(code, proxies=proxies, server=server)
-        if not session_id or not aes_key:
-            log("❌ 登录失败，跳过该账号")
-            result["error"] = "登录失败"
-            return result
-        openid = openid_ret  # 使用登录返回的真实 openid
-        # 更新缓存
-        if "accounts" not in cache:
-            cache["accounts"] = {}
-        cache["accounts"][cache_key] = {
-            "sessionId": session_id,
-            "aesSessionId": aes_key,
-            "openid": openid,
-            "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%S")
-        }
-        write_token_cache(cache)
+    ck = cache_key(server_addr, ref)
 
-    client = OppoMiniClient(session_id, aes_key, openid, sign_act_id, task_act_id,
-                            proxies=proxies, server=server)
-
-    # 查询初始积分
-    credit = client.credit_info()
-    points_before = None
-    if credit:
-        user = credit.get("userNickName") or credit.get("userName") or nickname
-        level = credit.get("userLevel")
-        amount = credit.get("amount")
-        points_before = amount
-        result["points_before"] = amount
-        result["user"] = user
-        log(f"💎 当前积分: 【{points_text(amount)}】 等级【{level}】")
-    else:
-        log("⚠️ 积分查询失败，继续任务")
-
-    # 签到
-    log_section("📝 签到")
-    ok, msg, award = client.do_sign()
-    result["sign"] = msg
-    sign_points = 0
-    if ok:
-        log(f"✅ {msg}")
-        sign_points = award or 0
-        result["sign_already"] = ("今日已签" in msg) and sign_points == 0
-    else:
-        log(f"❌ {msg}")
-    result["sign_points"] = sign_points
-
-    # 浏览任务
-    log_section("🎯 日常任务")
-    stats = client.do_browse_tasks(simulate_wait=SIMULATE_WAIT)
-    task_points = stats.get("points", 0)
-    result["task_points"] = task_points
-    result["tasks"] = (f"提交【{stats['done']}】领奖【{stats['awarded']}】"
-                       f"跳过【{stats['skipped']}】失败【{stats['failed']}】")
-    if stats.get("manual_hint"):
-        log("ℹ️ 说明: 非浏览任务需人工完成")
-
-    # 刷新积分
-    credit2 = client.credit_info()
-    points_after = None
-    if credit2:
-        points_after = credit2.get("amount")
-        result["points_after"] = points_after
-        log(f"💎 执行后积分: 【{points_text(points_after)}】")
-    elif points_before is not None:
-        points_after = points_before
-
-    delta = 0
-    if points_before is not None and points_after is not None:
+    for attempt in range(2):
+        client = None
         try:
-            delta = int(points_after) - int(points_before)
-        except:
-            delta = sign_points + task_points
-    else:
-        delta = sign_points + task_points
-    result["points_delta"] = delta
-    log(f"📈 积分变化: {points_text(points_before)} -> {points_text(points_after)} (+{delta})")
+            # ---------- ① 首次尝试复用缓存凭证 ----------
+            if attempt == 0:
+                entry = read_cache_entry(cache, server_addr, ref)
+                if entry.get("sessionId") and entry.get("aesSessionId"):
+                    log(f"   💾 [缓存] 复用已保存的登录凭证（NEWOPPOSID {mask(entry['sessionId'])}）")
+                    client = OppoMiniClient(entry["sessionId"], entry["aesSessionId"],
+                                            entry.get("openid", ""), sign_act_id, task_act_id,
+                                            proxies=proxies, server=server)
+                    credit = client.credit_info()
+                    if client.auth_expired:
+                        log("   ♻️ [缓存] 登录凭证已失效，清理缓存后重新登录")
+                        drop_cache_entry(cache, server_addr, ref)
+                        client = None
+                    elif not credit:
+                        result["error"] = f"凭证校验失败（{brief_error(client.last_error)}）"
+                        log(f"   ❌ [积分] 缓存凭证校验失败，保留缓存不删除")
+                        return result
+                    else:
+                        result["login_source"] = "缓存"
+                        show_credit(result, credit)
 
-    # 判断是否整体成功（签到未报严重错误即可）
-    result["success"] = ok or ("今日已签" in msg)
+            # ---------- ② 没有可用凭证 → 重新登录 ----------
+            if client is None:
+                code = get_code(server)
+                if not code:
+                    result["error"] = "取码失败（检查 YYB 服务地址与账号标识）"
+                    log("   ❌ [登录] 取码失败，跳过该账号")
+                    return result
+
+                session_id, aes_key, openid_ret = login(code, proxies=proxies, server=server)
+                if not session_id or not aes_key:
+                    result["error"] = "登录失败（pre-auth 或 member/info 未通过，见上方日志）"
+                    log("   ❌ [登录] 登录失败，跳过该账号")
+                    return result
+
+                save_cache_entry(cache, server_addr, ref, {
+                    "sessionId": session_id,
+                    "aesSessionId": aes_key,
+                    "openid": openid_ret or "",
+                })
+                result["login_source"] = "新登录"
+                log(f"   🔐 [登录] 登录成功 openid {openid_ret or '-'}（已写入缓存）")
+
+                client = OppoMiniClient(session_id, aes_key, openid_ret or "", sign_act_id, task_act_id,
+                                        proxies=proxies, server=server)
+                credit = client.credit_info()
+                if not credit:
+                    result["error"] = f"登录后查询积分失败（{brief_error(client.last_error)}）"
+                    log("   ❌ [积分] 登录后查询积分失败")
+                    return result
+                show_credit(result, credit)
+
+            # ---------- ③ 签到 ----------
+            ok, msg, award = client.do_sign()
+            result["sign"] = msg
+            if ok:
+                log(f"   ✅ [签到] {msg}")
+                result["sign_points"] = award or 0
+                result["sign_already"] = ("今日已签" in msg) and result["sign_points"] == 0
+            else:
+                log(f"   ❌ [签到] {msg}")
+
+            # ---------- ④ 浏览任务 ----------
+            stats = client.do_browse_tasks(simulate_wait=SIMULATE_WAIT)
+            result["task_points"] = stats.get("points", 0)
+            result["tasks"] = (f"提交 {stats['done']} · 领奖 {stats['awarded']}"
+                               f"（+{stats['points']}）· 跳过 {stats['skipped']} · 失败 {stats['failed']}")
+            if stats.get("manual_hint"):
+                log("   ℹ️ [任务] 非浏览任务需人工完成")
+
+            # ---------- ⑤ 执行中凭证失效 → 清缓存重登重跑一次 ----------
+            if client.auth_expired and attempt == 0:
+                log("   🔄 [重试] 执行中登录凭证失效，清理缓存重登后重跑一次")
+                drop_cache_entry(cache, server_addr, ref)
+                time.sleep(1.5)
+                continue
+
+            # ---------- ⑥ 复查积分 ----------
+            credit2 = client.credit_info()
+            points_after = None
+            if credit2:
+                points_after = credit2.get("amount")
+                result["points_after"] = points_after
+            elif result["points_before"] is not None:
+                points_after = result["points_before"]
+                result["points_after"] = points_after
+
+            delta = 0
+            before = result["points_before"]
+            if before is not None and points_after is not None:
+                try:
+                    delta = int(points_after) - int(before)
+                except Exception:
+                    delta = result["sign_points"] + result["task_points"]
+            else:
+                delta = result["sign_points"] + result["task_points"]
+            result["points_delta"] = delta
+
+            if points_after is not None:
+                log(f"   💰 [积分] {points_text(before)} → {points_text(points_after)}（{delta:+d}）")
+            else:
+                log(f"   ⚠️ [积分] 查询失败，按任务奖励推算：+{delta}")
+
+            result["success"] = bool(ok) or ("今日已签" in msg) or bool(stats.get("awarded")) or bool(stats.get("done"))
+            if result["success"]:
+                log("   ✅ [完成] 该账号任务执行完成")
+            else:
+                result["error"] = msg or "签到与任务均未成功（详见上方日志）"
+                log(f"   ⚠️ [完成] 流程结束，但未完成有效签到/任务")
+            return result
+
+        except Exception as exc:
+            result["error"] = f"执行异常：{exc}"
+            log(f"   ❌ [异常] {exc}")
+            return result
+
+    result["error"] = result["error"] or "重试后仍未完成（详见上方日志）"
     return result
+
+
+def show_credit(result: dict, credit: dict) -> None:
+    """把用户信息与当前积分写在登录行正下方"""
+    user = credit.get("userNickName") or credit.get("userName") or ""
+    level = credit.get("userLevel")
+    amount = credit.get("amount")
+    if user:
+        result["user"] = user
+    if level not in (None, ""):
+        result["level"] = str(level)
+    result["points_before"] = amount
+    suffix = f" · 等级 {level}" if level not in (None, "") else ""
+    log(f"   💰 [积分] 当前 {points_text(amount)} 分{suffix}")
 
 
 def should_retry_with_new_ids(result: dict) -> bool:
@@ -939,81 +1158,106 @@ def should_retry_with_new_ids(result: dict) -> bool:
 
 
 def main():
-    log("==============================")
-    log("🛒 OPPO 商城 · 小程序签到+任务")
-    log("💡 版本: 2.1.0 (code 接口 + 品赞代理 + PushPlus)")
-    log("==============================")
+    box_top("🛒 OPPO 商城 签到 + 浏览任务")
+    box_line("🕒 启动时间", now_text())
+    box_line("🔢 账号数量", f"{len(SERVERS)} 个")
+    box_line("💾 缓存", "token_caches/oppo_token_cache.json")
+    box_bottom()
 
     cache = read_token_cache()
-    if not SERVERS:
-        log("❌ 没有配置本地 code 服务，退出")
-        return
 
-    # 获取活动ID (优先缓存)
+    # 获取活动ID（优先缓存）
     sign_act_id, task_act_id = get_cached_activity_ids(cache)
     if not sign_act_id or not task_act_id:
-        log_section("🔍 提取活动 ID（无缓存）")
+        log("   🔍 [活动] 缓存中无活动 ID，从落地页提取")
         sign_act_id, task_act_id = extract_activity_ids()
         update_activity_ids_cache(cache, sign_act_id, task_act_id)
         write_token_cache(cache)
+    log(f"   🎯 [活动] 签到 ID {sign_act_id} | 任务 ID {task_act_id}")
 
     results = []
     for idx, server in enumerate(SERVERS, 1):
         try:
             res = run_account(server, sign_act_id, task_act_id, cache, idx)
             # 失败时尝试重新拉取活动ID并重试一次
-            if not res["success"] and should_retry_with_new_ids(res):
-                log("⚠️ 疑似活动ID过期，尝试重新提取并重试本账号")
+            if not res.get("success") and should_retry_with_new_ids(res):
+                log("   ⚠️ [活动] 疑似活动 ID 过期，重新提取并重试本账号")
                 new_sign, new_task = extract_activity_ids()
                 if new_sign != sign_act_id or new_task != task_act_id:
                     update_activity_ids_cache(cache, new_sign, new_task)
                     write_token_cache(cache)
-                    log(f"🔄 使用新活动ID重试: 签到={new_sign}, 任务={new_task}")
+                    log(f"   🔄 [活动] 使用新 ID 重试：签到 {new_sign} | 任务 {new_task}")
                     res = run_account(server, new_sign, new_task, cache, idx)
+                    sign_act_id, task_act_id = new_sign, new_task
                 else:
-                    log("ℹ️ 活动ID未变化，不重试")
-            results.append(res)
-        except Exception as e:
-            log(f"❌ 账号异常: {e}")
-            results.append({"name": f"账号{idx}", "server": server,
-                            "success": False, "error": str(e)})
-        if idx < len(SERVERS):
-            time.sleep(1.5)
+                    log("   ℹ️ [活动] 活动 ID 未变化，不重试")
+        except Exception as exc:
+            _, ref, note = parse_entry(server)
+            res = {
+                "index": idx, "name": note or ref or f"账号{idx}",
+                "source": server, "success": False, "error": f"执行异常：{exc}",
+                "login_source": "", "user": "", "level": "",
+                "points_before": None, "points_after": None,
+                "sign_points": 0, "task_points": 0, "sign": "", "tasks": "",
+                "points_delta": 0, "proxyStatus": "-", "proxyIp": "-",
+            }
+            log(f"   ❌ [异常] 该账号执行异常：{exc}")
+        results.append(res)
 
-    # 汇总通知
+        hr()
+        if idx < len(SERVERS):
+            log("   ⏳ 等待2秒后执行下一个账号...")
+            time.sleep(2)
+
+    # ---------- 逐账号明细（汇总框上方） ----------
+    for res in results:
+        icon = "✅" if res.get("success") else "❌"
+        log("")
+        note_txt = f"（{res['name']}）" if res.get("name") and res["name"] != res.get("source") else ""
+        log(f"{icon} 【账号 {res['index']} · {res.get('source', '-')}{note_txt}】")
+        if res.get("login_source"):
+            log(f"   🔐 [登录] {'缓存复用' if res['login_source'] == '缓存' else '新登录'}")
+            user_line = res.get("user") or "(未返回昵称)"
+            if res.get("level"):
+                user_line += f" · 等级 {res['level']}"
+            log(f"   👤 [用户] {user_line}")
+            log(f"   📅 [签到] {res.get('sign') or '未获取到签到结果'}")
+            log(f"   📋 [任务] {res.get('tasks') or '无任务数据'}")
+            log(f"   💰 [积分] {points_text(res.get('points_before'))} → "
+                f"{points_text(res.get('points_after'))}（{int(res.get('points_delta') or 0):+d}）")
+        if not res.get("success"):
+            log(f"   ⚠️ [失败] {res.get('error') or '未知原因'}")
+
     ok_count = sum(1 for r in results if r.get("success"))
     fail_count = len(results) - ok_count
-    log_blank()
-    log("==============================")
-    log(f"🏁 全部完成: 成功【{ok_count}】失败【{fail_count}】")
-    log("==============================")
+    total_delta = sum(int(r.get("points_delta") or 0) for r in results if r.get("success"))
 
-    lines = []
+    box_top("🏁 OPPO 商城 执行汇总")
+    box_line("✅ 成功账号", f"{ok_count} / {len(results)}")
+    box_line("❌ 失败账号", f"{fail_count} / {len(results)}")
+    box_line("💰 今日总新增", f"{total_delta} 积分")
+    box_line("🕒 结束时间", now_text())
+    box_bottom()
+
+    # ---------- 通知 ----------
+    lines = ["### OPPO 商城 签到任务"]
     for r in results:
         flag = "✅" if r.get("success") else "❌"
-        nick = r.get("user") or r.get("name", "未知")
-        lines.append(f"{flag} {nick}")
-        lines.append(f"🌍 来源: {r.get('server', '-')}")
-        lines.append(f"🌐 代理: {r.get('proxyStatus', '-')} {r.get('proxyIp', '')}".rstrip())
-        if not r.get("success") and r.get("error"):
-            lines.append(f"⚠️ {r['error']}")
-            lines.append("")
-            continue
-        sign_pts = r.get("sign_points", 0)
-        sign_already = r.get("sign_already", False)
-        if sign_already and sign_pts == 0:
-            lines.append("📝 签到: +0（今日已签）")
-        else:
-            lines.append(f"📝 签到: +{sign_pts}")
-        lines.append(f"🎯 任务: +{r.get('task_points', 0)}")
-        pts_after = r.get("points_after")
-        if pts_after is not None:
-            lines.append(f"💎 总积分: {points_text(pts_after)}")
-        else:
-            lines.append(f"💎 总积分: 未知")
-        lines.append("")
-    content = "\n".join(lines).strip()
-    send_pushplus("📱 OPPO 小程序签到", content)
+        lines.append(f"\n#### {flag} 账号 {r['index']} · {r.get('source', '-')}")
+        if r.get("login_source"):
+            lines.append(f"- 登录：{'缓存复用' if r['login_source'] == '缓存' else '新登录'}")
+            lines.append(f"- 用户：{r.get('user') or '未返回'}")
+            lines.append(f"- 签到：{r.get('sign') or '无结果'}")
+            lines.append(f"- 任务：{r.get('tasks') or '无任务数据'}")
+            lines.append(f"- 积分：{points_text(r.get('points_before'))} → "
+                         f"{points_text(r.get('points_after'))}（{int(r.get('points_delta') or 0):+d}）")
+        if not r.get("success"):
+            lines.append(f"- 失败原因：{r.get('error') or '未知'}")
+    content = "\n".join(lines)
+
+    if send_qinglong_notify("OPPO 商城", content):
+        log("   ✅ [通知] 青龙通知模块调用完成（送达情况以通知渠道为准）")
+    send_pushplus("📱 OPPO 商城签到任务", content)
 
 
 if __name__ == "__main__":
