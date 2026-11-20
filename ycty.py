@@ -167,9 +167,13 @@ def now_text() -> str:
 
 
 def _pad_str(value: Any, width: int) -> str:
-    """按显示宽度补齐（中文按 2 字符宽）。"""
+    """按显示宽度补齐（中文/emoji 占 2，变体选择符与零宽连接符不计宽）。"""
     text = str(value)
-    length = sum(2 if ord(ch) > 255 else 1 for ch in text)
+    length = 0
+    for ch in text:
+        if ch in ("\ufe0f", "\ufe0e", "\u200d"):
+            continue
+        length += 2 if ord(ch) > 255 else 1
     return text + " " * max(0, width - length)
 
 
@@ -766,12 +770,12 @@ def _print_summary_box(results: List[Dict[str, Any]]) -> None:
 
     log("")
     log("╔" + "═" * 48 + "╗")
-    log("║  🏁 勇闯天涯签到 完成                          ║")
-    log("║  ✅ 成功: " + _pad_str(str(ok), 26) + "║")
-    log("║  ⏭️ 跳过: " + _pad_str(str(skip), 26) + "║")
-    log("║  ❌ 失败: " + _pad_str(str(fail), 26) + "║")
-    log("║  💎 积分: " + _pad_str("+" + str(total_earned), 26) + "║")
-    log("║  🕒 结束时间: " + _pad_str(now_text(), 22) + "║")
+    log("║  " + _pad_str("🏁 勇闯天涯签到 完成", 46) + "║")
+    log("║  " + _pad_str(f"✅ 成功: {ok}", 46) + "║")
+    log("║  " + _pad_str(f"⏭️ 跳过: {skip}", 46) + "║")
+    log("║  " + _pad_str(f"❌ 失败: {fail}", 46) + "║")
+    log("║  " + _pad_str(f"💎 积分: +{total_earned}", 46) + "║")
+    log("║  " + _pad_str(f"🕒 结束时间: {now_text()}", 46) + "║")
     log("╚" + "═" * 48 + "╝")
 
     for idx, r in enumerate(results, 1):
@@ -812,10 +816,10 @@ def main() -> int:
 
     log("")
     log("╔" + "═" * 48 + "╗")
-    log("║  🍺 勇闯天涯 superX 自动签到                   ║")
-    log("║  🕒 启动时间: " + _pad_str(now_text(), 25) + "║")
-    log("║  🔢 账号数量: " + _pad_str(str(len(accounts)), 25) + "║")
-    log("║  🎯 自动任务: " + _pad_str(str(len(AUTO_TASKS)) + " 项", 24) + "║")
+    log("║  " + _pad_str("🍺 勇闯天涯 superX 自动签到", 46) + "║")
+    log("║  " + _pad_str(f"🕒 启动时间: {now_text()}", 46) + "║")
+    log("║  " + _pad_str(f"🔢 账号数量: {len(accounts)}", 46) + "║")
+    log("║  " + _pad_str(f"🎯 自动任务: {len(AUTO_TASKS)} 项", 46) + "║")
     log("╚" + "═" * 48 + "╝")
     if DRY_RUN:
         log("🧪 干跑模式（YCTY_DRY_RUN=1），只查询不签到")
@@ -825,8 +829,8 @@ def main() -> int:
     for idx, (host, ref) in enumerate(accounts, 1):
         log("")
         log("┌" + "─" * 48 + "┐")
-        log("│  🧩 账号 " + _pad_str(f"{idx} / {len(accounts)}", 40) + "│")
-        log("│  🔑 标识: " + _pad_str(ref, 39) + "│")
+        log("│  " + _pad_str(f"🧩 账号 {idx} / {len(accounts)}", 46) + "│")
+        log("│  " + _pad_str(f"🔑 标识: {ref}", 46) + "│")
         log("└" + "─" * 48 + "┘")
         try:
             results.append(run_account(host, ref, f"[{idx}] {ref}"))
@@ -854,4 +858,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n⏹️ 已手动中断")
         sys.exit(130)
-#（注：内容由AI生成）
