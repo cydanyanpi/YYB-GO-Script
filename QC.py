@@ -4,8 +4,8 @@
 # -*- coding: utf-8 -*-
 # ==============================================
 # 雀巢会员俱乐部自动任务脚本（青龙面板专用版）
-# 版本: v2.1.0
-# 更新日期: 2026-05-13
+# 版本: v2.2.0
+# 更新日期: 2026-11-20
 # 功能: 自动完成每日签到、浏览官网、浏览视频号任务
 # 适配: 雀巢小程序  | 品赞代理 | PushPlus推送
 # ==============================================
@@ -75,6 +75,13 @@
 # ==============================================
 #
 # 【六、更新日志】
+# v2.2.0 (2026-11-20)
+# - 修复首次运行（无缓存）时跳过登录、直接返回“获取初始积分失败”且不打印任何日志的问题
+# - 修复所有静默 return：登录失败/取码失败/换 token 失败现在都有明确提示
+# - 缓存键改为“地址|标识”，避免同一标识在不同 YYB 地址下串号；旧缓存自动迁移
+# - 日志美化：启动横幅、账号框、逐账号明细（汇总框上方）、积分贴账号登录行
+# - 新增青龙 notify.py 推送（QC_NOTIFY=0 可关闭），保留 PushPlus
+#
 # v2.1.0 (2026-05-13)
 # - 优化青龙面板日志格式，code参数专业打印
 # - 恢复品赞代理系统，支持单账号独立代理
@@ -100,6 +107,7 @@ import sys
 import asyncio
 import json
 import random
+import importlib.util
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -129,9 +137,6 @@ if len(SERVERS) == 0:
     print("❌ 未配置环境变量 YYB_SERVER")
     print("格式：yyb-go:8000@账号ID或OpenID，多账号换行分隔")
     sys.exit(1)
-
-print(f"✅ 读取到 {len(SERVERS)} 个 YYB Go 账号")
-print("-" * 60 + "\n")
 
 def parse_yyb_go_entry(raw_value: str) -> Tuple[str, str]:
     value = str(raw_value or "").strip()
@@ -219,6 +224,51 @@ def get_ua() -> str:
     return random.choice(USER_AGENT_LIST)
 
 
+# ===================== 日志美化 =====================
+def now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _pad_str(value, width: int) -> str:
+    """按显示宽度补齐（中文/emoji 占 2，变体选择符不计宽）。"""
+    text = str(value)
+    length = 0
+    for ch in text:
+        if ch in ("\ufe0f", "\ufe0e", "\u200d"):
+            continue
+        length += 2 if ord(ch) > 255 else 1
+    return text + " " * max(0, width - length)
+
+
+def box_top(title: str) -> None:
+    print()
+    print("╔" + "═" * 48 + "╗")
+    print("║  " + _pad_str(title, 46) + "║")
+
+
+def box_line(label: str, value) -> None:
+    print("║  " + _pad_str(f"{label}: {value}", 46) + "║")
+
+
+def box_bottom() -> None:
+    print("╚" + "═" * 48 + "╝")
+
+
+def account_frame(index: int, total: int, title: str, source: str) -> None:
+    print()
+    print("┌" + "─" * 48 + "┐")
+    print("│  " + _pad_str(f"🧩 账号 {index} / {total}　{title}", 46) + "│")
+    print("│  " + _pad_str(f"🔗 来源: {source}", 46) + "│")
+    print("└" + "─" * 48 + "┘")
+
+
+def mask_token(token: str) -> str:
+    value = str(token or "")
+    if len(value) <= 16:
+        return value or "-"
+    return f"{value[:8]}...{value[-6:]}"
+
+
 # ===================== Token 缓存（不过期，失效自动重登） =====================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_CACHE_FILE = os.path.join(SCRIPT_DIR, "token_caches", "qc_token_cache.json")
@@ -240,7 +290,44 @@ def write_token_cache(cache: Dict[str, Any]) -> None:
         with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
     except Exception as exc:
-        print(f"[缓存] 写入失败: {exc}")
+        print(f"   ⚠️ [缓存] 写入失败（不影响本次执行）: {exc}")
+
+
+def cache_key(server: str, ref: str) -> str:
+    """缓存键：地址|标识，避免不同 YYB 地址下同名标识串号。"""
+    return f"{server}|{ref}" if ref else server
+
+
+def read_cache_entry(ck: str, ref: str) -> Dict[str, Any]:
+    cache = read_token_cache()
+    entry = cache.get(ck)
+    if isinstance(entry, dict) and entry.get("access_token"):
+        return entry
+    # 兼容旧版仅按 ref 存的缓存：首次读到就迁移到新键
+    legacy = cache.get(ref)
+    if isinstance(legacy, dict) and legacy.get("access_token"):
+        cache[ck] = legacy
+        cache.pop(ref, None)
+        write_token_cache(cache)
+        return legacy
+    return {}
+
+
+def save_cache_entry(ck: str, token: str, refresh: str) -> None:
+    cache = read_token_cache()
+    cache[ck] = {
+        "access_token": token,
+        "refresh_token": refresh or "",
+        "updated_at": now_text(),
+    }
+    write_token_cache(cache)
+
+
+def drop_cache_entry(ck: str) -> None:
+    cache = read_token_cache()
+    if ck in cache:
+        cache.pop(ck, None)
+        write_token_cache(cache)
 
 def build_direct_transport() -> AsyncHTTPTransport:
     return AsyncHTTPTransport()
@@ -318,10 +405,10 @@ def build_proxy_transport(proxy_info: Dict[str, Any]) -> Optional[AsyncProxyTran
 
 async def get_valid_proxy(account_name: str) -> Optional[Dict[str, Any]]:
     if not PROXY_API:
-        print(f"ℹ️ [{account_name}] 未配置代理 | 使用直连模式")
+        print(f"ℹ️ [代理] {account_name} 未配置代理 | 使用直连模式")
         return None
 
-    print(f"🔌 [{account_name}] 正在获取专属代理...")
+    print(f"🔌 [代理] {account_name} 正在获取专属代理...")
 
     for i in range(PROXY_RETRY_TIMES):
         try:
@@ -368,6 +455,32 @@ async def send_plusplus_notification(title: str, content: str) -> None:
     except Exception as e:
         print(f"❌ 通知推送失败 | 原因: {str(e)}")
 
+# ===================== 青龙通知（notify.py） =====================
+def send_qinglong_notify(title: str, content: str) -> bool:
+    """优先调用青龙自带的 notify.py（send / sendNotify），找不到就跳过。"""
+    candidates = [
+        "/ql/data/scripts/notify.py",
+        "/ql/scripts/notify.py",
+        "/ql/data/notify.py",
+        os.path.join(SCRIPT_DIR, "notify.py"),
+    ]
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("qc_ql_notify", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            if hasattr(module, "send"):
+                module.send(title, content)
+                return True
+            if hasattr(module, "sendNotify"):
+                module.sendNotify(title, content)
+                return True
+        except Exception as exc:
+            print(f"   ⚠️ [通知] 加载 {path} 失败: {exc}")
+    return False
+
 # ===================== 核心业务类 =====================
 class QueChaoBot:
     def __init__(self, server: str, proxy_info: Optional[Dict[str, Any]] = None):
@@ -385,7 +498,7 @@ class QueChaoBot:
 
     async def get_token_by_code(self, code: str) -> Optional[str]:
         """通过code换取token（简洁日志）"""
-        print(f"🔑 [{self.server}] 正在换取token...")
+        print(f"🔑 正在换取token...")
 
         headers = {
             "Host": "crm.nestlechinese.com",
@@ -428,15 +541,15 @@ class QueChaoBot:
             if res.get("access_token") and res.get("token_type", "Bearer").lower() == "bearer":
                 self.token = res["access_token"]
                 self.refresh_token = res.get("refresh_token", "")
-                print(f"✅ [登录] [{self.server}] 获取token成功 | 模式: {mode}")
+                print(f"✅ [登录] 获取token成功 | 模式: {mode}")
                 return self.token
             else:
                 raise Exception(f"业务错误: {res.get('error', '未知错误')}")
         except Exception as e:
-            print(f"⚠️ [{self.server}] {mode}获取token失败 | 原因: {str(e)}")
+            print(f"⚠️ {mode}获取token失败 | 原因: {str(e)}")
 
             if self.proxy_info and ENABLE_DIRECT_FALLBACK:
-                print(f"🌐 [{self.server}] 切换直连重试...")
+                print(f"🌐 切换直连重试...")
                 try:
                     async with httpx.AsyncClient(
                         headers=headers,
@@ -450,12 +563,12 @@ class QueChaoBot:
                     if res.get("access_token"):
                         self.token = res["access_token"]
                         self.refresh_token = res.get("refresh_token", "")
-                        print(f"✅ [登录] [{self.server}] 直连获取token成功")
+                        print(f"✅ [登录] 直连获取token成功")
                         return self.token
                     else:
                         raise Exception(f"直连业务错误: {res.get('error', '未知错误')}")
                 except Exception as e2:
-                    print(f"❌ [{self.server}] 直连获取token失败 | 原因: {str(e2)}")
+                    print(f"❌ 直连获取token失败 | 原因: {str(e2)}")
 
         return None
 
@@ -464,7 +577,7 @@ class QueChaoBot:
         if not self.refresh_token:
             return False
 
-        print(f"🔄 [续期] [{self.server}] 使用refresh_token换新access_token...")
+        print(f"🔄 [续期] 使用refresh_token换新access_token...")
 
         headers = {
             "Host": "crm.nestlechinese.com",
@@ -499,21 +612,40 @@ class QueChaoBot:
                 response = await client.post(TOKEN_URL, data=form_data)
 
             if response.status_code != 200:
-                print(f"⚠️ [续期] [{self.server}] refresh_token已失效 (HTTP {response.status_code})")
+                print(f"⚠️ [续期] refresh_token已失效 (HTTP {response.status_code})")
                 return False
 
             res = response.json()
             if res.get("access_token"):
                 self.token = res["access_token"]
                 self.refresh_token = res.get("refresh_token", self.refresh_token)
-                print(f"✅ [续期] [{self.server}] refresh_token续期成功")
+                print(f"✅ [续期] refresh_token续期成功")
                 return True
             else:
-                print(f"⚠️ [续期] [{self.server}] refresh_token返回异常: {res.get('error', '未知')}")
+                print(f"⚠️ [续期] refresh_token返回异常: {res.get('error', '未知')}")
                 return False
         except Exception as e:
-            print(f"⚠️ [续期] [{self.server}] refresh_token续期失败: {str(e)}")
+            print(f"⚠️ [续期] refresh_token续期失败: {str(e)}")
             return False
+
+    async def ensure_token(self) -> bool:
+        """确保手里有可用 token：先试 refresh_token 续期，再走微信取码完整登录。"""
+        if self.token:
+            return True
+
+        if self.refresh_token and await self.refresh_token_by_refresh():
+            return True
+
+        code = await self.get_code()
+        if not code:
+            print("   ❌ [登录] 取码失败（检查 YYB 服务地址 / 标识是否正确）")
+            return False
+
+        token = await self.get_token_by_code(code)
+        if not token:
+            print("   ❌ [登录] code 换 token 失败（确认 code 未过期）")
+            return False
+        return True
 
     async def __aenter__(self):
         transport = build_proxy_transport(self.proxy_info) if self.proxy_info else build_direct_transport()
@@ -550,7 +682,7 @@ class QueChaoBot:
 
     def check_response(self, response_data: Dict[str, Any]) -> bool:
         if response_data.get("errcode") != 200:
-            print(f"❌ [{self.server}] 请求失败 | 原因: {response_data.get('errmsg', '未知错误')}")
+            print(f"❌ [接口] 请求失败 | 原因: {response_data.get('errmsg', '未知错误')}")
             return False
         return True
 
@@ -583,15 +715,15 @@ class QueChaoBot:
                 last_err = str(e)
                 if attempt < retries:
                     wait = 1500 * (attempt + 1)
-                    print(f"⚠️ [{self.server}] 积分接口返回非JSON/空响应，{wait//1000}s后第{attempt+1}次重试... ({last_err})")
+                    print(f"⚠️ [积分] 积分接口返回非JSON/空响应，{wait//1000}s后第{attempt+1}次重试... ({last_err})")
                     await sleep(wait)
             except Exception as e:
                 last_err = str(e)
                 if attempt < retries:
                     wait = 1500 * (attempt + 1)
-                    print(f"⚠️ [{self.server}] 积分接口网络异常，{wait//1000}s后第{attempt+1}次重试... ({last_err})")
+                    print(f"⚠️ [积分] 积分接口网络异常，{wait//1000}s后第{attempt+1}次重试... ({last_err})")
                     await sleep(wait)
-        print(f"❌ [{self.server}] 获取积分失败 | 原因: {last_err}（已重试{retries}次）")
+        print(f"❌ [积分] 获取积分失败 | 原因: {last_err}（已重试{retries}次）")
         return None, "network"
 
     async def daily_sign(self) -> Tuple[bool, str]:
@@ -604,7 +736,7 @@ class QueChaoBot:
 
             if response_data.get("errcode") == 201:
                 sign_msg = "今日已签到"
-                print(f"ℹ️ [{self.server}] {sign_msg}")
+                print(f"ℹ️ [签到] {sign_msg}")
                 return True, sign_msg
 
             if self.check_response(response_data):
@@ -612,16 +744,16 @@ class QueChaoBot:
                 sign_day = data.get("sign_day", 0)
                 sign_points = data.get("sign_points", 0)
                 sign_msg = f"签到成功 | 连续{sign_day}天 | +{sign_points}积分"
-                print(f"✅ [{self.server}] {sign_msg}")
+                print(f"✅ [签到] {sign_msg}")
                 return True, sign_msg
             else:
                 sign_msg = f"签到失败: {response_data.get('errmsg', '未知错误')}"
-                print(f"❌ [{self.server}] {sign_msg}")
+                print(f"❌ [签到] {sign_msg}")
                 return False, sign_msg
 
         except Exception as e:
             sign_msg = f"签到异常: {str(e)}"
-            print(f"❌ [{self.server}] {sign_msg}")
+            print(f"❌ [签到] {sign_msg}")
             return False, sign_msg
 
     async def get_task_list(self) -> List[Dict[str, Any]]:
@@ -639,11 +771,11 @@ class QueChaoBot:
                     if task.get("task_status") == 0
                     and task.get("task_guid") not in SKIP_TASK_GUIDS
                 ]
-                print(f"📋 [{self.server}] 待完成任务: {len(uncompleted_tasks)}个")
+                print(f"📋 [任务] 待完成任务: {len(uncompleted_tasks)}个")
                 return uncompleted_tasks
             return []
         except Exception as e:
-            print(f"❌ [{self.server}] 获取任务列表失败 | 原因: {str(e)}")
+            print(f"❌ [任务] 获取任务列表失败 | 原因: {str(e)}")
             return []
 
     async def complete_task(self, task_guid: str, task_desc: str) -> Tuple[bool, str]:
@@ -656,174 +788,230 @@ class QueChaoBot:
 
             if self.check_response(response_data):
                 msg = f"完成【{task_desc}】 | +2积分"
-                print(f"✅ [{self.server}] {msg}")
+                print(f"✅ [任务] {msg}")
                 return True, msg
             else:
                 msg = f"【{task_desc}】失败: {response_data.get('errmsg', '未知错误')}"
-                print(f"❌ [{self.server}] {msg}")
+                print(f"❌ [任务] {msg}")
                 return False, msg
 
         except Exception as e:
             msg = f"【{task_desc}】异常: {str(e)}"
-            print(f"❌ [{self.server}] {msg}")
+            print(f"❌ [任务] {msg}")
             return False, msg
 
-    async def run(self) -> Dict[str, Any]:
+    async def run(self, index: int = 1, total: int = 1) -> Dict[str, Any]:
+        server, ref = parse_yyb_go_entry(self.server)
+        display = f"{server}@{ref}" if ref else server
+
+        account_frame(index, total, f"标识 {ref or '-'}", display)
+
         result = {
+            "index": index,
             "server": self.server,
+            "display": display,
             "success": False,
+            "used_cache": False,
             "proxy_status": "直连" if not self.proxy_info else "专属代理",
             "sign_msg": "",
             "task_msgs": [],
-            "initial_score": 0,
-            "final_score": 0,
+            "initial_score": None,
+            "final_score": None,
             "gained_score": 0,
             "error": ""
         }
+        print(f"   🌐 [代理] {result['proxy_status']}")
 
-        print(f"\n{'='*40}")
-        print(f"[{self.server}] 开始执行任务")
-        print(f"{'='*40}")
+        ck = cache_key(server, ref)
+        entry = read_cache_entry(ck, ref)
 
         try:
-            await sleep(random_int(2000, 5000))
-
-            # 0. 尝试缓存 token（命中则跳过取 code + 换 token）
-            _, ref = parse_yyb_go_entry(self.server)
-            cache = read_token_cache()
-            cached = cache.get(ref) or {}
-            self.token = cached.get("access_token", "") or None
-            self.refresh_token = cached.get("refresh_token", "") or ""
-            used_cache = bool(self.token)
-            if self.token:
-                print(f"💾 [缓存] [{self.server}] 使用缓存token")
+            await sleep(random_int(2000, 4000))
+            initial = None
 
             for attempt in range(2):
-                if attempt == 1 or not self.token:
-                    if attempt == 1:
-                        print(f"🔄 [重登] [{self.server}] 缓存token失效")
-                        # 先试 refresh_token 续期，不用重新走微信授权码
-                        if await self.refresh_token_by_refresh():
-                            cache = read_token_cache()
-                            cache[ref] = {"access_token": self.token, "refresh_token": self.refresh_token}
-                            write_token_cache(cache)
-                            print(f"✅ [续期] [{self.server}] 已用refresh_token换新token，继续执行业务")
-                        else:
-                            # refresh_token 也失效，清缓存重新走完整登录
-                            print(f"🔄 [重登] [{self.server}] refresh_token也失效，重新走微信登录")
-                            cache = read_token_cache()
-                            if ref in cache:
-                                del cache[ref]
-                                write_token_cache(cache)
-                            code = await self.get_code()
-                            if not code:
-                                result["error"] = "获取code失败"
-                                return result
-                            self.token = await self.get_token_by_code(code)
-                            if not self.token:
-                                result["error"] = "获取token失败"
-                                return result
-                            cache = read_token_cache()
-                            cache[ref] = {"access_token": self.token, "refresh_token": self.refresh_token}
-                            write_token_cache(cache)
+                # ---------- ① 首次尝试复用缓存 token ----------
+                if attempt == 0 and entry.get("access_token"):
+                    self.token = entry["access_token"]
+                    self.refresh_token = entry.get("refresh_token", "") or ""
+                    balance, err = None, ""
+                    try:
+                        async with self:
+                            balance, err = await self.get_user_balance(retries=1)
+                    except Exception as exc:
+                        balance, err = None, f"network({exc})"
 
-                # 执行业务
-                async with self:
-                    initial_balance, bal_err = await self.get_user_balance(retries=2)
-                    if initial_balance is None:
-                        # 只有真 token 失效才删缓存重登；网络错误直接报错退出，不误删缓存
-                        if bal_err == "token_invalid" and attempt == 0 and used_cache:
-                            print(f"🔄 [{self.server}] [重登] 服务端返回401/403，确认token失效")
-                            continue
-                        if bal_err == "network" and attempt == 0 and used_cache:
-                            print(f"⚠️ [{self.server}] [网络] 积分接口异常（已重试），但token可能仍有效，保留缓存直接报错")
-                        result["error"] = f"获取初始积分失败({bal_err})"
+                    if balance is not None:
+                        initial = balance
+                        result["used_cache"] = True
+                        print(f"   💾 [缓存] 复用已保存的登录 token（{mask_token(self.token)}）")
+                    elif err == "token_invalid":
+                        print("   ♻️ [缓存] token 已失效，清理缓存后重新登录")
+                        drop_cache_entry(ck)
+                        entry = {}
+                        self.token = None
+                        self.refresh_token = ""
+                    else:
+                        print(f"   ❌ [积分] 初始积分校验失败（{err}），保留缓存不删除")
+                        result["error"] = f"获取初始积分失败({err})"
                         return result
-                    result["initial_score"] = initial_balance
-                    print(f"💰 [{self.server}] 初始积分: {initial_balance}")
 
-                    # 每日签到
-                    sign_success, sign_msg = await self.daily_sign()
+                # ---------- ② 没有可用 token → 登录 ----------
+                if initial is None:
+                    if not await self.ensure_token():
+                        result["error"] = "登录失败（取码或换 token 未通过，详见上方日志）"
+                        print("   ❌ [登录] 失败，跳过该账号")
+                        return result
+
+                    save_cache_entry(ck, self.token, self.refresh_token)
+                    print("   🔑 [登录] token 获取成功（已写入缓存）")
+
+                    balance, err = None, ""
+                    try:
+                        async with self:
+                            balance, err = await self.get_user_balance(retries=2)
+                    except Exception as exc:
+                        balance, err = None, f"network({exc})"
+
+                    if balance is None:
+                        result["error"] = f"获取初始积分失败({err})"
+                        print(f"   ❌ [积分] 初始积分获取失败（{err}）")
+                        return result
+                    initial = balance
+
+                # ---------- ③ 登录行下面直接显示当前积分 ----------
+                result["initial_score"] = initial
+                print(f"   💰 [积分] 当前 {initial} 分")
+
+                # ---------- ④ 执行业务 ----------
+                async with self:
+                    sign_ok, sign_msg = await self.daily_sign()
                     result["sign_msg"] = sign_msg
                     await sleep(1000)
 
-                    # 完成日常任务
                     tasks = await self.get_task_list()
                     task_msgs = []
                     for task in tasks:
                         task_guid = task.get("task_guid", "")
                         task_desc = task.get("task_sub_desc", task.get("task_title", "未知任务"))
                         if task_guid:
-                            success, msg = await self.complete_task(task_guid, task_desc)
-                            task_msgs.append(msg)
+                            ok, msg = await self.complete_task(task_guid, task_desc)
+                            task_msgs.append(("✅ " if ok else "❌ ") + msg)
                             await sleep(1000)
                     result["task_msgs"] = task_msgs
 
-                    # 获取最终积分
-                    final_balance, _ = await self.get_user_balance(retries=1)
-                    if final_balance is not None:
-                        result["final_score"] = final_balance
-                        result["gained_score"] = final_balance - initial_balance
-                        print(f"📊 [{self.server}] 今日新增: {result['gained_score']}积分 | 当前: {final_balance}")
+                    final, ferr = await self.get_user_balance(retries=1)
 
-                    result["success"] = True
-                    print(f"✅ [{self.server}] 任务执行完成")
-                    break
+                # 执行途中 token 失效（极少见）→ 清缓存重登重跑一次
+                if final is None and ferr == "token_invalid" and attempt == 0:
+                    print("   🔄 [重试] 执行中 token 失效，清理缓存重新登录重跑")
+                    drop_cache_entry(ck)
+                    entry = {}
+                    self.token = None
+                    await sleep(1000)
+                    continue
+
+                if final is not None:
+                    result["final_score"] = final
+                    gained = final - initial
+                    result["gained_score"] = gained
+                    sign_txt = "+" if gained >= 0 else ""
+                    print(f"   💰 [积分] 当前 {final} 分（本次 {sign_txt}{gained}）")
+                else:
+                    print(f"   ⚠️ [积分] 最终积分获取失败（{ferr}），本次数据仍按成功处理")
+
+                result["success"] = True
+                print("   ✅ [完成] 该账号任务执行完成")
+                return result
+
+            result["error"] = "重试后仍未完成（详见上方日志）"
+            return result
 
         except Exception as e:
             result["error"] = str(e)
-            print(f"❌ [{self.server}] 执行异常 | 原因: {str(e)}")
-
-        return result
+            print(f"   ❌ [异常] 执行异常 | 原因: {str(e)}")
+            return result
 
 # ===================== 主程序 =====================
 async def main():
-    print('===== 雀巢会员俱乐部每日任务 =====\n')
-    print(f"📅 执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"🔌 待执行账号: {len(SERVERS)} 个")
-    print(f"🌐 代理模式: {'单账号独立代理' if ENABLE_PER_ACCOUNT_PROXY else '全局共用代理'}\n")
+    box_top("☕ 雀巢会员俱乐部 每日任务")
+    box_line("🕒 启动时间", now_text())
+    box_line("🔢 账号数量", f"{len(SERVERS)} 个")
+    box_line("🌐 代理模式", "单账号独立代理" if ENABLE_PER_ACCOUNT_PROXY else "全局共用代理")
+    box_line("💾 缓存文件", "token_caches/qc_token_cache.json")
+    box_bottom()
 
     global_proxy_info = None
     if not ENABLE_PER_ACCOUNT_PROXY and PROXY_API:
         global_proxy_info = await get_valid_proxy("全局共用")
 
     results = []
-    for index, server in enumerate(SERVERS):
+    for index, server in enumerate(SERVERS, 1):
         proxy_info = global_proxy_info
         if ENABLE_PER_ACCOUNT_PROXY:
             proxy_info = await get_valid_proxy(server)
             await sleep(PROXY_FETCH_INTERVAL)
 
         bot = QueChaoBot(server, proxy_info)
-        result = await bot.run()
-        results.append(result)
+        try:
+            res = await bot.run(index, len(SERVERS))
+        except Exception as e:
+            _, ref = parse_yyb_go_entry(server)
+            res = {
+                "index": index, "server": server,
+                "display": f"{server}@{ref}" if ref else server,
+                "success": False, "used_cache": False, "proxy_status": "未知",
+                "sign_msg": "", "task_msgs": [],
+                "initial_score": None, "final_score": None,
+                "gained_score": 0, "error": f"执行异常: {e}"
+            }
+            print(f"   ❌ [异常] 该账号执行异常: {e}")
+        results.append(res)
 
-        if index < len(SERVERS) - 1:
-            print(f"\n⏳ 等待2秒后执行下一个账号...")
+        if index < len(SERVERS):
+            print("\n   ⏳ 等待2秒后执行下一个账号...")
             await sleep(2000)
 
-    # 汇总结果
-    notify_content = "### 雀巢每日任务执行结果\n"
+    # ---------- 明细（汇总框上方） ----------
     for res in results:
-        notify_content += f"\n#### {res['server']}\n"
-        notify_content += f"- 代理状态：{res['proxy_status']}\n"
-        notify_content += f"- 执行状态：{'成功' if res['success'] else '失败'}\n"
-        if res['success']:
-            notify_content += f"- 签到结果：{res['sign_msg']}\n"
-            notify_content += f"- 任务完成：{'; '.join(res['task_msgs']) if res['task_msgs'] else '无未完成任务'}\n"
-            notify_content += f"- 初始积分：{res['initial_score']}\n"
-            notify_content += f"- 最终积分：{res['final_score']}\n"
-            notify_content += f"- 今日新增：{res['gained_score']} 积分\n"
+        icon = "✅" if res["success"] else "❌"
+        print(f"\n{icon} 【账号 {res['index']} · {res['display']}】")
+        if res["success"]:
+            cache_txt = "（登录态来源：缓存）" if res["used_cache"] else "（登录态来源：新登录）"
+            print(f"   📅 [签到] {res['sign_msg']}{cache_txt}")
+            task_txt = "\n              ".join(res["task_msgs"]) if res["task_msgs"] else "无未完成任务"
+            print(f"   📋 [任务] {task_txt}")
+            print(f"   💰 [积分] {res['initial_score']} → {res['final_score']}（{res['gained_score']:+d}）")
+        else:
+            print(f"   ⚠️ [失败] {res['error']}")
+
+    ok_count = sum(1 for r in results if r["success"])
+    total_gained = sum(r["gained_score"] for r in results if r["success"])
+
+    box_top("🏁 雀巢会员俱乐部 执行汇总")
+    box_line("✅ 成功账号", f"{ok_count} / {len(results)}")
+    box_line("❌ 失败账号", f"{len(results) - ok_count} / {len(results)}")
+    box_line("💰 今日总新增", f"{total_gained} 积分")
+    box_line("🕒 结束时间", now_text())
+    box_bottom()
+
+    # ---------- 通知 ----------
+    notify_content = "### 雀巢会员俱乐部每日任务\n"
+    for res in results:
+        notify_content += f"\n#### 账号 {res['index']} · {res['display']}\n"
+        if res["success"]:
+            notify_content += f"- 签到：{res['sign_msg']}\n"
+            notify_content += f"- 任务：{'; '.join(res['task_msgs']) if res['task_msgs'] else '无未完成任务'}\n"
+            notify_content += f"- 积分：{res['initial_score']} → {res['final_score']}（{res['gained_score']:+d}）\n"
         else:
             notify_content += f"- 失败原因：{res['error']}\n"
 
-    await send_plusplus_notification("雀巢每日任务完成", notify_content)
+    if os.getenv("QC_NOTIFY", "1") != "0":
+        if send_qinglong_notify("雀巢会员俱乐部", notify_content):
+            print("   ✅ [通知] 青龙通知模块调用完成（送达情况以通知渠道为准）")
+    await send_plusplus_notification("雀巢会员俱乐部每日任务", notify_content)
 
-    print('\n' + '='*40)
-    print('🎉 所有账号执行完成')
-    print(f"📊 成功: {sum(1 for r in results if r['success'])}/{len(results)} 个")
-    print(f"💰 今日总新增: {sum(r['gained_score'] for r in results if r['success'])} 积分")
-    print('='*40)
+
 
 if __name__ == "__main__":
     try:
