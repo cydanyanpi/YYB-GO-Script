@@ -87,49 +87,70 @@ def sleep(seconds):
 
 
 def log(*args):
-    print(f"[{APP_NAME}]", *args)
+    print(*args, flush=True)
+
+
+BOX_WIDTH = 48
+BOX_INNER = 46
+
+
+def _display_width(text):
+    width = 0
+    for ch in str(text):
+        code = ord(ch)
+        if code in (0xfe0f, 0xfe0e, 0x200d):
+            continue
+        width += 2 if code > 0xff else 1
+    return width
 
 
 def _pad(text, width):
-    """按显示宽度补空格（中文占2宽度）"""
     text = str(text)
-    w = 0
-    for ch in text:
-        w += 2 if ord(ch) > 127 else 1
-    return text + " " * max(0, width - w)
+    while _display_width(text) > width:
+        text = text[:-1]
+    return text + " " * max(0, width - _display_width(text))
 
 
-def log_title():
+def box_top(title):
     print()
-    print("╔" + "=" * 50 + "╗")
-    print("║  " + _pad("📱 iQOO社区 每日任务", 46) + "║")
-    print("║  " + _pad(f"🕒 启动时间: {now_text()}", 46) + "║")
-    print("║  " + _pad(f"🔢 账号数量: {len(SERVERS)}", 46) + "║")
-    print("╚" + "=" * 50 + "╝")
+    print("╔" + "═" * BOX_WIDTH + "╗")
+    print("║  " + _pad(title, BOX_INNER) + "║")
 
 
-def log_account_header(index, total, server):
+def box_line(label, value):
+    print("║  " + _pad(f"{label}: {value}", BOX_INNER) + "║")
+
+
+def box_bottom():
+    print("╚" + "═" * BOX_WIDTH + "╝")
+
+
+def account_frame(index, total, title, source):
     print()
-    print("┌" + "-" * 50 + "┐")
-    print("│  " + _pad(f"🧩 账号 {index} / {total}", 46) + "│")
-    remark = ""
-    if "#" in server:
-        remark = server.split("#", 1)[1].strip()
-    _, ref = parse_yyb_entry(server)
-    label = remark or ref or server
-    print("│  " + _pad(f"🔑 标识: {label}", 46) + "│")
-    print("└" + "-" * 50 + "┘")
+    print("┌" + "─" * BOX_WIDTH + "┐")
+    print("│  " + _pad(f"🧩 账号 {index} / {total}　{title}", BOX_INNER) + "│")
+    print("│  " + _pad(f"🔗 来源: {source}", BOX_INNER) + "│")
+    print("└" + "─" * BOX_WIDTH + "┘")
 
 
-def log_footer(success_count, fail_count):
+def hr():
     print()
-    print("╔" + "=" * 50 + "╗")
-    print("║  " + _pad("🏁 iQOO社区任务执行完成", 46) + "║")
-    print("║  " + _pad(f"✅ 成功: {success_count}", 46) + "║")
-    print("║  " + _pad(f"❌ 失败: {fail_count}", 46) + "║")
-    print("║  " + _pad(f"🕒 结束时间: {now_text()}", 46) + "║")
-    print("╚" + "=" * 50 + "╝")
+    print("-" * BOX_WIDTH)
 
+
+def to_number(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def fmt_points(value):
+    return str(value) if value is not None else "未知"
 
 def mask_name(value):
     text = str(value or "")
@@ -149,7 +170,14 @@ def is_success(result):
 
 
 def is_token_error(message):
-    return bool(re.search(r"-4011|401|403|token|登录|授权|请先登录|跳转到登录页|访客没有权限", str(message or ""), re.I))
+    """只认明确的登录凭证失效提示，避免把业务失败误判成 token 失效而删缓存。"""
+    pattern = (
+        r"-4011|\b401\b|\b403\b"
+        r"|token\s*(失效|无效|过期|不存在|错误)"
+        r"|(登录|登录态|凭证|授权)\s*(失效|过期|无效|已过期|异常)"
+        r"|请先登录|未登录|跳转到登录页|访客没有权限|重新登录"
+    )
+    return bool(re.search(pattern, str(message or ""), re.I))
 
 
 def json_preview(data, limit=800):
@@ -164,7 +192,8 @@ def read_token_cache():
         if not os.path.exists(TOKEN_CACHE_FILE):
             return {}
         with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f) or {}
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
@@ -174,11 +203,41 @@ def write_token_cache(cache):
         os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
         with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log(f"⚠️ [缓存] 写入失败: {e}")
+    except Exception as exc:
+        log(f"   ⚠️ [缓存] 保存失败（不影响本次执行）：{exc}")
 
 
-# ==================== 品赞代理 ====================
+def cache_key(server, ref):
+    """缓存键：地址|标识，避免不同 YYB 地址下同名标识串号。"""
+    return f"{server}|{ref}"
+
+
+def read_cache_entry(ck, ref):
+    cache = read_token_cache()
+    entry = cache.get(ck)
+    if isinstance(entry, dict) and entry.get("accessToken"):
+        return entry
+    # 兼容旧版仅按 ref 存的缓存：读到就迁移到新键
+    legacy = cache.get(ref)
+    if isinstance(legacy, dict) and legacy.get("accessToken"):
+        cache[ck] = legacy
+        cache.pop(ref, None)
+        write_token_cache(cache)
+        return legacy
+    return {}
+
+
+def save_cache_entry(ck, entry):
+    cache = read_token_cache()
+    cache[ck] = {**entry, "updatedAt": now_text()}
+    write_token_cache(cache)
+
+
+def drop_cache_entry(ck):
+    cache = read_token_cache()
+    if ck in cache:
+        cache.pop(ck, None)
+        write_token_cache(cache)
 
 def direct_session():
     session = requests.Session()
@@ -249,7 +308,7 @@ def build_proxy_dict(proxy_info):
     scheme = "socks5" if PROXY_TYPE == "socks5" else "http"
     proxy_url = f"{scheme}://{auth}{host}:{port}"
 
-    log(f"🌐 [代理] 生成 {scheme.upper()} 代理 {host}:{port}")
+    log(f"   🌐 [代理] 生成 {scheme.upper()} 代理 {host}:{port}")
 
     return {"http": proxy_url, "https": proxy_url}
 
@@ -265,20 +324,20 @@ def validate_proxy(proxies):
                 ip = response.json().get("origin", "未知")
             except Exception:
                 ip = "未知"
-            log(f"✅ [代理] 验证通过，出口 IP: {ip}")
+            log(f"   ✅ [代理] 验证通过，出口 IP: {ip}")
             return True, ip
     except Exception as exc:
-        log(f"⚠️ [代理] 验证失败: {exc}")
+        log(f"   ⚠️ [代理] 验证失败：{exc}")
 
     return False, ""
 
 
 def get_valid_proxy(server):
     if not PROXY_API:
-        log(f"ℹ️ [代理] {server} 未配置 PROXY_API，使用直连")
+        log("   🌐 [代理] 未配置 PROXY_API，使用直连")
         return None, ""
 
-    log(f"🔌 [代理] {server} 正在获取品赞代理...")
+    log("   🔌 [代理] 正在获取品赞代理...")
 
     for index in range(1, PROXY_RETRY_TIMES + 1):
         try:
@@ -286,24 +345,24 @@ def get_valid_proxy(server):
             proxy_info = parse_proxy_response(response.text)
 
             if not proxy_info:
-                log(f"⚠️ [代理] 第 {index} 次代理解析失败")
+                log(f"   ⚠️ [代理] 第 {index} 次代理解析失败")
                 continue
 
-            log(f"✅ [代理] 提取到 {proxy_info['host']}:{proxy_info['port']}")
+            log(f"   ✅ [代理] 提取到 {proxy_info['host']}:{proxy_info['port']}")
             proxies = build_proxy_dict(proxy_info)
 
             ok, ip = validate_proxy(proxies)
             if ok:
                 return proxies, ip
 
-            log(f"⚠️ [代理] 第 {index} 次代理不可用")
+            log(f"   ⚠️ [代理] 第 {index} 次代理不可用")
         except Exception as exc:
-            log(f"⚠️ [代理] 第 {index} 次获取代理异常: {exc}")
+            log(f"   ⚠️ [代理] 第 {index} 次获取代理异常：{exc}")
 
         if index < PROXY_RETRY_TIMES:
             sleep(2)
 
-    log("⚠️ [代理] 获取失败，使用直连")
+    log("   ⚠️ [代理] 获取失败，使用直连")
     return None, ""
 
 
@@ -314,10 +373,10 @@ def request_with_proxy(method, url, *, proxies=None, server="", **kwargs):
         try:
             return requests.request(method, url, proxies=proxies, **kwargs)
         except Exception as exc:
-            log(f"⚠️ [代理] {server} 代理请求失败: {exc}")
+            log(f"   ⚠️ [代理] 代理请求失败：{exc}")
             if not ENABLE_DIRECT_FALLBACK:
                 raise
-            log("🔄 [兜底] 切换直连重试")
+            log("   🔄 [兜底] 切换直连重试")
 
     session = direct_session()
     return session.request(method, url, **kwargs)
@@ -326,7 +385,7 @@ def request_with_proxy(method, url, *, proxies=None, server="", **kwargs):
 
 def send_pushplus(title, content):
     if not PLUSPLUS_TOKEN:
-        log("ℹ️ [推送] 未配置 PLUSPLUS_TOKEN，跳过推送")
+        log("   ℹ️ [推送] 未配置 PLUSPLUS_TOKEN，跳过推送")
         return
 
     try:
@@ -340,58 +399,81 @@ def send_pushplus(title, content):
             },
             timeout=10,
         )
-        log("✅ [推送] 推送成功")
+        log("   📨 [推送] PushPlus 推送成功")
     except Exception as exc:
-        log(f"❌ [推送] 推送失败: {exc}")
+        log(f"   ❌ [推送] PushPlus 推送失败：{exc}")
 
 
 def build_notify(results):
-    success_count = sum(1 for item in results if item["success"])
-    fail_count = len(results) - success_count
+    lines = ["### iQOO社区 每日任务"]
+    for res in results:
+        flag = "✅" if res.get("success") else "❌"
+        lines.append(f"\n#### {flag} 账号 {res['index']} · {res['source']}")
+        if res.get("login_source"):
+            source = "缓存复用" if res["login_source"] == "缓存" else "新登录"
+            lines.append(f"- 登录：{source}")
+            lines.append(f"- 用户：{res.get('userName') or '未返回'}")
+            lines.append(f"- 任务：{res.get('tasksMsg') or '无任务数据'}")
+            lines.append(f"- 签到：{res.get('signMsg') or '无结果'}")
+            lines.append(f"- 抽奖：{res.get('drawMsg') or '无结果'}")
+            lines.append(f"- 积分：{fmt_points(res.get('before'))} → "
+                         f"{fmt_points(res.get('after'))}（{int(res.get('delta') or 0):+d}）")
+        if not res.get("success"):
+            lines.append(f"- 失败原因：{res.get('error') or '未知'}")
+    return "\n".join(lines)
 
-    content = f"iQOO社区任务结果\n\n总结: {success_count} 成功 / {fail_count} 失败\n时间: {now_text()}\n"
-    content += "=" * 40 + "\n"
+# ==================== 青龙 notify.py 推送 ====================
 
-    for idx, res in enumerate(results, 1):
-        status_text = "成功" if res["success"] else "失败"
+def send_qinglong_notify(title, content):
+    if os.getenv("IQOO_NOTIFY", "1") == "0":
+        log("   ℹ️ [通知] IQOO_NOTIFY=0，已关闭通知")
+        return False
+    for candidate in (
+        "/ql/data/scripts/notify.py",
+        "/ql/scripts/notify.py",
+        "/ql/data/notify.py",
+        os.path.join(_SCRIPT_DIR, "notify.py"),
+    ):
+        if not os.path.exists(candidate):
+            continue
+        try:
+            import importlib.util
 
-        content += f"\n账号 {idx}\n"
-        content += f"来源: {res['server']}\n"
-        content += f"代理: {res['proxyStatus']}\n"
-        content += f"出口IP: {res['proxyIp']}\n"
-        content += f"Token: {res['token']}\n"
-        content += f"用户: {res['userName']}\n"
-        content += f"酷币: {res['score']}\n"
-        content += f"签到: {res['signMsg']}\n"
-        content += f"抽奖: {res['drawMsg']}\n"
-        content += f"结果: {status_text}\n"
-
-        if not res["success"]:
-            content += f"原因: {res['error']}\n"
-
-        content += "=" * 40 + "\n"
-
-    return content
+            spec = importlib.util.spec_from_file_location("iqoo_ql_notify", candidate)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            sender = getattr(module, "send", None) or getattr(module, "sendNotify", None)
+            if callable(sender):
+                sender(title, content)
+                return True
+        except Exception as exc:
+            log(f"   ⚠️ [通知] 加载 {candidate} 失败：{exc}")
+    return False
 
 
-# ==================== 8088 code服务 ====================
-
-def parse_yyb_entry(raw):
-    """解析 YYB_SERVER 条目：地址@微信账号标识[#备注] → (server, ref)"""
-    raw = raw.strip()
-    if "#" in raw:
-        raw = raw.split("#", 1)[0].strip()
-    if "@" not in raw:
-        log(f"❌ YYB_SERVER 格式应为 地址@微信账号标识，当前值：{raw}")
-        return "", ""
-    server, ref = raw.split("@", 1)
-    server = server.strip().lstrip("http://").lstrip("https://").rstrip("/")
+def parse_entry(raw):
+    """解析 YYB_SERVER 条目：地址@微信账号标识[#备注] → (服务器地址, 标识, 备注)"""
+    value = str(raw or "").strip()
+    note = ""
+    if "#" in value:
+        value, note = value.split("#", 1)
+        value, note = value.strip(), note.strip()
+    if "@" not in value:
+        log(f"   ❌ [配置] YYB_SERVER 格式应为 地址@微信账号标识，当前值：{raw}")
+        return "", "", note
+    server, ref = value.rsplit("@", 1)
+    # 用正则剥协议头，避免 lstrip 按字符集误删 https 的 s
+    server = re.sub(r"^https?://", "", server.strip(), flags=re.IGNORECASE).rstrip("/")
     ref = ref.strip()
     if not server or not ref:
-        log(f"❌ YYB_SERVER 缺少地址或微信账号标识，当前值：{raw}")
-        return "", ""
-    return server, ref
+        log(f"   ❌ [配置] YYB_SERVER 缺少地址或账号标识，当前值：{raw}")
+        return "", "", note
+    return server, ref, note
 
+
+def parse_yyb_entry(raw):
+    server, ref, _ = parse_entry(raw)
+    return server, ref
 
 def get_code(entry):
     """通过 YYB Go 取码服务获取微信小程序 login code"""
@@ -417,187 +499,286 @@ def get_code(entry):
                 result = {}
         code = (result or {}).get("code")
         if data.get("code") != 0 or not code:
-            log(f"❌ [取码] 取码失败: {json_preview(data)}")
+            log(f"   ❌ [取码] 取码失败：{json_preview(data)}")
             return None
 
-        log("✅ [取码] 取码成功")
+        log("   ✅ [取码] 取码成功")
         return code
     except Exception as exc:
-        log(f"❌ [取码] 取码异常: {exc}")
+        log(f"   ❌ [取码] 取码异常：{exc}")
+        log(f"   💡 [提示] 请检查 YYB 服务地址 http://{server} 是否在线、{ref} 是否已登录")
         return None
 
 
 # ==================== Task ====================
 
 class Task:
-    def __init__(self, server, proxies):
-        global _user_idx
-        _user_idx += 1
-        self.index = _user_idx
+    def __init__(self, server, proxies, index=1):
+        self.index = index
         self.server = server
         self.proxies = proxies
+        self.server_addr, self.ref, self.note = parse_entry(server)
+        self.ck = cache_key(self.server_addr, self.ref)
         self.openid = server
-        _, _ref = parse_yyb_entry(server)
-        self.cache_key = _ref or server
         self.token = ""
         self.refresh_token = ""
         self.user_id = ""
         self.user_info = {}
         self.thread_list = []
-        self.visitor = hashlib.md5((self.openid or str(int(time.time()))).encode()).hexdigest()
-        self._sign_msg = "-"
-        self._draw_msg = "-"
+        self.visitor = hashlib.md5((self.ref or self.openid or str(int(time.time()))).encode()).hexdigest()
+        self.sign_msg = "-"
+        self.draw_msg = "-"
+        self.tasks_msg = "-"
+        self.login_source = ""
+        self.before = None
+        self.after = None
+        self.sign_ok = False
+        self.task_ok = False
+        self.draw_ok = False
         self._login_error = ""
         self._token_dead = False
 
     def run(self):
         result = {
-            "server": self.server,
+            "index": self.index,
+            "source": f"{self.server_addr}@{self.ref}" if self.ref else self.server,
+            "name": self.note or self.ref or f"账号{self.index}",
             "success": False,
+            "login_source": "",
+            "userName": "-",
+            "before": None,
+            "after": None,
+            "delta": 0,
+            "signMsg": "-",
+            "drawMsg": "-",
+            "tasksMsg": "-",
+            "error": "",
             "proxyStatus": "使用专属代理" if self.proxies else "使用直连",
             "proxyIp": "-",
             "token": "-",
-            "userName": "-",
-            "score": "-",
-            "signMsg": "-",
-            "drawMsg": "-",
-            "error": "",
         }
 
-        try:
-            cached = self.get_cached_token()
-            if cached and cached.get("accessToken"):
-                self.apply_token(cached)
-                log(f"💾 [缓存] 账号[{self.index}] 使用缓存token: {short_token(self.token)}")
-                if not self.check_token():
-                    self.remove_cached_token()
-                    log(f"🔄 [重登] 账号[{self.index}] 缓存token失效，重新登录")
+        for attempt in range(2):
+            try:
+                # ---------- ① 首次尝试复用缓存 token ----------
+                if attempt == 0:
+                    entry = read_cache_entry(self.ck, self.ref)
+                    if entry.get("accessToken"):
+                        self.apply_token(entry)
+                        log(f"   💾 [缓存] 复用已保存的登录 token（{short_token(self.token)}）")
+                        verify_error = None
+                        try:
+                            self.fetch_user()
+                        except Exception as exc:
+                            verify_error = exc
 
-            if not self.token:
-                self.login_by_wx_code()
+                        if verify_error is None:
+                            self.login_source = "缓存"
+                            self.report_user()
+                        elif is_token_error(str(verify_error)) or self._token_dead:
+                            log("   ♻️ [缓存] token 已失效，清理缓存后重新登录")
+                            self.remove_cached_token()
+                        else:
+                            result["error"] = f"缓存 token 校验失败：{verify_error}"
+                            log("   ❌ [用户] 缓存 token 校验失败，保留缓存不删除")
+                            return self._fill(result)
+
+                # ---------- ② 没有可用 token → 重新登录 ----------
                 if not self.token:
-                    result["error"] = self._login_error or "登录失败"
-                    result["signMsg"] = self._sign_msg
-                    result["drawMsg"] = self._draw_msg
-                    return result
+                    self.login_by_wx_code()
+                    if not self.token:
+                        result["error"] = self._login_error or "登录失败（取码或换 token 未通过，见上方日志）"
+                        log("   ❌ [登录] 失败，跳过该账号")
+                        return self._fill(result)
+                    self.login_source = "新登录"
+                    self.fetch_user()
+                    self.report_user()
 
-            self._token_dead = False
-            self._run_business(result)
+                # ---------- ③ 日常任务 / 抽奖 / 签到 ----------
+                self._token_dead = False
+                self.run_daily_tasks()
+                if not self._token_dead:
+                    self.get_draw_num()
+                    self.sign_in()
 
-            if self._token_dead:
-                log(f"🔄 [重登] 账号[{self.index}] 业务返回登录失效，清除缓存重新登录并重试一次")
-                self.remove_cached_token()
-                self.login_by_wx_code()
-                if self.token:
-                    self._token_dead = False
-                    self._run_business(result)
+                # ---------- ④ 执行中登录态失效 → 清缓存重登重跑一次 ----------
+                if self._token_dead and attempt == 0:
+                    log("   🔄 [重试] 执行中登录态失效，清理缓存重登后重跑一次")
+                    self.remove_cached_token()
+                    sleep(1.5)
+                    continue
 
-            result["success"] = True
-        except Exception as e:
-            result["error"] = str(e)
+                # ---------- ⑤ 复查积分 ----------
+                self.refresh_points()
 
-        result["signMsg"] = self._sign_msg
-        result["drawMsg"] = self._draw_msg
+                result["success"] = bool(self.sign_ok or self.task_ok or self.draw_ok)
+                if result["success"]:
+                    log("   ✅ [完成] 该账号任务执行完成")
+                else:
+                    result["error"] = self.sign_msg if self.sign_msg not in ("-", "") else "签到、任务、抽奖均未成功（详见上方日志）"
+                    log("   ⚠️ [完成] 流程结束，但没有有效结果")
+                return self._fill(result)
+
+            except Exception as exc:
+                if (is_token_error(str(exc)) or self._token_dead) and attempt == 0:
+                    log("   🔄 [重试] 登录态失效，清理缓存重登后重跑一次")
+                    self.remove_cached_token()
+                    sleep(1.5)
+                    continue
+                result["error"] = f"执行异常：{exc}"
+                log(f"   ❌ [异常] {exc}")
+                return self._fill(result)
+
+        result["error"] = result["error"] or "重试后仍未完成（详见上方日志）"
+        return self._fill(result)
+
+    def _fill(self, result):
+        result["login_source"] = self.login_source
+        result["signMsg"] = self.sign_msg
+        result["drawMsg"] = self.draw_msg
+        result["tasksMsg"] = self.tasks_msg
+        result["token"] = short_token(self.token)
+        result["userName"] = mask_name(self.user_name()) or "-"
+        result["before"] = self.before
+        result["after"] = self.after
+        if isinstance(self.before, (int, float)) and isinstance(self.after, (int, float)):
+            result["delta"] = int(self.after - self.before)
         return result
 
-    def _run_business(self, result):
-        self.user_info_request()
-        result["token"] = short_token(self.token)
-        result["userName"] = mask_name(
-            self.user_info.get("nickname")
-            or self.user_info.get("username")
-            or self.user_info.get("userName")
-            or self.user_id
-        )
-        score_val = self.user_info.get("score")
-        if score_val is None:
-            score_val = self.user_info.get("points")
-        if score_val is None:
-            score_val = self.user_info.get("coolCoin", "未知")
-        result["score"] = score_val
+    def user_name(self):
+        return (self.user_info.get("nickname")
+                or self.user_info.get("username")
+                or self.user_info.get("userName")
+                or self.user_id
+                or "")
 
-        daily_tasks = self.fetch_daily_tasks()
-        if not daily_tasks:
-            log(f"⚠️ [任务] 账号[{self.index}] 未获取到每日任务，跳过任务执行")
+    def current_points(self):
+        for key in ("score", "points", "coolCoin"):
+            value = self.user_info.get(key)
+            if value is None:
+                continue
+            number = to_number(value)
+            return number if number is not None else value
+        return None
+
+    def report_user(self):
+        self.before = self.current_points()
+        log(f"   👤 [用户] {mask_name(self.user_name()) or '-'}")
+        log(f"   💰 [积分] 当前 {fmt_points(self.before)} 酷币")
+
+    def refresh_points(self):
+        try:
+            self.fetch_user()
+        except Exception as exc:
+            log(f"   ⚠️ [积分] 最终积分获取失败（{exc}）")
+            if isinstance(self.before, (int, float)):
+                self.after = self.before
+            return
+
+        self.after = self.current_points()
+        if isinstance(self.before, (int, float)) and isinstance(self.after, (int, float)):
+            log(f"   💰 [积分] {self.before} → {self.after}（{int(self.after - self.before):+d}）")
         else:
-            need_threads = any(
-                t.get("upper_limit") != "不限次数"
-                and (int(t.get("upper_limit", 0)) - t.get("isFinal", 0)) > 0
-                and t.get("rule") in ("view_thread", "like", "share", "create_post")
-                for t in daily_tasks
-            )
-            if need_threads:
-                self.get_thread_list()
+            log(f"   💰 [积分] 当前 {fmt_points(self.after)} 酷币")
 
-            for task in daily_tasks:
-                rule = task.get("rule")
-                done = task.get("isFinal", 0)
-                upper = task.get("upper_limit")
-                if upper == "不限次数":
-                    continue
-                max_count = int(upper)
-                remaining = max_count - done
-                if remaining <= 0:
-                    continue
+    def run_daily_tasks(self):
+        daily_tasks = self.fetch_daily_tasks()
+        if self._token_dead:
+            return
+        if not daily_tasks:
+            self.tasks_msg = "未获取到每日任务"
+            log("   ⚠️ [任务] 未获取到每日任务，跳过")
+            return
 
-                log(f"📋 [任务] 账号[{self.index}] {task.get('access')} 已完成{done}/{max_count}，还需{remaining}次")
+        def task_upper(task):
+            value = task.get("upper_limit")
+            if value in (None, "", "不限次数"):
+                return None
+            number = to_number(value)
+            return int(number) if number is not None else None
 
-                if rule == "view_thread":
-                    for item in self.thread_list:
-                        if remaining <= 0:
-                            break
-                        self.view_post(item.get("threadId"))
-                        remaining -= 1
-                        sleep(3)
-                elif rule == "like":
-                    for item in self.thread_list:
-                        if remaining <= 0:
-                            break
-                        self.like_post(item.get("threadId"), item.get("postId"))
-                        remaining -= 1
-                        sleep(3)
-                elif rule == "share":
-                    for item in self.thread_list:
-                        if remaining <= 0:
-                            break
-                        self.share_post(item.get("threadId"))
-                        remaining -= 1
-                        sleep(3)
-                elif rule == "create_post":
-                    if self.thread_list:
-                        self.comment_post(self.thread_list[0].get("threadId"))
-                        remaining -= 1
-                    else:
-                        log(f"⚠️ [任务] 账号[{self.index}] 无帖子可评论")
-                elif rule == "create_thread":
-                    self.create_and_delete_thread()
+        need_threads = any(
+            task_upper(t) is not None
+            and task_upper(t) > int(t.get("isFinal", 0) or 0)
+            and t.get("rule") in ("view_thread", "like", "share", "create_post")
+            for t in daily_tasks
+        )
+        if need_threads:
+            self.get_thread_list()
 
-        self.get_draw_num()
-        self.sign_in()
+        executed = []
+        for task in daily_tasks:
+            if self._token_dead:
+                break
+            rule = task.get("rule")
+            done = int(task.get("isFinal", 0) or 0)
+            max_count = task_upper(task)
+            if max_count is None:
+                continue
+            remaining = max_count - done
+            if remaining <= 0:
+                continue
 
-    def get_cached_token(self):
-        cache = read_token_cache()
-        return cache.get(self.cache_key) or None
+            label = task.get("access") or rule or "任务"
+            log(f"   📋 [任务] {label} 已完成 {done}/{max_count}，还需 {remaining} 次")
+            start_remaining = remaining
+
+            if rule == "view_thread":
+                for item in self.thread_list:
+                    if remaining <= 0 or self._token_dead:
+                        break
+                    self.view_post(item.get("threadId"))
+                    remaining -= 1
+                    sleep(3)
+            elif rule == "like":
+                for item in self.thread_list:
+                    if remaining <= 0 or self._token_dead:
+                        break
+                    self.like_post(item.get("threadId"), item.get("postId"))
+                    remaining -= 1
+                    sleep(3)
+            elif rule == "share":
+                for item in self.thread_list:
+                    if remaining <= 0 or self._token_dead:
+                        break
+                    self.share_post(item.get("threadId"))
+                    remaining -= 1
+                    sleep(3)
+            elif rule == "create_post":
+                if self.thread_list:
+                    self.comment_post(self.thread_list[0].get("threadId"))
+                    remaining -= 1
+                else:
+                    log("   ⚠️ [任务] 无帖子可评论")
+            elif rule == "create_thread":
+                self.create_and_delete_thread()
+                remaining -= 1
+
+            finished = max(0, start_remaining - remaining)
+            if finished:
+                executed.append(f"{label} {finished}")
+
+        done_total = len(executed)
+        self.task_ok = done_total > 0
+        self.tasks_msg = " · ".join(executed) if executed else "没有需要执行的待办任务"
+        if done_total:
+            log(f"   📋 [任务] 本次完成 {done_total} 项任务：{self.tasks_msg}")
+        else:
+            log("   ℹ️ [任务] 没有需要执行的待办任务")
 
     def save_cached_token(self):
         if not self.token:
             return
-        cache = read_token_cache()
-        cache[self.cache_key] = {
+        save_cache_entry(self.ck, {
             "accessToken": self.token,
             "refreshToken": self.refresh_token,
             "userId": self.user_id,
             "userInfo": self.user_info,
             "visitor": self.visitor,
-            "updatedAt": datetime.now().isoformat(),
-        }
-        write_token_cache(cache)
+        })
 
     def remove_cached_token(self):
-        cache = read_token_cache()
-        if cache.get(self.cache_key):
-            del cache[self.cache_key]
-            write_token_cache(cache)
+        drop_cache_entry(self.ck)
         self.token = ""
         self.refresh_token = ""
         self.user_id = ""
@@ -688,7 +869,10 @@ class Task:
             result = self.request("v5/users/tasks", {}, {"method": "GET"})
             return (result.get("Data") or {}).get("perDayData") or []
         except Exception as e:
-            log(f"❌ [任务] 账号[{self.index}] 获取每日任务失败: {e}")
+            log(f"   ❌ [任务] 获取每日任务失败：{e}")
+            if is_token_error(str(e)):
+                self._token_dead = True
+                self.remove_cached_token()
             return []
 
     def login_by_wx_code(self):
@@ -707,7 +891,7 @@ class Task:
                 "iv": iv,
                 "from": 46,
             }
-            log(f"🔐 [登录] 账号[{self.index}] 使用 code 换取 token...")
+            log("   🔐 [登录] 使用 code 换取 token...")
             result = self.request("v3/users/vivo/mini", payload)
             data = result.get("Data") or {}
             token = data.get("accessToken") or data.get("token") or ""
@@ -719,40 +903,17 @@ class Task:
             self.user_info = data.get("user") or data
             self.save_cached_token()
             name = self.user_info.get("nickname") or self.user_info.get("username") or self.user_id
-            log(f"✅ [登录] 账号[{self.index}] 登录成功: {mask_name(name)}")
+            log(f"   ✅ [登录] 登录成功：{mask_name(name)}")
         except Exception as e:
             self._login_error = str(e)
-            log(f"❌ [登录] 账号[{self.index}] 登录失败: {e}")
+            log(f"   ❌ [登录] 登录失败：{e}")
 
-    def check_token(self):
-        try:
-            if not self.user_id:
-                return False
-            self.request("v3/user", {"userId": self.user_id}, {"method": "GET"})
-            return True
-        except Exception:
-            return False
-
-    def user_info_request(self):
+    def fetch_user(self):
         if not self.user_id:
-            return
-        try:
-            result = self.request("v3/user", {"userId": self.user_id}, {"method": "GET"})
-            self.user_info = result.get("Data") or self.user_info
-            self.save_cached_token()
-            name = self.user_info.get("nickname") or self.user_info.get("username") or self.user_info.get("userName") or self.user_id
-            score = self.user_info.get("score")
-            if score is None:
-                score = self.user_info.get("points")
-            if score is None:
-                score = self.user_info.get("coolCoin", "未知")
-            log(f"👤 [用户] 账号[{self.index}] 用户:{mask_name(name)} 酷币:{score}")
-        except Exception as e:
-            message = str(e)
-            log(f"❌ [用户] 账号[{self.index}] 获取用户信息失败:{message}")
-            if is_token_error(message):
-                self._token_dead = True
-                self.remove_cached_token()
+            raise Exception("缺少 userId，无法校验登录态")
+        result = self.request("v3/user", {"userId": self.user_id}, {"method": "GET"})
+        self.user_info = result.get("Data") or self.user_info
+        self.save_cached_token()
 
     def get_draw_num(self):
         try:
@@ -760,46 +921,66 @@ class Task:
             if (result.get("Data") or {}).get("count") == 0:
                 self.draw()
             else:
-                self._draw_msg = "今日已抽奖"
-                log(f"🎰 [抽奖] 账号[{self.index}] 今日已抽奖")
-        except Exception as e:
-            self._draw_msg = f"查询抽奖失败: {e}"
-            log(f"❌ [抽奖] 账号[{self.index}] 查询抽奖次数失败:{e}")
+                self.draw_msg = "今日已抽奖"
+                self.draw_ok = True
+                log("   🎰 [抽奖] 今日已抽奖")
+        except Exception as exc:
+            self.draw_msg = f"查询抽奖失败：{exc}"
+            log(f"   ❌ [抽奖] 查询抽奖次数失败：{exc}")
+            if is_token_error(str(exc)):
+                self._token_dead = True
+                self.remove_cached_token()
 
     def draw(self):
         try:
             result = self.request("v3/luck.draw", {})
             prize = (result.get("Data") or {}).get("prize_name") or "奖励"
-            self._draw_msg = f"获得{prize}"
-            log(f"🎰 [抽奖] 账号[{self.index}] 抽奖成功 获得{prize}")
-        except Exception as e:
-            self._draw_msg = f"抽奖失败: {e}"
-            log(f"❌ [抽奖] 账号[{self.index}] 抽奖失败:{e}")
+            self.draw_msg = f"抽奖成功，获得 {prize}"
+            self.draw_ok = True
+            log(f"   🎰 [抽奖] 抽奖成功，获得 {prize}")
+        except Exception as exc:
+            self.draw_msg = f"抽奖失败：{exc}"
+            log(f"   ❌ [抽奖] 抽奖失败：{exc}")
+            if is_token_error(str(exc)):
+                self._token_dead = True
+                self.remove_cached_token()
 
     def sign_in(self):
         try:
             result = self.request("v3/sign", {"from": "group"})
             data = result.get("Data") or {}
-            self._sign_msg = f"已签到{data.get('serialDays')}天 获得积分{data.get('score')} 当前积分{data.get('scoreCount')}"
-            log(f"✅ [签到] 账号[{self.index}] 已签到{data.get('serialDays')}天 获得积分{data.get('score')} 当前积分{data.get('scoreCount')}")
-        except Exception as e:
-            message = str(e)
+            score = data.get("score")
+            total = data.get("scoreCount")
+            self.sign_msg = (f"签到成功 连续{data.get('serialDays')}天"
+                             f" +{score}积分 当前{total}")
+            self.sign_ok = True
+            log(f"   ✅ [签到] {self.sign_msg}")
+        except Exception as exc:
+            message = str(exc)
             if re.search(r"已签|重复|今日|13006", message):
-                self._sign_msg = "今日已签到"
-                log(f"✅ [签到] 账号[{self.index}] 今日已签到")
+                self.sign_msg = "今日已签到"
+                self.sign_ok = True
+                log("   ℹ️ [签到] 今日已签到")
                 return
-            self._sign_msg = f"签到失败: {message}"
-            log(f"❌ [签到] 账号[{self.index}] 签到失败:{message}")
+            self.sign_msg = f"签到失败：{message}"
+            log(f"   ❌ [签到] {self.sign_msg}")
             if is_token_error(message):
                 self._token_dead = True
                 self.remove_cached_token()
 
+    def _interaction_error(self, label, exc):
+        log(f"   ❌ [{label}] {exc}")
+        if is_token_error(str(exc)):
+            self._token_dead = True
+            self.remove_cached_token()
+
     def like_post(self, thread_id, post_id):
         try:
             self.request("v3/posts.update", {"id": thread_id, "postId": post_id, "data": {"attributes": {"isLiked": True}}})
-            log(f"❤️ [互动] 账号[{self.index}] 帖子点赞成功")
+            log("   ❤️ [互动] 帖子点赞成功")
         except Exception as e:
-            log(f"❌ [互动] 账号[{self.index}] 帖子点赞失败:{e}")
+            self._interaction_error("互动", f"帖子点赞失败：{e}")
+            return
         try:
             self.request("v3/posts.update", {"id": thread_id, "postId": post_id, "data": {"attributes": {"isLiked": False}}})
         except Exception:
@@ -808,23 +989,23 @@ class Task:
     def share_post(self, thread_id):
         try:
             self.request("v3/thread.share", {"threadId": thread_id})
-            log(f"🔗 [互动] 账号[{self.index}] 帖子分享成功")
+            log("   🔗 [互动] 帖子分享成功")
         except Exception as e:
-            log(f"❌ [互动] 账号[{self.index}] 帖子分享失败:{e}")
+            self._interaction_error("互动", f"帖子分享失败：{e}")
 
     def view_post(self, thread_id):
         try:
             self.request("v3/view.count", {"threadId": thread_id, "type": 0}, {"method": "GET"})
-            log(f"👀 [互动] 账号[{self.index}] 帖子浏览成功")
+            log("   👀 [互动] 帖子浏览成功")
         except Exception as e:
-            log(f"❌ [互动] 账号[{self.index}] 帖子浏览失败:{e}")
+            self._interaction_error("互动", f"帖子浏览失败：{e}")
 
     def comment_post(self, thread_id):
         try:
             self.request("v3/posts.create", {"id": thread_id, "type": 0, "content": "666", "source": "", "attachments": []})
-            log(f"💬 [互动] 账号[{self.index}] 帖子评论成功")
+            log("   💬 [互动] 帖子评论成功")
         except Exception as e:
-            log(f"❌ [互动] 账号[{self.index}] 帖子评论失败:{e}")
+            self._interaction_error("互动", f"帖子评论失败：{e}")
 
     def create_and_delete_thread(self):
         try:
@@ -848,14 +1029,14 @@ class Task:
             })
             thread_id = (result.get("Data") or {}).get("threadId")
             if not thread_id:
-                log(f"⚠️ [发帖] 账号[{self.index}] 发帖成功但未获取到threadId")
+                log("   ⚠️ [发帖] 发帖成功但未获取到 threadId，无法删除")
                 return
-            log(f"📝 [发帖] 账号[{self.index}] 发帖成功, threadId: {thread_id}")
+            log(f"   📝 [发帖] 发帖成功，threadId: {thread_id}")
             sleep(2)
             self.request("v3/thread.delete", {"threadId": thread_id, "message": ""})
-            log(f"🗑️ [发帖] 账号[{self.index}] 帖子已删除")
+            log("   🗑️ [发帖] 帖子已删除")
         except Exception as e:
-            log(f"❌ [发帖] 账号[{self.index}] 发帖/删除失败: {e}")
+            self._interaction_error("发帖", f"发帖/删除失败：{e}")
 
     def get_thread_list(self):
         try:
@@ -868,36 +1049,96 @@ class Task:
                 "sequence": 0,
             }, {"method": "GET"})
             self.thread_list = (result.get("Data") or {}).get("pageData") or []
-            log(f"📋 [帖子] 账号[{self.index}] 获取到{len(self.thread_list)}条帖子")
+            log(f"   📋 [帖子] 获取到 {len(self.thread_list)} 条帖子")
         except Exception as e:
-            log(f"❌ [帖子] 账号[{self.index}] 获取帖子列表失败:{e}")
+            log(f"   ❌ [帖子] 获取帖子列表失败：{e}")
             self.thread_list = []
 
 # ==================== 主入口 ====================
 
 def main():
-    log_title()
+    box_top("📱 iQOO社区 每日任务")
+    box_line("🕒 启动时间", now_text())
+    box_line("🔢 账号数量", f"{len(SERVERS)} 个")
+    box_line("💾 缓存", "token_caches/iqoo_token_cache.json")
+    box_bottom()
+
     results = []
-
     for idx, server in enumerate(SERVERS, 1):
-        log_account_header(idx, len(SERVERS), server)
-
+        server_addr, ref, note = parse_entry(server)
+        title = f"标识 {ref}" + (f"（{note}）" if note else "") if ref else "标识 未解析"
+        account_frame(idx, len(SERVERS), title, f"{server_addr}@{ref}" if ref else server)
         proxies, proxy_ip = get_valid_proxy(server)
-        sleep(PROXY_FETCH_INTERVAL)
+        if PROXY_API:
+            sleep(PROXY_FETCH_INTERVAL)
+        if proxies:
+            log("   🌐 [代理] 使用专属代理" + (f"（{proxy_ip}）" if proxy_ip else ""))
 
-        task = Task(server, proxies)
-        result = task.run()
+        task = Task(server, proxies, idx)
+        try:
+            result = task.run()
+        except Exception as exc:
+            result = {
+                "index": idx,
+                "source": f"{server_addr}@{ref}" if ref else server,
+                "name": note or ref or f"账号{idx}",
+                "success": False,
+                "login_source": "",
+                "userName": "-",
+                "before": None,
+                "after": None,
+                "delta": 0,
+                "signMsg": "-",
+                "drawMsg": "-",
+                "tasksMsg": "-",
+                "error": f"执行异常：{exc}",
+                "token": "-",
+            }
+            log(f"   ❌ [异常] 该账号执行异常：{exc}")
         result["proxyIp"] = proxy_ip or "-"
         results.append(result)
+        hr()
+        if idx < len(SERVERS):
+            log("   ⏳ 等待2秒后执行下一个账号...")
+            sleep(2)
 
-        sleep(5)
+    print()
+    for res in results:
+        icon = "✅" if res.get("success") else "❌"
+        title = f"【账号 {res['index']} · {res['source']}】"
+        if res.get("name") and res["name"] != res["source"]:
+            title = f"【账号 {res['index']} · {res['source']}（{res['name']}）】"
+        log(f"{icon} {title}")
+        if res.get("login_source"):
+            login_text = "缓存复用" if res["login_source"] == "缓存" else "新登录"
+            log(f"   🔐 [登录] {login_text} | token {res.get('token') or '-'}")
+            log(f"   👤 [用户] {res.get('userName') or '-'}")
+            log(f"   📋 [任务] {res.get('tasksMsg') or '-'}")
+            log(f"   📅 [签到] {res.get('signMsg') or '-'}")
+            log(f"   🎰 [抽奖] {res.get('drawMsg') or '-'}")
+            log(f"   💰 [积分] {fmt_points(res.get('before'))} → "
+                f"{fmt_points(res.get('after'))}（{int(res.get('delta') or 0):+d}）")
+        if not res.get("success"):
+            log(f"   ⚠️ [失败] {res.get('error') or '未知原因'}")
 
-    success_count = sum(1 for r in results if r["success"])
-    fail_count = len(results) - success_count
-    log_footer(success_count, fail_count)
+    ok_count = sum(1 for r in results if r.get("success"))
+    fail_count = len(results) - ok_count
+    total_delta = sum(int(r.get("delta") or 0) for r in results if r.get("success"))
 
-    send_pushplus("iQOO社区任务完成", build_notify(results))
+    box_top("🏁 iQOO社区 执行汇总")
+    box_line("📊 执行结果", f"成功 {ok_count} / 失败 {fail_count} / 共 {len(results)}")
+    box_line("💰 积分变化", f"+{total_delta}")
+    box_bottom()
+
+    content = build_notify(results)
+    if send_qinglong_notify("iQOO社区每日任务", content):
+        log("   📨 [通知] 已通过青龙 notify.py 推送")
+    send_pushplus("iQOO社区任务完成", content)
+    return results
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log(f"❌ 程序异常: {e}")
