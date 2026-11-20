@@ -371,7 +371,7 @@ def run_account(index: int, total: int, account, allow_cache: bool = True) -> di
     entry = read_cache().get(ck) or {}
     result = {"success": False, "status": "", "error": "", "aggr": "-"}
 
-    account_frame(index, total, f"账号 {ref}", f"{server}@{ref}")
+    account_frame(index, total, f"标识 {ref}", f"{server}@{ref}")
 
     for attempt in range(2):
         client = Changhong(server, ref)
@@ -394,6 +394,16 @@ def run_account(index: int, total: int, account, allow_cache: bool = True) -> di
             if not used_cache:
                 client.login()
                 print(f"   ✅ [登录] 成功　token 已更新")
+
+            # 登录后立即取一次积分，作为该账号的当前余额直接展示在登录行下面
+            try:
+                points = client.api("GET", "/homePage/getUserPoint")
+                if isinstance(points, (int, float)) and not isinstance(points, bool):
+                    print(f"   💰 [积分] 当前 {int(points)}")
+                else:
+                    print("   💰 [积分] 接口返回格式无法识别")
+            except TaskError as exc:
+                print(f"   ⚠️ [积分] 查询失败（{exc}）")
 
             aggr_id = client.activity_id()
             result["aggr"] = aggr_id
