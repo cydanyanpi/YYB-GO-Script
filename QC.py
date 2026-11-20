@@ -967,6 +967,7 @@ async def main():
             }
             print(f"   ❌ [异常] 该账号执行异常: {e}")
         results.append(res)
+        print("\n" + "-" * 48)
 
         if index < len(SERVERS):
             print("\n   ⏳ 等待2秒后执行下一个账号...")
