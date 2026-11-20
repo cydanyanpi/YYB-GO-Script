@@ -739,10 +739,14 @@ class OppoMiniClient:
 
     def _note(self, data: Any) -> dict:
         if isinstance(data, dict):
-            if is_auth_error(data):
-                self.auth_expired = True
             if data.get("_error"):
                 self.last_error = str(data.get("_error"))
+            elif is_auth_error(data):
+                self.auth_expired = True
+                self.last_error = str(
+                    data.get("message") or data.get("errorMessage")
+                    or data.get("msg") or f"code {data.get('code')}"
+                )
         return data
 
     def _post(self, url: str, json_body: dict = None) -> dict:
@@ -762,6 +766,24 @@ class OppoMiniClient:
         except Exception as exc:
             self.last_error = str(exc)
             return {"_error": str(exc)}
+
+    def check_session(self) -> Tuple[bool, str, dict]:
+        """开跑前校验凭证：积分接口 + 任务列表接口都返回正常才算有效。
+
+        只查积分不够——积分接口偶尔对过期 NEWOPPOSID 也返回 200，
+        而任务列表/任务提交才真正校验登录态，所以两个都查。
+        """
+        credit = self.credit_info()
+        if self.auth_expired:
+            return False, brief_error(self.last_error) or "积分接口提示登录失效", {}
+        if not credit:
+            return False, brief_error(self.last_error) or "积分接口未返回数据", {}
+
+        self.task_list()
+        if self.auth_expired:
+            return False, brief_error(self.last_error) or "任务列表接口提示登录失效", {}
+
+        return True, "", credit
 
     def is_login_valid(self) -> bool:
         data = self._get(API_CREDIT)
@@ -822,14 +844,17 @@ class OppoMiniClient:
             return list((data.get("data") or {}).get("taskDTOList") or [])
         return []
 
-    def report_browse(self, task: dict) -> bool:
+    def report_browse(self, task: dict) -> Tuple[bool, str]:
         params = {
             "taskId": str(task.get("taskId") or ""),
             "activityId": str(task.get("activityId") or self.task_activity_id),
             "taskType": str(task.get("taskType") or TASK_TYPE_BROWSE),
         }
         data = self._get(API_TASK_REPORT, params=params)
-        return data.get("code") == 200
+        if data.get("code") == 200:
+            return True, ""
+        reason = data.get("message") or data.get("errorMessage") or data.get("_error") or data.get("code")
+        return False, str(reason)
 
     def receive_award(self, task: dict) -> Tuple[bool, int, str]:
         params = {
@@ -887,6 +912,9 @@ class OppoMiniClient:
             stats["manual_hint"] = True
 
         for task in browse:
+            if self.auth_expired:
+                log("   ⚠️ [任务] 登录凭证失效，停止剩余任务")
+                break
             name = str(task.get("taskName") or task.get("taskId"))
             status = int(task.get("taskStatus") or 0)
             task_id = str(task.get("taskId") or "")
@@ -907,9 +935,10 @@ class OppoMiniClient:
                 if simulate_wait:
                     log(f"   👀 [任务] {name} 浏览等待 {wait_s}s")
                     time.sleep(wait_s + 0.5)
-                if not self.report_browse(task):
+                ok_report, report_msg = self.report_browse(task)
+                if not ok_report:
                     stats["failed"] += 1
-                    log(f"   ❌ [任务] {name} 提交失败")
+                    log(f"   ❌ [任务] {name} 提交失败：{report_msg}")
                     continue
                 stats["done"] += 1
                 log(f"   📤 [任务] {name} 提交成功")
@@ -999,7 +1028,8 @@ def run_account(server: str, sign_act_id: str, task_act_id: str,
     proxies, proxy_ip = get_valid_proxy(server)
     result["proxyStatus"] = "使用品赞代理" if proxies else "使用直连"
     result["proxyIp"] = proxy_ip or "-"
-    log(f"   🌐 [代理] {result['proxyStatus']}" + (f"（{proxy_ip}）" if proxy_ip else ""))
+    if proxies:
+        log(f"   🌐 [代理] {result['proxyStatus']}" + (f"（{proxy_ip}）" if proxy_ip else ""))
 
     if PROXY_API:
         time.sleep(PROXY_FETCH_INTERVAL)
@@ -1025,17 +1055,14 @@ def run_account(server: str, sign_act_id: str, task_act_id: str,
                     client = OppoMiniClient(entry["sessionId"], entry["aesSessionId"],
                                             entry.get("openid", ""), sign_act_id, task_act_id,
                                             proxies=proxies, server=server)
-                    credit = client.credit_info()
-                    if client.auth_expired:
-                        log("   ♻️ [缓存] 登录凭证已失效，清理缓存后重新登录")
+                    ok_session, session_reason, credit = client.check_session()
+                    if not ok_session:
+                        log(f"   ♻️ [缓存] 登录凭证未通过开跑前校验（{session_reason}），清理缓存后重新登录")
                         drop_cache_entry(cache, server_addr, ref)
                         client = None
-                    elif not credit:
-                        result["error"] = f"凭证校验失败（{brief_error(client.last_error)}）"
-                        log(f"   ❌ [积分] 缓存凭证校验失败，保留缓存不删除")
-                        return result
                     else:
                         result["login_source"] = "缓存"
+                        log("   ✅ [缓存] 开跑前校验通过（积分接口 + 任务列表接口）")
                         show_credit(result, credit)
 
             # ---------- ② 没有可用凭证 → 重新登录 ----------
@@ -1062,11 +1089,18 @@ def run_account(server: str, sign_act_id: str, task_act_id: str,
 
                 client = OppoMiniClient(session_id, aes_key, openid_ret or "", sign_act_id, task_act_id,
                                         proxies=proxies, server=server)
-                credit = client.credit_info()
-                if not credit:
-                    result["error"] = f"登录后查询积分失败（{brief_error(client.last_error)}）"
-                    log("   ❌ [积分] 登录后查询积分失败")
+                ok_session, session_reason, credit = client.check_session()
+                if not ok_session:
+                    if attempt == 0:
+                        log(f"   ♻️ [登录] 新凭证校验未通过（{session_reason}），清理缓存后重登一次")
+                        drop_cache_entry(cache, server_addr, ref)
+                        client = None
+                        time.sleep(1.5)
+                        continue
+                    result["error"] = f"登录后凭证校验失败（{session_reason}）"
+                    log(f"   ❌ [登录] 登录后凭证校验失败：{session_reason}")
                     return result
+                log("   ✅ [登录] 登录后校验通过（积分接口 + 任务列表接口）")
                 show_credit(result, credit)
 
             # ---------- ③ 签到 ----------
