@@ -1,6 +1,6 @@
 // name: 飞鹤星妈会
 // cron: 8 15,3 * * *
-// 环境变量：FHXMH_GAME=0 关闭闯关；FHXMH_GAME_WAIT=25 提交前等待秒；FHXMH_GAME_LEVEL 指定关卡；
+// 环境变量：FHXMH_GAME=0 关闭闯关；FHXMH_GAME_WAIT_MIN/MAX 随机等待秒（默认30~60）；FHXMH_GAME_LEVEL 指定关卡；
 // FHXMH_GAME_SCORE 固定分数（不设则随机）；FHXMH_GAME_SCORE_MIN/MAX 随机区间（默认300~800）；FHXMH_GAME_PLAYS 默认20；
 // FHXMH_GAME_ACTIVITY_GUID 活动 GUID（默认 jntkxkaa）；FHXMH_NOTIFY=0 关闭青龙/PushPlus 通知
 // 说明：闯关无法真实操作小游戏，脚本按目标分模拟对局并提交成绩（AES 加密与 H5 一致）；分数越高排名越靠前，但异常分值会被后台判定异常并封禁，建议小号先试
@@ -196,7 +196,8 @@ const RRX_ACT = process.env.FHXMH_GAME_ACTIVITY_GUID || "jntkxkaa";
 const RRX_CHANNEL = process.env.FHXMH_RRX_CHANNEL || "2";
 const RRX_PCS = process.env.FHXMH_RRX_PCS || "7c9a359609ec215d"; // H5 AES key/iv（window.RRX_WSITE_INFO.pcs）
 const GAME_LEVEL_WANT = Number(process.env.FHXMH_GAME_LEVEL || 0); // 0 = 自动取可玩关卡
-const GAME_WAIT = Math.max(0, Math.min(180, Number(process.env.FHXMH_GAME_WAIT || 15))); // 提交前等待秒数
+const GAME_WAIT_MIN = Math.max(5, Math.min(300, Number(process.env.FHXMH_GAME_WAIT_MIN || 30))); // 每局随机等待下限
+const GAME_WAIT_MAX = Math.max(GAME_WAIT_MIN, Math.min(300, Number(process.env.FHXMH_GAME_WAIT_MAX || 60))); // 上限
 const GAME_SCORE = Number(process.env.FHXMH_GAME_SCORE || 0); // 0 = targetScore×10（分数越高排名越靠前，可用 FHXMH_GAME_SCORE 直接指定）
 const GAME_DEBUG = String(process.env.FHXMH_DEBUG ?? "0") === "1";
 const GAME_SCORE_MIN = Math.max(0, Number(process.env.FHXMH_GAME_SCORE_MIN || 300)); // 随机下限，不低于 300
@@ -496,15 +497,14 @@ class FeiheMom {
         const target = GAME_SCORE > 0 ? Math.max(GAME_SCORE, floor) : floor + Math.floor(Math.random() * (ceil - floor + 1));
         const totalBefore = Number(sd.myRecord?.totalScore || 0);
         console.log(`   🎮 [游戏] 第 ${level} 关开局，目标 ${need} 分，本局提交 ${target}，累计 ${totalBefore}`);
-        if (GAME_WAIT > 0) {
-            console.log(`   ⏳ [游戏] 模拟对局中，等待 ${GAME_WAIT}s 后提交`);
-            await sleep(GAME_WAIT * 1000);
-        }
+        const waitSec = GAME_WAIT_MIN + Math.floor(Math.random() * (GAME_WAIT_MAX - GAME_WAIT_MIN + 1));
+        console.log(`   ⏳ [游戏] 模拟对局中，本局随机等待 ${waitSec}s 后提交`);
+        await sleep(waitSec * 1000);
         const now = Date.now();
         const isPass = target >= need ? 1 : 0;
         const plain = JSON.stringify({
             score: target,
-            currentTime: GAME_WAIT * 1000 + 1200,
+            currentTime: waitSec * 1000 + 1200,
             microTime: now,
             activityGuid: RRX_ACT,
             memberGuid: auth.guid,
@@ -518,7 +518,7 @@ class FeiheMom {
             activityGuid: RRX_ACT,
             fmid: "",
             currentScore: cipher,
-            currentTime: String(GAME_WAIT * 1000 + 1200),
+            currentTime: String(waitSec * 1000 + 1200),
             isHelpStyle: "0",
             gameLevel: String(level),
             isPass: String(isPass),
