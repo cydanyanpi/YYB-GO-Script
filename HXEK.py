@@ -7,10 +7,12 @@
 
 环境变量：
 - YYB_SERVER        必填；YYB Go 地址@微信账号标识，多账号每行一条，可带 #备注
-- HXEK_NOTIFY       默认 1；0=关闭青龙 notify.py 通知
+- HXEK_NOTIFY       默认 1；0=关闭通知（青龙 notify.py 与 PushPlus 一起关）
 - PLUSPLUS_TOKEN    可选；配置后额外走 PushPlus 推送
 
 缓存：脚本目录 token_caches/hxek_token_cache.json，按「地址|标识」隔离，不设固定过期
+校验：开跑前调用只读接口 sign/get-member-sign-info.json（连签/累计/今日是否已签）
+      与 get-member-asset.json（可用积分 D007），失效才重新登录，不拿签到接口兼职校验
 """
 
 import hashlib
@@ -29,8 +31,11 @@ APP_NAME = "鸿星尔克"
 APP_ID = "wxa1f1fa3785a47c7d"
 ENTERPRISE_ID = "ff8080817d9fbda8017dc20674f47fb6"
 SECRET = "damogic8888"
-LOGIN_URL = "https://hope.demogic.com/gic-wx-app/on_login.json"
-SIGN_URL = "https://hope.demogic.com/gic-wx-app/member_sign.json"
+BASE_URL = (os.environ.get("HXEK_BASE_URL") or "https://hope.demogic.com").rstrip("/")
+LOGIN_URL = f"{BASE_URL}/gic-wx-app/on_login.json"
+SIGN_URL = f"{BASE_URL}/gic-wx-app/member_sign.json"
+SIGN_INFO_URL = f"{BASE_URL}/gic-wx-app/sign/get-member-sign-info.json"
+ASSET_URL = f"{BASE_URL}/gic-wx-app/get-member-asset.json"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_CACHE_FILE = os.path.join(BASE_DIR, "token_caches", "hxek_token_cache.json")
@@ -133,6 +138,27 @@ def to_number(value):
 
 def fmt_points(value):
     return str(value) if value is not None and value != "?" else "未知"
+
+
+def deep_find(obj, keys, depth=0):
+    """在接口返回里任意层级找指定字段（连续天数/积分等），找不到返回 None"""
+    if depth > 6 or obj is None:
+        return None
+    if isinstance(obj, dict):
+        for k in keys:
+            v = obj.get(k)
+            if v not in (None, "", "?", -1, "-1"):
+                return v
+        for v in obj.values():
+            found = deep_find(v, keys, depth + 1)
+            if found not in (None, "", "?", -1, "-1"):
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = deep_find(v, keys, depth + 1)
+            if found not in (None, "", "?", -1, "-1"):
+                return found
+    return None
 
 
 def brief(value, limit=120):
@@ -253,6 +279,102 @@ def get_wx_code(server_entry: str):
         return None
 
 
+# ====================== 只读查询接口 ======================
+def _member_api(url, member_id, extra=None):
+    """GET 只读接口：参数与签名规则同签到接口"""
+    ts = china_ts()
+    rand = random.randint(1000000, 9999999)
+    trans_id = f"{APP_ID}{ts}"
+    params = {
+        "memberId": member_id, "cliqueId": "-1", "cliqueMemberId": "-1", "useClique": "0",
+        "enterpriseId": ENTERPRISE_ID, "sign": make_sign(ts, rand, member_id),
+        "random": str(rand), "appid": APP_ID, "transId": trans_id, "timestamp": ts,
+        "gicWxaVersion": "3.9.95",
+        "launchOptions": json.dumps({"path": "pages/authorize/authorize", "query": {}, "scene": 1027},
+                                    ensure_ascii=False, separators=(",", ":")),
+    }
+    if extra:
+        params.update(extra)
+    headers = {
+        "User-Agent": UA, "sign": ENTERPRISE_ID,
+        "Content-Type": "application/json;charset=UTF-8", "Accept": "*/*",
+        "Referer": f"https://servicewechat.com/{APP_ID}/89/page-frame.html",
+    }
+    try:
+        res = requests.get(url, params=params, headers=headers,
+                           timeout=20, proxies={"http": None, "https": None})
+        return res.json()
+    except Exception as e:
+        log(f"   ⚠️ [接口] 只读请求异常：{e}")
+        return None
+
+
+def query_asset(member_id):
+    """会员资产：D007 可用积分 / D010 冻结积分 / D021 今日是否已签 / D022 连签天数"""
+    data = _member_api(ASSET_URL, member_id, {"dataIconKeyList": "D007,D010,D021,D022"})
+    if not isinstance(data, dict) or str(data.get("code")) != "0":
+        return None
+    r = data.get("result") or {}
+    return {"points": r.get("D007"), "frozen": r.get("D010"),
+            "signed": r.get("D021"), "continuous": r.get("D022")}
+
+
+def query_sign_info(member_id):
+    """签到日历：continuousSign 连签天数 / cumulativeSign 累计 / 今日 signFlag"""
+    data = _member_api(SIGN_INFO_URL, member_id)
+    if not isinstance(data, dict):
+        return None
+    if str(data.get("code")) != "0":
+        msg = str(data.get("message") or data.get("msg") or "")
+        return {"ok": False, "msg": msg or "签到日历接口返回异常",
+                "auth": bool(AUTH_PATTERN.search(msg))}
+    r = data.get("result") or {}
+    today = {}
+    for d in (r.get("memberSignCalendar") or []):
+        if d.get("currentDayFlag") == 1:
+            today = d
+            break
+    return {"ok": True, "continuous": r.get("continuousSign"),
+            "cumulative": r.get("cumulativeSign"),
+            "signedToday": today.get("signFlag")}
+
+
+def probe_member(member_id):
+    """开跑前只读校验：不调用签到接口，判断登录态是否还有效并取回积分/连签"""
+    asset = query_asset(member_id)
+    info = query_sign_info(member_id)
+    if asset is None and info is None:
+        return {"ok": False, "auth": False, "msg": "只读接口无响应（网络异常，未动缓存）"}
+    info = info or {}
+    valid = bool(info.get("ok")) or asset is not None
+    continuous = info.get("continuous")
+    if continuous in (None, "", "?", -1, "-1"):
+        continuous = (asset or {}).get("continuous")
+    signed_today = info.get("signedToday")
+    if signed_today is None and asset is not None:
+        signed_today = (asset or {}).get("signed")
+    return {
+        "ok": valid,
+        "auth": bool(info.get("auth")),
+        "msg": info.get("msg") or "",
+        "points": (asset or {}).get("points"),
+        "continuous": continuous,
+        "cumulative": info.get("cumulative"),
+        "signedToday": signed_today,
+    }
+
+
+def apply_member_info(result, info):
+    if info.get("points") is not None:
+        result["points"] = fmt_points(info["points"])
+    if info.get("continuous") not in (None, "", "?", -1, "-1"):
+        result["continuous"] = f"{info['continuous']} 天"
+    if info.get("cumulative") not in (None, "", "?", -1, "-1"):
+        result["cumulative"] = f"{info['cumulative']} 天"
+    if info.get("signedToday") in (0, 1):
+        result["signedToday"] = int(info["signedToday"])
+
+
 # ====================== 业务接口 ======================
 def make_sign(ts: str, rand: int, member_id: str = "-1") -> str:
     raw = f"timestamp={ts}transId={APP_ID}{ts}secret={SECRET}random={rand}memberId={member_id}"
@@ -346,19 +468,29 @@ def sign_once(member_id: str) -> dict:
             return {"ok": False, "msg": f"HTTP {res.status_code}", "auth": res.status_code in (401, 403)}
         data = res.json()
         errcode = to_number(data.get("errcode"))
+        body = data.get("response") or {}
+        ms = body.get("memberSign") or {}
+        points = body.get("points", "?")
+        if points in ("?", None, "", -1, "-1"):
+            points = deep_find(data, ("points", "totalPoints", "integralTotal", "score")) or "?"
+        continuous = ms.get("continuousCount", "?")
+        if continuous in ("?", None, "", "-1", -1):
+            continuous = deep_find(data, ("continuousCount", "continuousDays",
+                                          "continuousSignCount", "continuousSignDays"))
+        if continuous in (None, "", "-1", -1):
+            continuous = "?"
         if errcode == 0:
-            result = data.get("response") or {}
-            ms = result.get("memberSign") or {}
             integral = ms.get("integralCount", "?")
-            continuous = ms.get("continuousCount", "?")
-            points = result.get("points", "?")
-            return {"ok": True, "msg": f"签到成功 +{integral}积分，连续{continuous}天",
-                    "points": points, "auth": False}
-        errmsg = str(data.get("errmsg") or (data.get("response") or {}).get("errmsg") or "")
-        if "已签" in errmsg or "重复" in errmsg:
-            text = "今日已签到" if ("今日已签" in errmsg or "今天已签" in errmsg) else f"今日已签到（{errmsg}）"
-            return {"ok": True, "msg": text, "points": "?", "auth": False}
-        return {"ok": False, "msg": f"签到失败：{errmsg or brief(data)}", "auth": bool(AUTH_PATTERN.search(errmsg))}
+            return {"ok": True, "msg": f"签到成功 +{integral}积分",
+                    "points": points, "continuous": continuous, "auth": False}
+        errmsg = str(data.get("errmsg") or body.get("errmsg") or "")
+        already = any(k in errmsg for k in ("已签", "已经签", "签过", "重复", "已领取", "一签"))
+        if already:
+            text = f"今日已签到（{errmsg}）" if errmsg and "已经签到" not in errmsg else "今日已签到"
+            return {"ok": True, "msg": text, "points": points,
+                    "continuous": continuous, "auth": False}
+        return {"ok": False, "msg": f"签到失败：{errmsg or brief(data)}",
+                "continuous": continuous, "auth": bool(AUTH_PATTERN.search(errmsg))}
     except Exception as e:
         return {"ok": False, "msg": f"请求异常：{e}", "auth": False}
 
@@ -378,6 +510,9 @@ def run_account(idx: int, total: int, server_entry: str) -> dict:
         "member": "-",
         "signMsg": "-",
         "points": "未知",
+        "continuous": "-",
+        "cumulative": "-",
+        "signedToday": None,
         "error": "",
     }
 
@@ -399,7 +534,25 @@ def run_account(idx: int, total: int, server_entry: str) -> dict:
                 result["loginSource"] = "缓存"
                 result["member"] = mask_id(member_id)
 
-        # ---------- ② 没有缓存 → 取码登录 ----------
+        # ---------- ② 开跑前只读校验（会员资产 + 签到日历，不触发签到） ----------
+        if member_id:
+            info = probe_member(member_id)
+            if info.get("ok"):
+                apply_member_info(result, info)
+                extra = ""
+                if result["cumulative"] != "-":
+                    extra += f" ｜ 累计 {result['cumulative']}"
+                log(f"   ✅ [校验] 登录态有效 ｜ 连签 {result['continuous']}{extra}"
+                    f" ｜ 积分 {result['points']}")
+            else:
+                log(f"   ⚠️ [校验] 只读接口未通过：{info.get('msg') or '未知'}")
+                if info.get("auth") and attempt == 0:
+                    log("   🔄 [重试] 会员凭证失效，清理缓存后重新登录")
+                    drop_cache_entry(ck)
+                    member_id = ""
+                    continue
+
+        # ---------- ③ 没有缓存/失效 → 取码登录 ----------
         if not member_id:
             code = get_wx_code(server_entry)
             if not code:
@@ -412,20 +565,49 @@ def run_account(idx: int, total: int, server_entry: str) -> dict:
                 log("   ❌ [登录] 登录失败，跳过该账号")
                 return result
             save_cache_entry(ck, member_id)
-            result["loginSource"] = "新登录"
+            result["loginSource"] = "重新登录" if attempt == 1 else "新登录"
             result["member"] = mask_id(member_id)
+            info = probe_member(member_id)
+            if info.get("ok"):
+                apply_member_info(result, info)
+                extra = ""
+                if result["cumulative"] != "-":
+                    extra += f" ｜ 累计 {result['cumulative']}"
+                log(f"   ✅ [校验] 登录态有效 ｜ 连签 {result['continuous']}{extra}"
+                    f" ｜ 积分 {result['points']}")
 
-        # ---------- ③ 签到 ----------
+        # ---------- ④ 今日已签到则不再发签到请求 ----------
+        if result["signedToday"] == 1:
+            result["signMsg"] = "今日已签到"
+            result["success"] = True
+            log(f"   ✅ [签到] 今日已签到（签到日历已确认），跳过签到请求")
+            if result["continuous"] != "-":
+                log(f"   📆 [连续] 已连续签到 {result['continuous']}")
+            log(f"   💰 [积分] 当前 {result['points']} 分")
+            log("   ✅ [完成] 该账号任务执行完成")
+            return result
+
+        # ---------- ⑤ 签到 ----------
         time.sleep(random.uniform(1, 2))
         sign = sign_once(member_id)
         result["signMsg"] = sign["msg"]
+        if sign.get("continuous") not in (None, "", "?", "-1"):
+            result["continuous"] = f"{sign['continuous']} 天"
+            log(f"   📆 [连续] 已连续签到 {result['continuous']}")
         if sign.get("points", "?") != "?":
             result["points"] = fmt_points(sign.get("points"))
-            log(f"   💰 [积分] 当前 {result['points']} 分")
 
         if sign["ok"]:
             log(f"   ✅ [签到] {sign['msg']}")
             result["success"] = True
+            # 签到后复查资产，取真实积分与连签天数
+            asset = query_asset(member_id)
+            if asset and asset.get("points") is not None:
+                result["points"] = fmt_points(asset["points"])
+            if asset and str(asset.get("continuous")) not in ("None", "", "-1"):
+                result["continuous"] = f"{asset['continuous']} 天"
+            log(f"   💰 [积分] 当前 {result['points']} 分" + (
+                f" ｜ 连签 {result['continuous']}" if result["continuous"] != "-" else ""))
             log("   ✅ [完成] 该账号任务执行完成")
             return result
 
@@ -456,6 +638,8 @@ def build_notify(results):
             lines.append(f"- 登录：{r['loginSource']}")
             lines.append(f"- 会员：{r['member']}")
             lines.append(f"- 签到：{r['signMsg'] or '无结果'}")
+            lines.append(f"- 连续：{r['continuous']}" + (
+                f"（累计 {r['cumulative']}）" if r["cumulative"] != "-" else ""))
             lines.append(f"- 积分：{r['points']}")
         if not r["success"]:
             lines.append(f"- 失败原因：{r['error'] or '未知'}")
@@ -489,6 +673,8 @@ def send_qinglong_notify(title, content):
 
 
 def send_pushplus(title, content):
+    if not NOTIFY_ENABLED:
+        return
     if not PLUSPLUS_TOKEN:
         log("   ℹ️ [推送] 未配置 PLUSPLUS_TOKEN，跳过 PushPlus")
         return
@@ -532,6 +718,9 @@ def main():
                 "member": "-",
                 "signMsg": "-",
                 "points": "未知",
+                "continuous": "-",
+                "cumulative": "-",
+                "signedToday": None,
                 "error": f"执行异常：{exc}",
             })
         hr()
@@ -550,6 +739,10 @@ def main():
             log(f"   🔐 [登录] {r['loginSource']}")
             log(f"   🆔 [会员] {r['member']}")
             log(f"   📅 [签到] {r['signMsg'] or '-'}")
+            cont = r["continuous"] if r["continuous"] != "-" else "未知"
+            if r["cumulative"] != "-":
+                cont = f"{cont}（累计 {r['cumulative']}）"
+            log(f"   📆 [连续] {cont}")
             log(f"   💰 [积分] {r['points']}")
         if not r["success"]:
             log(f"   ⚠️ [失败] {r['error'] or '未知原因'}")
