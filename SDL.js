@@ -6,7 +6,7 @@
  *
  * 环境变量：
  * - YYB_SERVER     必填；YYB Go 地址@微信账号标识，多账号每行一条，可带 #备注
- * - SDL_NOTIFY     默认 1；0=关闭青龙 notify.py 通知
+ * - SDL_NOTIFY     默认 1；0=关闭通知（青龙 notify.py 与 PushPlus 一起关）
  * - PLUSPLUS_TOKEN 可选；配置后额外走 PushPlus 推送
  *
 
@@ -519,6 +519,7 @@ sys.exit(2)
 }
 
 async function sendPushPlus(title, content) {
+  if (!NOTIFY_ENABLED) return;
   if (!PLUSPLUS_TOKEN) {
     console.log('   ℹ️ [推送] 未配置 PLUSPLUS_TOKEN，跳过 PushPlus');
     return;
