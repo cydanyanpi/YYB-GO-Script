@@ -1,8 +1,13 @@
 // name: 飞鹤星妈会
 // cron: 8 15,3 * * *
+// 环境变量：FHXMH_GAME=0 关闭闯关；FHXMH_GAME_WAIT=25 提交前等待秒；FHXMH_GAME_LEVEL 指定关卡；
+// FHXMH_GAME_SCORE 固定分数（不设则随机）；FHXMH_GAME_SCORE_MIN/MAX 随机区间（默认300~800）；FHXMH_GAME_PLAYS 默认20；
+// FHXMH_GAME_ACTIVITY_GUID 活动 GUID（默认 jntkxkaa）；FHXMH_NOTIFY=0 关闭青龙/PushPlus 通知
+// 说明：闯关无法真实操作小游戏，脚本按目标分模拟对局并提交成绩（AES 加密与 H5 一致）；分数越高排名越靠前，但异常分值会被后台判定异常并封禁，建议小号先试
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 // Token 缓存
 const TOKEN_CACHE_DIR = path.join(__dirname, "token_caches");
@@ -19,33 +24,96 @@ function writeTokenCache(cache) {
     try {
         fs.mkdirSync(TOKEN_CACHE_DIR, { recursive: true });
         fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
-    } catch (e) { console.log(`⚠️ [缓存] 写入失败: ${e.message}`); }
+    } catch (e) { console.log("⚠️ 缓存写入失败:", e.message); }
 }
+function cacheKey(server, ref) { return `${server}|${ref}`; }
+
+// 静默解析缓存键里的标识：兼容老版本「纯标识」与「地址@标识[#备注]」两种键
+function legacyRefOf(key) {
+    const value = String(key || "").trim();
+    if (!value) return "";
+    if (!value.includes("@")) return value;
+    let body = value;
+    const hashIndex = body.lastIndexOf("#");
+    const atIndexAll = body.lastIndexOf("@");
+    if (hashIndex !== -1 && hashIndex > atIndexAll) body = body.slice(0, hashIndex);
+    const atIndex = body.lastIndexOf("@");
+    return atIndex === -1 ? body.trim() : body.slice(atIndex + 1).trim();
+}
+
+function removeCacheKey(key, ref) {
+    const cache = readTokenCache();
+    delete cache[key];
+    for (const k of Object.keys(cache)) {
+        if (k !== key && legacyRefOf(k) === ref) delete cache[k];
+    }
+    writeTokenCache(cache);
+}
+
 // ====================== YYB Go 账号（环境变量 YYB_SERVER = 地址@微信账号标识，多行） ======================
 const SERVERS = (process.env.YYB_SERVER || "")
     .split(/\r?\n/)
     .map(s => s.trim())
     .filter(Boolean);
-if (!SERVERS.length) {
-    console.error("❌ 未配置环境变量 YYB_SERVER，请设置后重试（格式：地址@微信账号标识，多行换行）");
-    process.exit(1);
-}
+const NOTIFY_ON = String(process.env.FHXMH_NOTIFY ?? "1") !== "0";
 function parseYybGoEntry(rawValue) {
-    const value = String(rawValue || "").trim();
-    if (!value) return { server: "", ref: "" };
-    const atIndex = value.indexOf("@");
-    if (atIndex === -1) {
-        console.log("⚠️ YYB_SERVER 格式应为 地址@微信账号标识，当前值: " + value);
-        return { server: "", ref: "" };
+    let value = String(rawValue || "").trim();
+    if (!value) return { server: "", ref: "", note: "" };
+    let note = "";
+    const hashIndex = value.lastIndexOf("#");
+    if (hashIndex > value.lastIndexOf("@") && hashIndex !== -1) {
+        note = value.slice(hashIndex + 1).trim();
+        value = value.slice(0, hashIndex).trim();
     }
-    let server = value.slice(0, atIndex).trim();
+    const atIndex = value.lastIndexOf("@");
+    if (atIndex === -1) {
+        console.log("   ❌ [账号] 格式应为 地址@标识[#备注]，当前值: " + value);
+        return { server: "", ref: "", note: "" };
+    }
+    let server = value.slice(0, atIndex).trim().replace(/^https?:\/\//, "").replace(/\/+$/, "");
     const ref = value.slice(atIndex + 1).trim();
-    if (server.startsWith("http://")) server = server.slice(7);
-    else if (server.startsWith("https://")) server = server.slice(8);
-    server = server.replace(/\/+$/, "");
-    if (!server || !ref) return { server: "", ref: "" };
-    return { server, ref };
+    if (!server || !ref) return { server: "", ref: "", note: "" };
+    return { server, ref, note };
 }
+
+const BOX_WIDTH = 48;
+const BOX_INNER = 46;
+const _VARIATION = /[\uFE0F\uFE0E\u200D]/g;
+
+function displayWidth(text) {
+    return String(text).replace(_VARIATION, "").split("").reduce((n, ch) => n + (ch.codePointAt(0) > 0xFF ? 2 : 1), 0);
+}
+
+function padWidth(text, width) {
+    let value = String(text);
+    while (displayWidth(value) > width) value = value.slice(0, -1);
+    return value + " ".repeat(Math.max(0, width - displayWidth(value)));
+}
+
+function boxTop(title) { console.log("\n╔" + "═".repeat(BOX_WIDTH) + "╗"); console.log("║  " + padWidth(title, BOX_INNER) + "║"); }
+function boxLine(label, value) { console.log("║  " + padWidth(label + ": " + value, BOX_INNER) + "║"); }
+function boxBottom() { console.log("╚" + "═".repeat(BOX_WIDTH) + "╝"); }
+function accountFrame(index, total, title, source) {
+    console.log("\n┌" + "─".repeat(BOX_WIDTH) + "┐");
+    console.log("│  " + padWidth("🧩 账号 " + index + " / " + total + "　" + title, BOX_INNER) + "│");
+    console.log("│  " + padWidth("🔗 来源: " + source, BOX_INNER) + "│");
+    console.log("└" + "─".repeat(BOX_WIDTH) + "┘");
+}
+function hr() { console.log("\n" + "-".repeat(BOX_WIDTH)); }
+function toInt(value, fallback = 0) { const n = Number(value); return Number.isFinite(n) ? Math.trunc(n) : fallback; }
+function brief(value, limit = 90) { const text = String(value ?? "").replace(/\n/g, " "); return text.length <= limit ? text : text.slice(0, limit - 1) + "…"; }
+async function captureLogs(fn) {
+    const lines = [];
+    const original = console.log;
+    console.log = (...args) => {
+        const line = args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg))).join(" ");
+        original("   " + line);
+        lines.push(line);
+    };
+    try { await fn(); } finally { console.log = original; }
+    return lines;
+}
+
 async function getCode(server) {
     const { server: parsedServer, ref } = parseYybGoEntry(server);
     if (!parsedServer || !ref) return null;
@@ -54,13 +122,13 @@ async function getCode(server) {
         const { data } = await axios.post(url, { ref, app_id: 'wxc83b55d61c7fc51d' }, { timeout: 20000, proxy: false });
         const code = data && data.data && data.data.result && data.data.result.code;
         if (!data || data.code !== 0 || !code) {
-            console.log(`❌ [取码] ${parsedServer} 获取code失败: ${JSON.stringify(data)}`);
+            console.log(parsedServer + " 获取code失败: " + JSON.stringify(data));
             return null;
         }
-        console.log(`✅ [取码] ${parsedServer} 获取code成功`);
+        console.log(parsedServer + " 获取code成功");
         return code;
     } catch (e) {
-        console.log(`❌ [取码] ${parsedServer} 获取code异常: ${e.message}`);
+        console.log(parsedServer + " 获取code异常: " + e.message);
         return null;
     }
 }
@@ -117,39 +185,79 @@ async function request(options) {
     return { status: res.status, headers: res.headers || {}, data: res.data };
 }
 
-async function getWxCode(server) {
-        return await getCode(server);
-    }
+// ====================== 业务逻辑 ======================
+const API_BASE = (process.env.FHXMH_API_BASE || "https://momclub.feihe.com/capis").replace(/\/+$/, "");
+const GAME_ON = String(process.env.FHXMH_GAME ?? "1") !== "0";
+// 鹤小飞超级大闯关真实链路：momclub token -> ca.rrx.cn 换取 rrx JWT -> resactiviy 闯关接口
+const RRX_CA = (process.env.FHXMH_RRX_CA || "https://ca.rrx.cn").replace(/\/+$/, "");
+const RRX_SITE = process.env.FHXMH_RRX_SITE || "tv23ty";
+const RRX_MALL = process.env.FHXMH_RRX_MALL || "xdag4i";
+const RRX_ACT = process.env.FHXMH_GAME_ACTIVITY_GUID || "jntkxkaa";
+const RRX_CHANNEL = process.env.FHXMH_RRX_CHANNEL || "2";
+const RRX_PCS = process.env.FHXMH_RRX_PCS || "7c9a359609ec215d"; // H5 AES key/iv（window.RRX_WSITE_INFO.pcs）
+const GAME_LEVEL_WANT = Number(process.env.FHXMH_GAME_LEVEL || 0); // 0 = 自动取可玩关卡
+const GAME_WAIT = Math.max(0, Math.min(180, Number(process.env.FHXMH_GAME_WAIT || 15))); // 提交前等待秒数
+const GAME_SCORE = Number(process.env.FHXMH_GAME_SCORE || 0); // 0 = targetScore×10（分数越高排名越靠前，可用 FHXMH_GAME_SCORE 直接指定）
+const GAME_DEBUG = String(process.env.FHXMH_DEBUG ?? "0") === "1";
+const GAME_SCORE_MIN = Math.max(0, Number(process.env.FHXMH_GAME_SCORE_MIN || 300)); // 随机下限，不低于 300
+const GAME_SCORE_MAX = Math.max(GAME_SCORE_MIN, Number(process.env.FHXMH_GAME_SCORE_MAX || 800)); // 随机上限
+const GAME_PLAYS = Math.max(1, Math.min(20, Number(process.env.FHXMH_GAME_PLAYS || 20))); // 默认一次跑满 20 局
 
-// ==================== 输出美化 ====================
-function logTitle() {
-    console.log();
-    console.log("╔" + "═".repeat(48) + "╗");
-    console.log("║  🍼 飞鹤星妈会 自动签到                      ║");
-    console.log(`║  🕒 启动时间: ${new Date().toLocaleString("zh-CN", { hour12: false }).padEnd(22)}║`);
-    console.log(`║  🔢 账号数量: ${String(SERVERS.length).padEnd(22)}║`);
-    console.log("╚" + "═".repeat(48) + "╝");
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781 MiniProgramEnv/Windows WindowsWechat/WMPF";
+const RRX_INFO = (process.env.FHXMH_RRX_INFO || "https://resinfo.rrx.cn").replace(/\/+$/, "");
+const RRX_ACT_BASE = (process.env.FHXMH_RRX_ACT_BASE || "https://resactiviy.rrx.cn").replace(/\/+$/, "");
+const RRX_GAME_BASE = `${RRX_ACT_BASE}/game/gameLevelView`;
+
+function aesZeroPad(text, keyText) {
+    const key = Buffer.from(String(keyText), "utf8");
+    const data = Buffer.from(text, "utf8");
+    const block = 16;
+    const pad = data.length % block === 0 ? 0 : block - (data.length % block);
+    const buf = Buffer.concat([data, Buffer.alloc(pad)]);
+    const c = crypto.createCipheriv("aes-128-cbc", key, key);
+    c.setAutoPadding(false);
+    return Buffer.concat([c.update(buf), c.final()]).toString("base64");
 }
 
-function logAccountHeader(index, total, server) {
-    const { ref } = parseYybGoEntry(server);
-    console.log();
-    console.log("┌" + "─".repeat(48) + "┐");
-    console.log(`│  🧩 账号 ${index} / ${total}${" ".repeat(26)}│`);
-    console.log(`│  🔑 标识: ${String(ref || "-").padEnd(41)}│`);
-    console.log("└" + "─".repeat(48) + "┘");
+function randomGuid(len) {
+    const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+    let out = "";
+    for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
+    return out;
 }
+
+function maskToken(token) {
+    const text = String(token || "");
+    if (text.length <= 8) return "***";
+    return text.slice(0, 6) + "***" + text.slice(-4);
+}
+
+async function request(options) {
+    const res = await axios.request({
+        timeout: 20000,
+        proxy: false,
+        validateStatus: () => true,
+        ...options,
+        headers: {
+            "User-Agent": USER_AGENT,
+            Accept: "application/json, text/plain, */*",
+            ...(options.headers || {}),
+        },
+    });
+    return { status: res.status, headers: res.headers || {}, data: res.data };
+}
+
+const OK_CODES = ["00000", "000000"];
 
 class FeiheMom {
-    constructor(openid) {
-        this.server = openid;
-        const _yyb = parseYybGoEntry(this.server);
-        this.ref = _yyb.ref;
-        this.openid = _yyb.ref;
-        this.openid = openid;
-        this.base = "https://momclub.feihe.com/capis";
+    constructor(entry) {
+        const parsed = parseYybGoEntry(entry);
+        this.server = parsed.server;
+        this.ref = parsed.ref;
+        this.note = parsed.note;
+        this.key = cacheKey(parsed.server, parsed.ref);
+        this.base = API_BASE;
         this.token = "";
-        this.index = userIdx++;
     }
 
     async api({ method = "GET", path, data, allowFail = false }) {
@@ -165,34 +273,39 @@ class FeiheMom {
         if (method === "GET") opts.params = data || {};
         else opts.data = data === undefined ? {} : data;
         const res = await request(opts);
-        const body = res.data || {};
-        const code = String(body.code || "");
-        const msg = String(body.msg || body.message || "");
-
-        // 检测token失效
-        if (code === "A00004" || /unauthorized|未登录|登录已过期|token/i.test(msg)) {
-            const err = new Error(`token失效: ${msg || code}`);
-            err.tokenInvalid = true;
-            throw err;
-        }
-
-        const ok = res.status === 200 && ["00000", "000000", "A00002"].includes(code);
-        if (!ok && !allowFail) throw new Error(`HTTP ${res.status}: ${short(body)}`);
-        return body;
+        const ok = res.status === 200 && OK_CODES.includes(String(res.data?.code));
+        if (!ok && !allowFail) throw new Error(`HTTP ${res.status}: ${short(res.data)}`);
+        return { ok, data: res.data, status: res.status };
     }
 
     async login() {
-        // 尝试缓存（不过期）
+        // 1) 优先复用缓存 token（开跑前会再做只读校验）
         const cache = readTokenCache();
-        const cached = cache[this.server] || {};
-        if (cached.accessToken) {
+        let cached = cache[this.key];
+        if (!cached) {
+            for (const k of Object.keys(cache)) {
+                const value = cache[k];
+                if (value && value.accessToken && k !== this.key && legacyRefOf(k) === this.ref) {
+                    cached = { ...value, updatedAt: nowText() };
+                    cache[this.key] = cached;
+                    delete cache[k];
+                    writeTokenCache(cache);
+                    console.log("   🗂️ [缓存] 旧缓存键已迁移为「地址|标识」");
+                    break;
+                }
+            }
+        }
+        if (cached && cached.accessToken) {
             this.token = cached.accessToken;
-            console.log(`💾 [缓存] 账号[${this.index}] 使用缓存token: ${this.token.slice(0, 8)}***`);
-            return true;
+            console.log(`   💾 [缓存] 复用已保存 token：${maskToken(this.token)}`);
+            return { line: `缓存 token ${maskToken(this.token)}`, fromCache: true };
         }
 
-        console.log(`🔐 [登录] 账号[${this.index}] 使用 code 换取 token...`);
-        const code = await getWxCode(this.server);
+        // 2) 取码登录
+        console.log("   🔐 [取码] 请求 YYB Go 获取 code");
+        const code = await getCode(this.server, this.ref);
+        if (!code) throw new Error("获取 code 失败");
+        console.log("   ✅ [取码] code 获取成功");
         const res = await request({
             method: "POST",
             url: `${this.base}/social/ma`,
@@ -203,244 +316,439 @@ class FeiheMom {
         const token = res.data?.data?.tokenInfo?.accessToken || res.data?.data?.accessToken || "";
         if (res.status !== 200 || !token) throw new Error(`登录失败 HTTP ${res.status}: ${short(res.data)}`);
         this.token = token;
-
         const c = readTokenCache();
-        c[this.server] = { accessToken: token };
+        for (const k of Object.keys(c)) {
+            if (k !== this.key && legacyRefOf(k) === this.ref) delete c[k];
+        }
+        c[this.key] = { accessToken: token, updatedAt: nowText() };
         writeTokenCache(c);
-
-        console.log(`✅ [登录] 账号[${this.index}] 登录成功: ${token.slice(0, 8)}***`);
-        return true;
+        console.log("   ✅ [登录] 新 token 获取成功");
+        return { line: `新登录 ${maskToken(token)}`, fromCache: false };
     }
 
-    async query() {
+    /** 只读校验：memberInfo 能正常返回即视为登录态有效 */
+    async verifyToken() {
+        const res = await this.api({ path: "/c/user/memberInfo", allowFail: true });
+        const msg = res.data?.message || res.data?.msg || res.data?.code || "未知";
+        return { ok: res.ok, msg: String(msg) };
+    }
+
+    /** 会员信息 + 积分（结构化） */
+    async profile() {
         const member = await this.api({ path: "/c/user/memberInfo", allowFail: true });
         const user = await this.api({ path: "/p/user/userInfo", allowFail: true });
-        const data = member?.data || user?.data || {};
-        this.memberId = data.memberId || data.member_id || data.crmId || data.id || "";
-        this.gameOpenId = this.memberId;
-        this.nickname = data.nickname || data.nickName || data.mobile || "";
-        const score = data.score || data.points || data.integral || data.availableScore || data.totalScore;
-        console.log(`👤 [用户] 账号[${this.index}] 用户: ${this.nickname || "未知"}，积分: ${score ?? "未知"}，memberId: ${this.memberId || "无"}`);
+        const memberData = member?.data?.data || member?.data || {};
+        const userData = user?.data?.data || user?.data || {};
+        const data = { ...memberData, ...userData };
+        const name = userData.nickName || userData.nickname || memberData.nickName || memberData.memberName || memberData.mobile || "未知";
+        return {
+            name: String(name),
+            memberId: String(memberData.memberId || data.memberId || data.crmId || ""),
+            openId: String(memberData.openId || data.openId || ""),
+            score: pickScore(data),
+        };
     }
 
-    async receiveTask(activityId) {
-        try {
-            await this.api({
-                method: "POST",
-                path: "/c/activity/todo/receive",
-                data: { activityId, mockTime: Date.now() },
-                allowFail: true,
-            });
-        } catch {}
-    }
-
-    async completeTask(task) {
-        const activityId = task.id;
-        const taskName = task.name || "未知任务";
-        await this.receiveTask(activityId);
-        await sleep(1500);
-        const result = await this.api({
-            method: "POST",
-            path: "/c/activity/todo/complete",
-            data: { activityId, mockTime: Date.now() },
-            allowFail: true,
-        });
-        const code = String(result?.code || "");
-        if (["00000", "000000", "A00002"].includes(code)) {
-            const credits = result?.data?.credits || "";
-            console.log(`  ✅ [任务] ${taskName}: 完成${credits ? ` (+${credits}积分)` : ""}`);
-            return true;
-        }
-        console.log(`  ℹ️ [任务] ${taskName}: ${result?.msg || result?.message || "未完成"}`);
-        return false;
-    }
-
-    async completeGameTask(task) {
-        const taskName = task.name || "连连看";
-        const activityId = task.id;
-        if (!this.gameOpenId) {
-            console.log(`  ⏭️ [任务] ${taskName}: 无openid，跳过游戏`);
-            return false;
-        }
-        try {
-            // 游戏登录
-            const gameNickname = encodeURIComponent(this.nickname || "");
-            const loginRes = await axios.post(
-                `https://momclub.feihe.com/pmall/v1/api/auth/login?openid=${this.gameOpenId}&nickname=${gameNickname}`,
-                null,
-                {
-                    headers: {
-                        "User-Agent": USER_AGENT,
-                        authorization: "",
-                        "content-length": "0",
-                        origin: "https://momclub.feihe.com",
-                        referer: `https://momclub.feihe.com/h5/game/?wxNickName=${gameNickname}&crmId=${this.memberId}&memberid=${this.gameOpenId}&programLogin=1`,
-                    },
-                    timeout: 15000,
-                    validateStatus: () => true,
-                    transformRequest: () => "",
-                }
-            );
-            const loginData = loginRes.data;
-            if (String(loginData?.code) !== "10000") {
-                console.log(`  ⚠️ [任务] ${taskName}: 游戏登录失败 ${JSON.stringify(loginData).slice(0, 150)}`);
-                return false;
-            }
-            const gameToken = loginData.data.accessToken;
-            const gameHeaders = {
-                "User-Agent": USER_AGENT,
-                authorization: gameToken,
-                "content-type": "application/json",
-                referer: `https://momclub.feihe.com/h5/game/?wxNickName=${gameNickname}&crmId=${this.memberId}&memberid=${this.gameOpenId}&programLogin=1`,
-            };
-
-            await this.receiveTask(activityId);
-            await sleep(1000);
-
-            // 玩3关
-            for (let level = 1; level <= 3; level++) {
-                await axios.post(`https://momclub.feihe.com/pmall/v1/api/game/level/startLevel?level=${level}`, null, {
-                    headers: gameHeaders, timeout: 15000, validateStatus: () => true, transformRequest: () => "",
-                });
-                await sleep(4000);
-                await axios.post(`https://momclub.feihe.com/pmall/v1/api/game/level/complete?levelId=${level}`, null, {
-                    headers: gameHeaders, timeout: 15000, validateStatus: () => true, transformRequest: () => "",
-                });
-                console.log(`  🎮 [任务] ${taskName}: 第${level}关完成`);
-                await sleep(2000);
-            }
-
-            // 完成任务
-            const result = await this.api({
-                method: "POST",
-                path: "/c/activity/todo/complete",
-                data: { activityId, mockTime: Date.now() },
-                allowFail: true,
-            });
-            const code = String(result?.code || "");
-            if (["00000", "000000", "A00002"].includes(code)) {
-                const credits = result?.data?.credits || "";
-                console.log(`  ✅ [任务] ${taskName}: 游戏完成${credits ? ` (+${credits}积分)` : ""}`);
-                return true;
-            }
-            return false;
-        } catch (e) {
-            console.log(`  ❌ [任务] ${taskName}: 游戏异常 ${e.message}`);
-            return false;
-        }
-    }
-
-    async sign() {
+    async sign(scoreBefore) {
         const todo = await this.api({
             path: "/c/activity/todo/list",
             data: { mockTime: Date.now() },
             allowFail: true,
         });
-        const todoData = todo?.data || {};
-
-        // ===== 签到 =====
-        const checkTodo = todoData.checkInTodo;
-        if (checkTodo?.id) {
-            const joinRecord = checkTodo.checkInExtra?.joinRecord || [];
-            const todayRecord = joinRecord.find((r) => r.today);
-            if (todayRecord?.joined) {
-                console.log(`✅ [签到] 账号[${this.index}] 今日已签到 (+${todayRecord.credits || 0}积分)`);
-            } else {
-                const sign = await this.api({
-                    method: "POST",
-                    path: "/c/activity/todo/checkIn",
-                    data: { activityId: checkTodo.id, mockTime: Date.now() },
-                    allowFail: true,
-                });
-                const code = String(sign?.code || "");
-                if (["00000", "000000", "A00002"].includes(code)) {
-                    const credits = sign?.data?.credits || "";
-                    console.log(`✅ [签到] 账号[${this.index}] 签到成功${credits ? ` (+${credits}积分)` : ""}`);
-                } else {
-                    console.log(`⚠️ [签到] 账号[${this.index}] ${sign?.msg || sign?.message || "已签到"}`);
-                }
-            }
-        } else {
-            console.log(`ℹ️ [签到] 账号[${this.index}] 无签到活动`);
+        const body = todo?.data?.data ?? todo?.data ?? {};
+        const checkTodo =
+            body.checkInTodo ||
+            findFirst(body, (item) => item && typeof item === "object" && (item.checkInExtra || /签到|打卡|check/i.test(`${item.taskName || item.name || item.title || ""}`)));
+        const activityId = checkTodo?.id || checkTodo?.activityId || checkTodo?.taskId;
+        if (!activityId) {
+            return { ok: false, text: `未找到签到任务（${short(todo?.data, 120)}）`, scoreAfter: null };
         }
-
-        // ===== 其他任务 =====
-        const taskList = todoData.taskTodo || [];
-        if (taskList.length) {
-            const skipTypes = new Set(["Perfect", "AddQw", "FirstOrder"]);
-            const gameKeywords = ["游戏", "连连看", "玩一"];
-            console.log(`📋 [任务] 账号[${this.index}] 共 ${taskList.length} 个任务`);
-
-            for (const task of taskList) {
-                const extra = task.taskTodoExtra || {};
-                const taskType = extra.type || "";
-                const taskName = task.name || "未知";
-                const status = String(extra.status || "");
-                const completeCount = extra.completeCount || 0;
-                const completeLimit = extra.completeLimit || 1;
-
-                if (skipTypes.has(taskType)) {
-                    console.log(`  ⏭️ [任务] ${taskName}: 需手动完成，跳过`);
-                    continue;
-                }
-                if (status === "3" || completeCount >= completeLimit) {
-                    console.log(`  ✅ [任务] ${taskName}: 已完成`);
-                    continue;
-                }
-
-                const isGame = gameKeywords.some((kw) => taskName.includes(kw));
-                if (isGame) {
-                    await this.completeGameTask(task);
-                } else {
-                    await this.completeTask(task);
-                }
-                await sleep(3000);
-            }
+        const todaySigned =
+            checkTodo?.todaySigned ||
+            checkTodo?.signed ||
+            checkTodo?.finish ||
+            checkTodo?.completed ||
+            checkTodo?.status === 1 ||
+            checkTodo?.state === 1;
+        if (todaySigned) {
+            const after = await this.profile();
+            return { ok: true, text: `今日已签到（activityId ${activityId}）`, scoreAfter: after.score };
         }
+        const sign = await this.api({
+            method: "POST",
+            path: "/c/activity/todo/checkIn",
+            data: { activityId, mockTime: Date.now() },
+            allowFail: true,
+        });
+        const msg = String(sign.data?.message || sign.data?.msg || "");
+        const already = /已签|重复|签到过/i.test(msg);
+        const success = sign.ok || already;
+        const after = await this.profile();
+        return {
+            ok: success,
+            text: already ? `今日已签到（${msg}）` : (success ? `签到成功${msg && !/^签到成功/.test(msg) ? `（${msg}）` : ""}` : `签到失败：${msg || short(sign.data, 120)}`),
+            scoreAfter: after.score,
+        };
+    }
+
+    /** rrx 侧鉴权：ca.rrx.cn 由服务端下发签名 SSO 跳转，跟随后即可拿到 JWT Cookie */
+    async rrxAuth() {
+        const url = `${RRX_CA}/v/${RRX_SITE}?token=${encodeURIComponent(this.token)}&v=1&mwa=1`;
+        const res = await axios.get(url, {
+            headers: { "user-agent": UA, accept: "text/html,application/xhtml+xml,*/*;q=0.8" },
+            maxRedirects: 6,
+            validateStatus: () => true,
+            proxy: false,
+            timeout: 30000,
+        });
+        if (res.status !== 200) throw new Error(`rrx 授权跳转 HTTP ${res.status}`);
+        const cookies = res.headers["set-cookie"] || [];
+        let jwt = "", day = "";
+        for (const raw of cookies) {
+            const pair = String(raw).split(";")[0];
+            const idx = pair.indexOf("=");
+            if (idx === -1) continue;
+            const name = pair.slice(0, idx).trim();
+            const value = pair.slice(idx + 1).trim();
+            if (value.startsWith("eyJ") && value.split(".").length === 3) jwt = value;
+            else if (name.startsWith("authByDayWith")) day = pair;
+        }
+        if (!jwt) throw new Error("rrx 授权未返回 JWT");
+        const headers = {
+            authorization: `Bearer ${jwt}`,
+            cookie: day,
+            origin: RRX_CA,
+            referer: `${RRX_CA}/`,
+            "user-agent": UA,
+        };
+        const info = await axios.get(`${RRX_INFO}/m/auth/checkIsLogin?${this.rrxQuery()}`, { headers, proxy: false, validateStatus: () => true, timeout: 25000 });
+        const data = info.data?.data || {};
+        if (info.status !== 200 || info.data?.result !== 0 || !data.guid) {
+            throw new Error(`rrx 登录态校验失败：${brief(info.data?.msg || info.data?.message || `HTTP ${info.status}`, 60)}`);
+        }
+        return { jwt, headers, guid: String(data.guid), name: String(data.name || ""), openId: String(data.openId || "") };
+    }
+
+    rrxQuery() {
+        return `channel=${RRX_CHANNEL}&mallGuid=${RRX_MALL}&wsiteGuid=${RRX_SITE}`;
+    }
+
+    /** 鹤小飞超级大闯关：取 JWT → 查可玩关卡 → 开局 → 提交成绩 → 领奖机会 */
+    async playGame(profile) {
+        if (!GAME_ON) {
+            console.log("   ℹ️ [游戏] FHXMH_GAME=0，已跳过");
+            return { ok: true, skipped: true, text: "已关闭（FHXMH_GAME=0）" };
+        }
+        try {
+            let auth = await this.rrxAuth();
+            const q = this.rrxQuery();
+            const maxRes = await axios.get(`${RRX_GAME_BASE}/getPlayMaxLevel?${q}&activityGuid=${RRX_ACT}`, { headers: auth.headers, proxy: false, validateStatus: () => true, timeout: 25000 });
+            const maxData = maxRes.data?.data || {};
+            if (maxRes.data?.result !== 0) throw new Error(`查询关卡失败：${brief(maxRes.data?.msg || `HTTP ${maxRes.status}`, 60)}`);
+            const played = Number(maxData.playMaxLevel || 0);
+            if (Number.isFinite(played) && played >= 100) return { ok: true, skipped: true, text: "100 关已全部通关" };
+            let level = GAME_LEVEL_WANT > 0 ? GAME_LEVEL_WANT : Math.max(1, played + 1);
+            console.log(`   🎮 [游戏] 已进入闯关（rrx ${auth.guid.slice(0, 8)}…），从第 ${level} 关开始，本账号今天最多 20 局`);
+            if (maxData.checkIntegralJoin) console.log("   ℹ️ [游戏] 接口标记需积分校验，按活动规则继续尝试");
+            console.log("   ⚠️ [游戏] 脚本为模拟对局提交成绩，活动规则写明异常账号会封禁，风险自担");
+
+            const parts = [];
+            let passCount = 0, totalAfter = 0;
+            for (let n = 1; n <= GAME_PLAYS; n++) {
+                // rrx JWT 有效期很短，多局时定期刷新，避免后半程 401
+                if (n > 1 && (n - 1) % 4 === 0) {
+                    try { auth = await this.rrxAuth(); } catch (e) { console.log(`   ⚠️ [游戏] JWT 刷新失败（${brief(e.message, 40)}），继续用旧凭证`); }
+                }
+                const one = await this.playOneGame(auth, level);
+                if (!one.ok) {
+                    parts.push(`第${n}局失败（${one.error}）`);
+                    break;
+                }
+                parts.push(one.text);
+                totalAfter = one.totalAfter || totalAfter;
+                if (one.pass) {
+                    passCount++;
+                    level = one.nextLevel > level ? one.nextLevel : level + 1;
+                } else break;
+            }
+            const summary = `计划 ${GAME_PLAYS} 局，成功 ${passCount} 局${totalAfter ? `，总分 ${totalAfter}` : ""}`;
+            return { ok: true, text: `${summary}｜${parts.join("；")}` };
+        } catch (e) {
+            const msg = e && e.message ? e.message : String(e);
+            return { ok: false, text: `闯关失败（${brief(msg, 80)}）` };
+        }
+    }
+
+    async playOneGame(auth, level) {
+        const q = this.rrxQuery();
+        const start = await axios.post(
+            `${RRX_GAME_BASE}/startGame?${q}&activityGuid=${RRX_ACT}`,
+            new URLSearchParams({ activityGuid: RRX_ACT, mallGuid: RRX_MALL, fmid: "", gameLevel: String(level) }).toString(),
+            { headers: { ...auth.headers, "content-type": "application/x-www-form-urlencoded" }, proxy: false, validateStatus: () => true, timeout: 25000 }
+        );
+        const sd = start.data?.data || {};
+        if (start.data?.result !== 0 || !sd.gameStartToken) {
+            return { ok: false, error: brief(start.data?.msg || `HTTP ${start.status}`, 60) };
+        }
+        const need = Number(sd.targetScore || 60);
+        const floor = Math.max(need, GAME_SCORE_MIN);
+        const ceil = Math.max(floor, GAME_SCORE_MAX);
+        const target = GAME_SCORE > 0 ? Math.max(GAME_SCORE, floor) : floor + Math.floor(Math.random() * (ceil - floor + 1));
+        const totalBefore = Number(sd.myRecord?.totalScore || 0);
+        console.log(`   🎮 [游戏] 第 ${level} 关开局，目标 ${need} 分，本局提交 ${target}，累计 ${totalBefore}`);
+        if (GAME_WAIT > 0) {
+            console.log(`   ⏳ [游戏] 模拟对局中，等待 ${GAME_WAIT}s 后提交`);
+            await sleep(GAME_WAIT * 1000);
+        }
+        const now = Date.now();
+        const isPass = target >= need ? 1 : 0;
+        const plain = JSON.stringify({
+            score: target,
+            currentTime: GAME_WAIT * 1000 + 1200,
+            microTime: now,
+            activityGuid: RRX_ACT,
+            memberGuid: auth.guid,
+            gameLevel: level,
+            isPass,
+            gameGrade: 1,
+        });
+        const cipher = aesZeroPad(plain, RRX_PCS);
+        const submitToken = now.toString(36) + "_" + randomGuid(16);
+        const body = new URLSearchParams({
+            activityGuid: RRX_ACT,
+            fmid: "",
+            currentScore: cipher,
+            currentTime: String(GAME_WAIT * 1000 + 1200),
+            isHelpStyle: "0",
+            gameLevel: String(level),
+            isPass: String(isPass),
+            gameGrade: "1",
+            gameMemo: "",
+            gameStartToken: sd.gameStartToken,
+            gameSubmitToken: submitToken,
+            _t: String(now),
+        }).toString();
+        const save = await axios.post(`${RRX_GAME_BASE}/saveGame?${q}&activityGuid=${RRX_ACT}`, body, {
+            headers: { ...auth.headers, "content-type": "application/x-www-form-urlencoded" },
+            proxy: false, validateStatus: () => true, timeout: 25000,
+        });
+        const res = save.data || {};
+        if (GAME_DEBUG) console.log(`   🔍 [游戏] saveGame 原始返回：${brief(JSON.stringify(res), 220)}`);
+        if (res.result !== 0) return { ok: false, error: brief(res.msg || res.message || `HTTP ${save.status}`, 60) };
+        const d = res.data || {};
+        const pass = String(d.status || "").includes("Pass") || Number(d.isPass) === 1 || Number(d.currentGrade) > 0;
+        const totalAfter = Number(d.totalScore || totalBefore);
+        const delta = totalAfter - totalBefore;
+        return {
+            ok: true,
+            pass,
+            totalAfter,
+            nextLevel: Number(d.currentLevel || 0),
+            text: pass
+                ? `第${level}关通关（${Number(d.lastScore || target)}分）${delta > 0 ? `，总分 ${totalBefore}→${totalAfter}（+${delta}）` : `，总分 ${totalAfter}`}`
+                : `第${level}关未通关（${Number(d.lastScore || target)}/${need}分）`,
+        };
     }
 }
 
-async function runAccount(openid, index, total) {
-    logAccountHeader(index, total, openid);
-    let usedCache = !!(readTokenCache()[openid] || {}).accessToken;
+function pickScore(data) {
+    if (!data || typeof data !== "object") return null;
+    const keys = ["score", "points", "integral", "availableScore", "totalScore", "point", "scoreValue"];
+    for (const key of keys) {
+        if (data[key] !== undefined && data[key] !== null && Number.isFinite(Number(data[key]))) return Number(data[key]);
+    }
+    const found = findFirst(data, (item) => {
+        if (!item || typeof item !== "object") return false;
+        return keys.some((key) => item[key] !== undefined && Number.isFinite(Number(item[key])));
+    });
+    if (found) {
+        const key = keys.find((k) => found[k] !== undefined && Number.isFinite(Number(found[k])));
+        return Number(found[key]);
+    }
+    return null;
+}
+
+function nowText() {
+    return new Date().toLocaleString("zh-CN", { hour12: false });
+}
+
+async function getCode(server, ref) {
+    const url = `http://${server}/wxapp/getCode`;
+    try {
+        const { data } = await axios.post(url, { ref, app_id: APP.appid }, { timeout: 20000, proxy: false });
+        const code = data && data.data && data.data.result && data.data.result.code;
+        if (!data || data.code !== 0 || !code) {
+            console.log(`   ❌ [取码] 失败：${short(data, 150)}`);
+            return null;
+        }
+        return code;
+    } catch (e) {
+        console.log(`   ❌ [取码] 异常：${e.message}`);
+        return null;
+    }
+}
+
+async function runAccount(entry, index) {
+    const runner = new FeiheMom(entry);
+    const result = {
+        index, ref: runner.ref, note: runner.note,
+        name: "", scoreBefore: null, scoreAfter: null, signText: "", gameText: "", gameOk: true, ok: true, error: "",
+    };
+    let usedCache = !!(readTokenCache()[runner.key] || {}).accessToken;
+
     for (let attempt = 0; attempt < 2; attempt++) {
-        const runner = new FeiheMom(openid);
         try {
-            await runner.login();
-            await runner.query();
-            await runner.sign();
-            return true;
+            const loginInfo = await runner.login();
+            if (loginInfo.fromCache) {
+                const verify = await runner.verifyToken();
+                if (!verify.ok) {
+                    console.log(`   ⚠️ [校验] 缓存 token 失效（${brief(verify.msg)}），清除后重新登录`);
+                    removeCacheKey(runner.key, runner.ref);
+                    usedCache = false;
+                    continue;
+                }
+                console.log("   ✅ [校验] 缓存 token 有效，直接复用");
+            }
+            const profile = await runner.profile();
+            result.name = profile.name;
+            result.scoreBefore = profile.score;
+            console.log(`   👤 [会员] ${profile.name}`);
+            console.log(`   💰 [积分] ${profile.score === null ? "未知" : profile.score}`);
+
+            const signInfo = await runner.sign(profile.score);
+            result.signText = signInfo.text;
+            result.scoreAfter = signInfo.scoreAfter;
+            console.log(`   ${signInfo.ok ? "✅" : "❌"} [签到] ${signInfo.text}`);
+
+            const game = await runner.playGame({ name: profile.name, memberId: profile.memberId, score: signInfo.scoreAfter });
+            result.gameText = game.skipped && /当前无游戏任务/.test(game.text || "") ? "" : (game.text || "");
+            result.gameOk = game.ok !== false;
+            if (result.gameText) {
+                console.log(`   ${game.skipped ? "ℹ️" : result.gameOk ? "✅" : "❌"} [游戏] ${result.gameText}`);
+            }
+            if (game.ok !== false) {
+                const after = await runner.profile();
+                if (after.score !== null) result.scoreAfter = after.score;
+            }
+
+            result.ok = signInfo.ok && result.gameOk;
+            if (!result.ok) result.error = signInfo.ok ? result.gameText : signInfo.text;
+            return result;
         } catch (e) {
-            if (e.tokenInvalid && attempt === 0 && usedCache) {
-                console.log(`🔄 [重登] 账号[${runner.index}] token失效(${e.message})，清除缓存重新登录...`);
-                const c = readTokenCache();
-                delete c[openid];
-                writeTokenCache(c);
+            const msg = e && e.message ? e.message : String(e);
+            if (attempt === 0 && usedCache) {
+                console.log(`   ⚠️ [校验] 缓存 token 使用失败（${brief(msg)}），清除后重新登录`);
+                removeCacheKey(runner.key, runner.ref);
+                usedCache = false;
                 continue;
             }
-            console.log(`❌ [执行] 账号[${runner.index}] 执行失败：${e.message || e}`);
-            return false;
+            result.ok = false;
+            result.error = msg;
+            console.log(`   ❌ [异常] ${brief(msg)}`);
+            return result;
         }
+    }
+    result.ok = false;
+    result.error = result.error || "重登后仍失败";
+    return result;
+}
+
+async function sendQingLongNotify(title, content) {
+    for (const file of ["/ql/data/scripts/notify.js", "/ql/scripts/notify.js", path.join(__dirname, "notify.js"), path.join(__dirname, "SendNotify.js")]) {
+        try {
+            if (!fs.existsSync(file)) continue;
+            const mod = require(file);
+            const fn = (typeof mod === "function" && mod) || mod.sendNotify || mod.send;
+            if (typeof fn === "function") { await fn(title, content); return true; }
+        } catch {}
     }
     return false;
 }
 
-(async () => {
-    logTitle();
-    let successCount = 0;
-    let failCount = 0;
-    for (let i = 0; i < SERVERS.length; i++) {
-        const ok = await runAccount(SERVERS[i], i + 1, SERVERS.length);
-        if (ok) successCount++; else failCount++;
-        await sleep(800);
+async function sendPushPlus(title, content) {
+    const token = process.env.PLUSPLUS_TOKEN || "";
+    if (!token) return false;
+    try {
+        await axios.post("https://www.pushplus.plus/send", {
+            token, title, content, template: "txt",
+        }, { timeout: 10000, proxy: false });
+        return true;
+    } catch (e) {
+        console.log(`   ⚠️ [通知] PushPlus 失败：${e.message}`);
+        return false;
     }
-    console.log();
-    console.log("╔" + "═".repeat(48) + "╗");
-    console.log("║  🏁 飞鹤星妈会任务执行完成                    ║");
-    console.log(`║  ✅ 成功: ${String(successCount).padEnd(22)}║`);
-    console.log(`║  ❌ 失败: ${String(failCount).padEnd(22)}║`);
-    console.log(`║  🕒 结束时间: ${new Date().toLocaleString("zh-CN", { hour12: false }).padEnd(22)}║`);
-    console.log("╚" + "═".repeat(48) + "╝");
-})().catch((e) => {
-    console.log(`❌ 脚本异常：${e.stack || e.message || e}`);
-});
+}
+
+function deltaText(before, after) {
+    if (before === null || after === null) return "";
+    const diff = after - before;
+    if (diff === 0) return "";
+    return `${before} → ${after}（${diff > 0 ? "+" : ""}${diff}）`;
+}
+
+(async () => {
+    if (!SERVERS.length) {
+        console.log("❌ 未配置环境变量 YYB_SERVER（格式：地址@微信账号标识[#备注]，多账号换行分隔）");
+        return;
+    }
+    const valid = SERVERS.filter(item => item.includes("@"));
+    if (!valid.length) {
+        console.log("❌ YYB_SERVER 无有效账号（格式：地址@标识[#备注]）");
+        return;
+    }
+    SERVERS.length = 0;
+    SERVERS.push(...valid);
+
+    boxTop("🍼 飞鹤星妈会 每日任务");
+    boxLine("🕒 启动时间", new Date().toLocaleString("zh-CN"));
+    boxLine("🔢 账号数量", `${SERVERS.length} 个`);
+    boxLine("💾 缓存", "fhxmh_token_cache.json");
+    boxLine("🌐 网络", process.env.FHXMH_PROXY_API ? "代理" : "直连");
+    boxBottom();
+
+    const results = [];
+    for (let i = 0; i < SERVERS.length; i++) {
+        const entry = parseYybGoEntry(SERVERS[i]);
+        const label = `标识 ${entry.ref || "-"}` + (entry.note ? `（${entry.note}）` : "");
+        accountFrame(i + 1, SERVERS.length, label, SERVERS[i]);
+        const res = await runAccount(SERVERS[i], i + 1);
+        results.push(res);
+        console.log(res.ok ? "   ✅ [完成] 该账号任务执行完成" : "   ❌ [完成] 该账号存在失败项");
+        hr();
+        if (i < SERVERS.length - 1) {
+            console.log("   ⏳ 等待2秒后执行下一个账号...");
+            await sleep(2000);
+        }
+    }
+
+    console.log("");
+    for (const r of results) {
+        const title = `${r.ok ? "✅" : "❌"} 【账号 ${r.index} · 标识 ${r.ref || "-"}` + (r.note ? `（${r.note}）` : "") + "】";
+        console.log(title);
+        console.log(`   👤 [会员] ${r.name || "未知"}`);
+        const scoreLine = deltaText(r.scoreBefore, r.scoreAfter) || `${r.scoreAfter ?? r.scoreBefore ?? "未知"}`;
+        console.log(`   💰 [积分] ${scoreLine}`);
+        console.log(`   📅 [签到] ${r.signText || (r.ok ? "已完成" : "未完成")}`);
+        if (r.gameText) console.log(`   🎮 [游戏] ${r.gameText}`);
+        if (!r.ok) console.log(`   ⚠️ [失败] ${brief(r.error)}`);
+    }
+
+    const ok = results.filter(r => r.ok).length;
+    console.log("");
+    boxTop("🏁 飞鹤星妈会 执行汇总");
+    boxLine("📊 执行结果", `成功 ${ok} / 失败 ${results.length - ok} / 共 ${results.length}`);
+    boxLine("🕒 结束时间", new Date().toLocaleString("zh-CN"));
+    boxBottom();
+
+    const content = results.map(r => `${r.ok ? "✅" : "❌"} 账号${r.index} ${r.ref || "-"}` + (r.note ? `（${r.note}）` : "") +
+        `\n会员：${r.name || "未知"}\n积分：${deltaText(r.scoreBefore, r.scoreAfter) || (r.scoreAfter ?? r.scoreBefore ?? "未知")}\n签到：${r.signText || (r.ok ? "已完成" : "未完成")}${r.gameText ? `\n游戏：${r.gameText}` : ""}` +
+        (r.ok ? "" : `\n失败：${r.error}`)).join("\n\n");
+
+    if (NOTIFY_ON) {
+        const sent = await sendQingLongNotify("🍼 飞鹤星妈会任务完成", content);
+        console.log(sent ? "   📮 [通知] 已通过青龙 notify 推送" : "   ℹ️ [通知] 未找到青龙 notify 脚本");
+        if (await sendPushPlus("🍼 飞鹤星妈会任务完成", content)) console.log("   📨 [通知] PushPlus 推送成功");
+    } else {
+        console.log("   ℹ️ [通知] FHXMH_NOTIFY=0，已关闭通知");
+    }
+})().catch(e => console.log(`❌ [全局异常] ${e.message}`));
