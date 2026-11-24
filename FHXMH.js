@@ -539,14 +539,16 @@ class FeiheMom {
         const pass = String(d.status || "").includes("Pass") || Number(d.isPass) === 1 || Number(d.currentGrade) > 0;
         const totalAfter = Number(d.totalScore || totalBefore);
         const delta = totalAfter - totalBefore;
+        const ranking = Number(d.ranking || 0);
+        const rankText = ranking > 0 ? `，当前排名第 ${ranking}` : "";
         return {
             ok: true,
             pass,
             totalAfter,
             nextLevel: Number(d.currentLevel || 0),
             text: pass
-                ? `第${level}关通关（${Number(d.lastScore || target)}分）${delta > 0 ? `，总分 ${totalBefore}→${totalAfter}（+${delta}）` : `，总分 ${totalAfter}`}`
-                : `第${level}关未通关（${Number(d.lastScore || target)}/${need}分）`,
+                ? `第${level}关通关（${Number(d.lastScore || target)}分）${delta > 0 ? `，总分 ${totalBefore}→${totalAfter}（+${delta}）` : `，总分 ${totalAfter}`}${rankText}`
+                : `第${level}关未通关（${Number(d.lastScore || target)}/${need}分）${rankText}`,
         };
     }
 }
