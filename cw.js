@@ -95,7 +95,7 @@ function parseAccounts(raw) {
   return accounts;
 }
 
-const LOG_WIDTH = 74;
+const LOG_WIDTH = 48;
 const BOX_WIDTH = 48;
 const BOX_INNER = 46;
 
@@ -195,6 +195,11 @@ function logSep(char = '─') {
 
 function endSection() {
   console.log('');
+}
+
+function accountDivider() {
+  console.log('');
+  console.log('-'.repeat(48));
 }
 
 function maskMiddle(s, left = 10, right = 8) {
@@ -953,7 +958,7 @@ async function acquireToken(account) {
 
 async function runOne(account, idx, total) {
   const { server, ref, note = '' } = account;
-  accountFrame(idx, total, `账号 ${ref}${note ? `（${note}）` : ''}`, `${server}@${ref}`);
+  accountFrame(idx, total, `标识 ${ref}${note ? `（${note}）` : ''}`, `${server}@${ref}`);
   const ck = cacheKey(server, ref);
   let token = '';
   let tokenSource = '';
@@ -1102,6 +1107,7 @@ sys.exit(2)
     try {
       const summary = await runOne(accounts[i], i + 1, accounts.length);
       results.push(`【账号${i + 1}${accounts[i].note ? ` · ${accounts[i].note}` : ''}】\n${summary}`);
+      accountDivider();
     } catch (e) {
       if (e?.accountSkipped) {
         logWarn(`账号${i + 1}未注册创维小程序，已跳过`);
@@ -1112,8 +1118,15 @@ sys.exit(2)
         results.push(`【账号${i + 1}${accounts[i].note ? ` · ${accounts[i].note}` : ''}】\n❌ 失败：${truncText(e.message || e, 80)}`);
         failed++;
       }
-      endSection();
+      accountDivider();
     }
+  }
+
+  // 逐账号明细在前
+  console.log('');
+  for (const item of results) {
+    console.log(item);
+    console.log('');
   }
 
   boxTop('🏁 创维小程序 任务完成');
@@ -1130,4 +1143,3 @@ sys.exit(2)
   ].join('\n'));
   if (failed > 0) process.exitCode = 1;
 })();
-//（注：内容由AI生成）
