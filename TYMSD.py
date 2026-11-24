@@ -38,7 +38,7 @@ APP_NAME = "统一梦时代"
 APPID = "wx532ecb3bdaaf92f9"
 
 # 微盟 API
-BASE_URL = "https://xapi.weimob.com"
+BASE_URL = (os.environ.get("TYMSD_BASE_URL") or "https://xapi.weimob.com").rstrip("/")
 LOGIN_URL = f"{BASE_URL}/fe/mapi/user/loginX"
 SIGN_IN_URL = f"{BASE_URL}/api3/onecrm/mactivity/sign/misc/sign/activity/core/c/sign"
 NOTICE_URL = f"{BASE_URL}/api3/onecrm/mactivity/sign/misc/sign/activity/c/getNotice"
@@ -114,9 +114,11 @@ def sleep(seconds: float) -> None:
 
 def mask(value) -> str:
     value = str(value or "")
-    if len(value) <= 12:
-        return value
-    return f"{value[:6]}...{value[-6:]}"
+    if len(value) <= 4:
+        return "***"
+    if len(value) <= 10:
+        return f"{value[:2]}***{value[-2:]}"
+    return f"{value[:5]}***{value[-3:]}"
 
 
 def json_preview(data, limit: int = 300) -> str:
@@ -126,30 +128,93 @@ def json_preview(data, limit: int = 300) -> str:
         return str(data)[:limit]
 
 
+
+# ============ 通用版式 ============
+BOX_WIDTH = 48
+BOX_INNER = BOX_WIDTH - 2
+TITLE = "统一梦时代"
+CACHE_NAME = "tymsd_token_cache.json"
+NOTIFY_ENABLED = (os.environ.get("TYMSD_NOTIFY") or "1") != "0"
+
+
+def display_width(text: str) -> int:
+    width = 0
+    for ch in str(text):
+        code = ord(ch)
+        if code in (0xfe0f, 0xfe0e, 0x200d):
+            continue
+        width += 2 if code > 0xff else 1
+    return width
+
+
+def pad_width(text: str, width: int) -> str:
+    pad = width - display_width(text)
+    return text + " " * pad if pad > 0 else str(text)
+
+
+def box_top() -> str:
+    return "╔" + "═" * BOX_INNER + "╗"
+
+
+def box_line(content: str) -> str:
+    return "║ " + pad_width(content, BOX_INNER - 1) + "║"
+
+
+def box_bottom() -> str:
+    return "╚" + "═" * BOX_INNER + "╝"
+
+
+def hr() -> None:
+    print("-" * 48)
+
+
+def brief(text, limit: int = 60) -> str:
+    value = " ".join(str(text or "").split())
+    return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def account_frame(index: int, total: int, ref: str, note: str, raw: str) -> None:
+    print("┌" + "─" * BOX_INNER + "┐")
+    label = f"  🧩 账号 {index} / {total}　标识 {ref}" + (f"（{note}）" if note else "")
+    print("│" + pad_width(label, BOX_INNER) + "│")
+    print("│" + pad_width(f"  🔗 来源: {raw}", BOX_INNER) + "│")
+    print("└" + "─" * BOX_INNER + "┘")
+
+
+def cache_key(server: str, ref: str) -> str:
+    return f"{server}|{ref}"
+
+
+def is_auth_error(message) -> bool:
+    text = str(message or "").lower()
+    return any(kw in text for kw in ["token", "登录", "未登录", "授权", "失效", "过期", "unauthorized"])
+
+
 # ============ YYB Server 交互 ============
 
 def parse_yyb_go_entry(raw_value: str):
-    raw_value = (raw_value or "").strip()
-    if not raw_value:
-        return None, None
-    if "@" not in raw_value:
-        print(f"❌ YYB_SERVER 格式应为 地址@微信账号标识，当前值：{raw_value}")
-        return None, None
-    server, ref = raw_value.split("@", 1)
-    server = server.strip()
-    ref = ref.strip()
-    if server.startswith("http://"):
-        server = server[7:]
-    elif server.startswith("https://"):
+    value = (raw_value or "").strip()
+    if not value:
+        return None, None, ""
+    body, note = value, ""
+    if "#" in body:
+        idx = body.rfind("#")
+        body, note = body[:idx], body[idx + 1:].strip()
+    if "@" not in body:
+        print(f"  ❌ [配置] 格式应为 地址@标识[#备注]，当前值：{value}")
+        return None, None, ""
+    server, ref = body[:body.rfind("@")].strip(), body[body.rfind("@") + 1:].strip()
+    server = server.replace("http://", "", 1) if server.startswith("http://") else server
+    if server.startswith("https://"):
         server = server[8:]
     server = server.rstrip("/")
     if not server or not ref:
-        return None, None
-    return server, ref
+        return None, None, ""
+    return server, ref, note
 
 
 def get_wx_code(server_entry: str) -> str | None:
-    parsed_server, ref = parse_yyb_go_entry(server_entry)
+    parsed_server, ref, _note = parse_yyb_go_entry(server_entry)
     if not parsed_server or not ref:
         return None
     url = f"http://{parsed_server}/wxapp/getCode"
@@ -495,110 +560,133 @@ def query_point_details(server: str, token: str, wid, proxies: dict | None) -> d
 
 
 def run_account(index: int, total: int, server_entry: str) -> dict:
-    parsed_server, wxid = parse_yyb_go_entry(server_entry)
+    parsed_server, wxid, note = parse_yyb_go_entry(server_entry)
     result = {
+        "index": index,
         "wxid": mask(wxid or ""),
         "success": False,
         "proxy_status": "未使用代理",
-        "token": "-",
-        "wid": "-",
+        "login_source": "-",
         "sign_msg": "-",
         "points_msg": "-",
         "details_msg": "-",
         "error": "",
+        "lines": [],
     }
+    if not parsed_server or not wxid:
+        result["error"] = "YYB_SERVER 格式无效"
+        print("  ❌ [配置] YYB_SERVER 格式无效")
+        hr()
+        return result
 
-    print(f"\n{'='*50}")
-    print(f"账号 {index}/{total} ({mask(wxid or '')})")
-    print(f"{'='*50}")
+    account_frame(index, total, mask(wxid), note, server_entry)
 
     proxies = get_valid_proxy(str(parsed_server))
     result["proxy_status"] = "使用专属代理" if proxies else "使用直连"
 
-    delay = random.randint(2, 6)
-    sleep(delay)
+    ck = cache_key(parsed_server, wxid)
+    cache = read_token_cache()
+    # 旧键迁移（ref-only）
+    if not cache.get(ck):
+        for old_key in (wxid, server_entry, f"{parsed_server}@{wxid}"):
+            if cache.get(old_key):
+                cache[ck] = cache[old_key]
+                cache.pop(old_key, None)
+                write_token_cache(cache)
+                break
 
-    code = None
     token = None
     wid = None
-    used_cache = False
+    login_source = ""
 
-    # 尝试缓存（不过期，服务端拒绝时自动重登）
-    cache = read_token_cache()
-    cached = cache.get(wxid) or {}
-    if cached.get("token"):
-        token = cached["token"]
-        wid = cached.get("wid")
-        used_cache = True
-        print(f"  [缓存] 使用缓存token: {mask(token)}")
+    entry = cache.get(ck) or {}
+    if entry.get("token"):
+        token, wid = entry["token"], entry.get("wid")
+        print("   💾 [缓存] 发现已保存的 token，先做有效性校验")
+        pts = query_points(parsed_server, token, wid, proxies)
+        if pts.get("success"):
+            login_source = "缓存"
+            print("   ✅ [缓存] 校验通过，直接复用")
+        else:
+            print("   🔄 [缓存] 校验失败，清理缓存后重新登录")
+            cache.pop(ck, None)
+            write_token_cache(cache)
+            token = wid = None
 
     if not token:
+        delay = random.randint(2, 6)
+        sleep(delay)
         code = get_wx_code(server_entry)
         if not code:
             result["error"] = "获取 code 失败"
+            print("   ❌ [登录] 获取 code 失败")
+            hr()
             return result
-
         token, wid, raw = login_by_code(parsed_server, code, proxies)
         if not token:
             result["error"] = f"登录失败: {json_preview(raw)}"
+            print("   ❌ [登录] 登录失败")
+            hr()
             return result
-
+        login_source = "新登录"
         cache = read_token_cache()
-        cache[wxid] = {"token": token, "wid": wid, "updatedAt": now_text()}
+        cache[ck] = {"token": token, "wid": wid, "updatedAt": now_text()}
         write_token_cache(cache)
+        print("   ✅ [登录] 成功（已写入缓存）")
 
-    result["token"] = mask(token)
-    result["wid"] = str(wid or "-")
+    result["login_source"] = login_source
 
-    # 执行业务，若缓存token失效则自动重登重试
-    for attempt in range(2):
-        if attempt == 1:
-            print("  [重登] 缓存token失效，重新登录...")
-            cache = read_token_cache()
-            if wxid in cache:
-                del cache[wxid]
-                write_token_cache(cache)
-            code = get_wx_code(server_entry)
-            if not code:
-                result["error"] = "重新登录获取code失败"
-                return result
+    # 签到（失败且像鉴权问题 → 清缓存重登一次）
+    sign_result = sign_in(parsed_server, token, wid, proxies)
+    if not sign_result["success"] and not sign_result["already_signed"] and is_auth_error(sign_result.get("message")):
+        print("   🔄 [重试] 签到提示登录态失效，清理缓存重登一次")
+        cache = read_token_cache()
+        cache.pop(ck, None)
+        write_token_cache(cache)
+        code = get_wx_code(server_entry)
+        if code:
             token, wid, raw = login_by_code(parsed_server, code, proxies)
-            if not token:
-                result["error"] = f"重新登录失败: {json_preview(raw)}"
-                return result
-            cache = read_token_cache()
-            cache[wxid] = {"token": token, "wid": wid, "updatedAt": now_text()}
-            write_token_cache(cache)
-            result["token"] = mask(token)
-            result["wid"] = str(wid or "-")
+            if token:
+                cache = read_token_cache()
+                cache[ck] = {"token": token, "wid": wid, "updatedAt": now_text()}
+                write_token_cache(cache)
+                login_source = "重新登录"
+                result["login_source"] = login_source
+                print("   ✅ [登录] 重登成功，重跑签到")
+                sign_result = sign_in(parsed_server, token, wid, proxies)
 
-        # 签到
-        sign_result = sign_in(parsed_server, token, wid, proxies)
+    if sign_result["already_signed"]:
+        result["sign_msg"] = f"今日已签到（{brief(sign_result['message'], 40)}）"
+    elif sign_result["success"]:
+        result["sign_msg"] = f"签到成功 +{brief(sign_result['message'], 30)}"
+    else:
+        result["sign_msg"] = f"失败（{brief(sign_result['message'], 40)}）"
 
-        # 首次用缓存失败 → 判定为token失效，重登重试
-        if attempt == 0 and used_cache and not sign_result["success"] and not sign_result["already_signed"]:
-            continue
+    # 积分（签到前后对比）
+    pts_after = query_points(parsed_server, token, wid, proxies)
+    if pts_after.get("success"):
+        result["points_msg"] = f"可用 {pts_after['available']} / 总计 {pts_after['total']}"
+    else:
+        result["points_msg"] = "积分查询失败"
 
-        if sign_result["already_signed"]:
-            result["sign_msg"] = f"今日已签到: {sign_result['message']}"
-        elif sign_result["success"]:
-            result["sign_msg"] = f"签到成功: {sign_result['message']}"
-        else:
-            result["sign_msg"] = sign_result["message"]
+    # 明细
+    det = query_point_details(parsed_server, token, wid, proxies)
+    result["details_msg"] = det.get("message", "-")
 
-        # 积分
-        pts = query_points(parsed_server, token, wid, proxies)
-        if pts["success"]:
-            result["points_msg"] = f"可用: {pts['available']} / 总计: {pts['total']}"
-        else:
-            result["points_msg"] = "积分查询失败"
+    ok = bool(sign_result["success"] or sign_result["already_signed"]) and pts_after.get("success")
+    result["success"] = ok
+    if not ok and not result["error"]:
+        result["error"] = result["sign_msg"] if not pts_after.get("success") else "任务未全部成功"
 
-        # 明细
-        det = query_point_details(parsed_server, token, wid, proxies)
-        result["details_msg"] = det.get("message", "-")
-        break
-
-    result["success"] = True
+    result["lines"] = [
+        f"👤 标识：{mask(wxid)}（登录态来源：{login_source}）",
+        f"📅 签到：{result['sign_msg']}",
+        f"💰 积分：{result['points_msg']}",
+        f"📋 明细：{result['details_msg']}",
+    ]
+    print(f"   ℹ️ [积分] {result['points_msg']}")
+    print(f"   ℹ️ [明细] {result['details_msg']}")
+    hr()
     return result
 
 
@@ -622,10 +710,13 @@ def build_notify(results: list) -> str:
 
 
 def main() -> None:
-    print(f"\n{'='*50}")
-    print(f"统一梦时代（YYB Go版）")
-    print(f"启动: {now_text()} | 账号: {len(SERVERS)}")
-    print(f"{'='*50}")
+    print(box_top())
+    print(box_line(f"💠 {TITLE} 每日任务"))
+    print(box_line(f"🕒 启动时间: {now_text()}"))
+    print(box_line(f"🔢 账号数量: {len(SERVERS)} 个"))
+    print(box_line(f"💾 缓存: {CACHE_NAME}"))
+    print(box_line("🌐 网络: 直连"))
+    print(box_bottom())
 
     results = []
     for idx, server_entry in enumerate(SERVERS):
@@ -633,23 +724,46 @@ def main() -> None:
             r = run_account(idx + 1, len(SERVERS), server_entry)
             results.append(r)
         except Exception as exc:
-            _, wxid = parse_yyb_go_entry(server_entry)
+            _, wxid, _note = parse_yyb_go_entry(server_entry)
+            print(f"   ❌ [异常] 账号{idx + 1} 执行异常: {brief(exc, 80)}")
+            hr()
             results.append({
-                "wxid": mask(wxid or ""), "success": False, "error": str(exc),
-                "token": "-", "wid": "-", "sign_msg": "-", "points_msg": "-", "details_msg": "-",
+                "index": idx + 1,
+                "wxid": mask(wxid or ""),
+                "success": False,
+                "error": str(exc),
                 "proxy_status": "-",
+                "login_source": "-",
+                "sign_msg": "-",
+                "points_msg": "-",
+                "details_msg": "-",
+                "lines": [f"❌ 原因：{brief(exc, 80)}"],
             })
         if idx < len(SERVERS) - 1:
             sleep(2)
 
     ok = sum(1 for r in results if r.get("success"))
     fail = len(results) - ok
-    print(f"\n{'='*50}")
-    print(f"完成: ✅{ok} ❌{fail} | 🕒{now_text()}")
-    print(f"{'='*50}")
 
-    if notify:
+    print()
+    for r in results:
+        icon = "✅" if r.get("success") else "❌"
+        note_text = ""
+        print(f"{icon} 【账号 {r.get('index', '-')}{note_text}】")
+        for line in r.get("lines") or [f"❌ 原因：{r.get('error', '未知错误')}"]:
+            print(f"   {line}")
+        print("")
+
+    print(box_top())
+    print(box_line(f"📊 汇总: 成功 {ok} / {len(results)}"))
+    print(box_line(f"❌ 失败: {fail}"))
+    print(box_line(f"🕒 结束时间: {now_text()}"))
+    print(box_bottom())
+
+    if notify and NOTIFY_ENABLED:
         notify.send(APP_NAME, build_notify(results))
+    elif notify and not NOTIFY_ENABLED:
+        print("ℹ️ TYMSD_NOTIFY=0，已关闭通知")
 
 
 if __name__ == "__main__":
