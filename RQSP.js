@@ -719,18 +719,29 @@ class Task {
         params: { pageNum: 1, pageSize: size },
       });
       const list = Array.isArray(data) ? data : (data?.list || data?.records || []);
-      if (!list.length) return '暂无记录';
-      return list
-        .slice(0, size)
+      if (!list.length) {
+        logInfo('[抽奖] 中奖记录：暂无记录');
+        return '暂无记录';
+      }
+      const shown = list.slice(0, size);
+      const physicalCount = shown.filter((it) => isPhysicalPrize(it.prizeType)).length;
+      const text = shown
         .map((it) => {
           const name = it.prizeName || it.awardName || it.name || '未知奖品';
           const tCn = prizeTypeText(it.prizeType);
           const t = it.createTime || it.awardTime || it.winTime || '';
           const timeText = t ? formatAwardTime(t) : '';
           const label = tCn ? `${name}（${tCn}）` : name;
-          return timeText ? `${label} ${timeText}` : label;
+          const pending = isPhysicalPrize(it.prizeType) ? '｜⚠️ 待填收货地址' : '';
+          return (timeText ? `${label} ${timeText}` : label) + pending;
         })
         .join('；');
+      logInfo(`[抽奖] 中奖记录：${text}`);
+      if (physicalCount > 0) {
+        logWarn(`[抽奖] 有 ${physicalCount} 个实物奖还没填收货地址，请到小程序「我的中奖记录」补齐`);
+        return `${text}（共 ${physicalCount} 个实物奖待填地址）`;
+      }
+      return text;
     } catch (e) {
       if (isAuthError(e)) throw e;
       return `记录查询失败（${truncText(e.message || e, 30)}）`;
