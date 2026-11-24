@@ -25,6 +25,7 @@ import base64
 import json
 import os
 import random
+import re
 import time
 
 import requests
@@ -33,6 +34,8 @@ try:
     from notify import send
 except ImportError:
     send = None
+
+NOTIFY_ENABLED = os.getenv("QH_NOTIFY", "1").strip() != "0"
 
 try:
     from cryptography.hazmat.primitives import hashes, serialization
@@ -51,9 +54,10 @@ except ImportError:
         CRYPTO_BACKEND = None
 
 
-BASE_URL = "https://farmgames.ioutu.cn"
+BASE_URL = (os.environ.get("QH_BASE_URL") or "https://farmgames.ioutu.cn").rstrip("/")
 APP_ID = "wx532ecb3bdaaf92f9"
-WEIMOB_LOGIN_URL = "https://xapi.weimob.com/fe/mapi/user/loginX"
+WEIMOB_LOGIN_URL = (os.environ.get("QH_WEIMOB_URL")
+                    or "https://xapi.weimob.com/fe/mapi/user/loginX")
 WEIMOB_CID = "176205957"
 WEIMOB_BOS_ID = "4020112618957"
 WEIMOB_VID = "6013753979957"
@@ -97,7 +101,117 @@ def write_token_cache(cache):
         with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
     except Exception as exc:
-        print(f"  [缓存] 写入失败: {exc}")
+        print(f"   ⚠️ [缓存] 写入失败: {exc}")
+
+
+def ckey(server, ref):
+    return f"{server}|{ref}"
+
+
+def load_cache_entry(server, ref, raw):
+    cache = read_token_cache()
+    key = ckey(server, ref)
+    entry = cache.get(key)
+    if isinstance(entry, dict) and entry.get("wid") and entry.get("openId"):
+        return entry
+    for legacy in (ref, f"{server}@{ref}", str(raw).strip()):
+        if not legacy:
+            continue
+        old = cache.get(legacy)
+        if isinstance(old, dict) and old.get("wid") and old.get("openId"):
+            cache[key] = dict(old)
+            cache.pop(legacy, None)
+            write_token_cache(cache)
+            print("   🗂️ [缓存] 已将旧缓存键迁移为「地址|标识」")
+            return cache[key]
+    return None
+
+
+def save_cache_entry(server, ref, wid, open_id):
+    cache = read_token_cache()
+    cache[ckey(server, ref)] = {"wid": wid, "openId": open_id, "updatedAt": now_text()}
+    write_token_cache(cache)
+
+
+def drop_cache_entry(server, ref):
+    cache = read_token_cache()
+    cache.pop(ckey(server, ref), None)
+    write_token_cache(cache)
+
+
+# ============ 通用工具 ============
+BOX_WIDTH = 48
+BOX_INNER = 46
+_VARIATION = 0xFE0F, 0xFE0E, 0x200D
+
+
+def now_text():
+    from datetime import datetime
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def to_int(value, default=0):
+    try:
+        return int(float(str(value).strip()))
+    except Exception:
+        return default
+
+
+def mask(value):
+    value = str(value or "")
+    if len(value) <= 4:
+        return "***"
+    if len(value) <= 10:
+        return f"{value[:2]}***{value[-2:]}"
+    return f"{value[:5]}***{value[-3:]}"
+
+
+def brief(value, limit=90):
+    text = str(value or "").replace("\n", " ")
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _disp_width(value):
+    width = 0
+    for ch in str(value):
+        if ord(ch) in _VARIATION:
+            continue
+        width += 2 if ord(ch) > 0xFF else 1
+    return width
+
+
+def _box_pad(value, width):
+    value = str(value)
+    while _disp_width(value) > width:
+        value = value[:-1]
+    return value + " " * max(0, width - _disp_width(value))
+
+
+def box_top(title):
+    print()
+    print("╔" + "═" * BOX_WIDTH + "╗")
+    print("║  " + _box_pad(title, BOX_INNER) + "║")
+
+
+def box_line(label, value):
+    print("║  " + _box_pad(f"{label}: {value}", BOX_INNER) + "║")
+
+
+def box_bottom():
+    print("╚" + "═" * BOX_WIDTH + "╝")
+
+
+def account_frame(index, total, title, source):
+    print()
+    print("┌" + "─" * BOX_WIDTH + "┐")
+    print("│  " + _box_pad(f"🧩 账号 {index} / {total}　{title}", BOX_INNER) + "│")
+    print("│  " + _box_pad(f"🔗 来源: {source}", BOX_INNER) + "│")
+    print("└" + "─" * BOX_WIDTH + "┘")
+
+
+def hr():
+    print()
+    print("-" * BOX_WIDTH)
 
 
 # ============ YYB Go 解析 ============
@@ -108,16 +222,25 @@ def parse_yyb_servers():
     return servers
 
 
+def parse_entry(raw):
+    """解析 地址@标识[#备注] → (地址, 标识, 备注)"""
+    value = str(raw or "").strip()
+    if not value or "@" not in value:
+        return "", "", ""
+    note = ""
+    hash_pos = value.rfind("#")
+    at_pos = value.rfind("@")
+    if hash_pos > at_pos:
+        note = value[hash_pos + 1:].strip()
+        value = value[:hash_pos].strip()
+    at_pos = value.rfind("@")
+    server = re.sub(r"^https?://", "", value[:at_pos].strip()).rstrip("/")
+    ref = value[at_pos + 1:].strip()
+    return server, ref, note
+
+
 def parse_yyb_entry(raw):
-    raw = raw.strip()
-    at_idx = raw.index("@")
-    server = raw[:at_idx].strip()
-    ref = raw[at_idx + 1:].strip()
-    if server.startswith("http://"):
-        server = server[7:]
-    elif server.startswith("https://"):
-        server = server[8:]
-    server = server.rstrip("/")
+    server, ref, _ = parse_entry(raw)
     return server, ref
 
 
@@ -134,7 +257,7 @@ def get_wx_code(server_entry):
         )
         data = resp.json()
         code = (((data.get("data") or {}).get("result") or {}).get("code"))
-        if data.get("code") == 0 and code:
+        if to_int(data.get("code")) == 0 and code:
             return code
         else:
             raise RuntimeError(f"YYB Go 返回异常：{str(data)[:200]}")
@@ -282,7 +405,7 @@ class TomatoClient:
                 raise RuntimeError(f"接口返回非 JSON 数据：{response.text[:200]}") from exc
 
             msg = str(result.get("msg", ""))
-            if result.get("code") == 200:
+            if to_int(result.get("code")) == 200:
                 return result
             if attempt < retry and (
                 response.status_code == 429 or "频繁" in msg or "稍后" in msg
@@ -390,8 +513,16 @@ def home_line(data, prefix="当前状态"):
 
 # ============ 主流程 ============
 
+def verify_identity(wid, open_id):
+    """只读校验：换 token + 拉一次首页，不跑任何任务"""
+    client = TomatoClient(wid, open_id)
+    data = client.login()
+    home = client.home()
+    return {"nick": data.get("nickName") or "未设置昵称", "home": home}
+
+
 def process_user(wid, open_id, index):
-    logs = [f"账号{index}（wid={wid}，openId={short_open_id(open_id)}）"]
+    logs = []
     client = TomatoClient(wid, open_id)
 
     login_data = client.login()
@@ -489,93 +620,213 @@ def process_user(wid, open_id, index):
 
     logs.append(home_line(home, "最终状态"))
     logs.append(f"本次完成任务 {completed} 个，跳过 {skipped} 个")
-    return logs
+    stats = {
+        "completed": completed,
+        "skipped": skipped,
+        "energy": to_int(home.get("energyBalance")),
+        "tomato": to_int(home.get("tomatoBalance")),
+        "stage": str(home.get("stageName") or "未知阶段"),
+    }
+    return True, logs, stats
 
 
 def render_report(all_logs):
     lines = ["统一茄皇五期"]
     for logs in all_logs:
-        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("-----------------------------------------------")
         lines.extend(logs)
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("-----------------------------------------------")
     return "\n".join(lines)
 
 
+def build_notify(results):
+    success_count = sum(1 for item in results if item["success"])
+    fail_count = len(results) - success_count
+    content = f"""🍅 统一快乐星球茄皇（五期）任务结果
+
+-----------------------------------------------
+🏁 总结：{success_count} 成功 / {fail_count} 失败
+🕒 时间：{now_text()}
+-----------------------------------------------
+"""
+    for item in results:
+        icon = "✅" if item["success"] else "❌"
+        content += f"""
+🧩 账号 {item['index']} · {item['name']}
+🌐 来源：{item['server']}
+🔐 身份：wid={mask(item['wid']) or '-'} openId={item['openId']}
+📋 任务：完成 {item['completed']} 个，跳过 {item['skipped']} 个
+🍅 状态：能量 {item['energy']}，番茄 {item['tomato']}，{item['stage']}
+{icon} 结果：{"成功" if item["success"] else "失败"}
+"""
+        if not item["success"]:
+            content += f"❌ 原因：{item['error']}\n"
+        content += "-----------------------------------------------\n"
+    return content
+
+
 def safe_send(title, message):
-    if send is None:
+    if send is None or not NOTIFY_ENABLED:
         return
     try:
         send(title, message)
     except Exception as exc:
-        print(f"通知发送失败（不影响脚本执行结果）：{exc}")
+        print(f"   ❌ [通知] 发送失败（不影响脚本执行结果）：{brief(exc)}")
 
 
 def main():
-    servers = parse_yyb_servers()
     if CRYPTO_BACKEND is None:
-        message = "缺少加密依赖，请安装 cryptography：pip install cryptography"
-        print(message)
-        safe_send("统一茄皇五期", message)
+        print("❌ 缺少加密依赖，请安装：pip install cryptography")
+        safe_send("统一茄皇五期", "缺少加密依赖，请安装 cryptography")
         return
+
+    servers = parse_yyb_servers()
     if not servers:
-        message = "没有可用账号：未读取到 YYB_SERVER 环境变量"
-        print(message)
-        safe_send("统一茄皇五期", message)
-        return
+        print("❌ 未配置环境变量 YYB_SERVER（格式：地址@微信账号标识[#备注]，多账号换行分隔）")
+        return []
 
-    print(f"✅ 读取到 {len(servers)} 个 YYB Go 账号")
+    box_top("🍅 统一快乐星球茄皇（五期）")
+    box_line("🕒 启动时间", now_text())
+    box_line("🔢 账号数量", f"{len(servers)} 个")
+    box_line("💾 缓存", "qh_token_cache.json")
+    box_bottom()
 
-    all_logs = []
-    cache = read_token_cache()
-    for index, server_entry in enumerate(servers, 1):
+    results = []
+
+    for index, entry in enumerate(servers, 1):
+        server_addr, ref, note = parse_entry(entry)
+        title = f"标识 {ref}" + (f"（{note}）" if note else "")
+        account_frame(index, total=len(servers), title=title, source=entry)
+
+        item = {
+            "index": index,
+            "server": entry,
+            "name": title,
+            "success": False,
+            "wid": "",
+            "openId": "",
+            "completed": 0,
+            "skipped": 0,
+            "energy": 0,
+            "tomato": 0,
+            "stage": "-",
+            "error": "",
+        }
+
+        if not server_addr or not ref:
+            item["error"] = "账号格式无效"
+            print(f"   ❌ [账号] 第 {index} 行格式无效：{brief(entry)}")
+            results.append(item)
+            hr()
+            continue
+
         wid = ""
         open_id = ""
-        print(f"\n===== 开始处理账号 {index} =====")
-        try:
-            _, ref = parse_yyb_entry(server_entry)
-            used_cache = False
-            cached = cache.get(ref) or {}
-            if cached.get("wid") and cached.get("openId"):
-                wid = cached["wid"]
-                open_id = cached["openId"]
-                used_cache = True
-                print(f"  [缓存] 使用缓存身份: wid={wid}, openId={short_open_id(open_id)}")
+        verified = False
+
+        for attempt in range(2):
+            if attempt == 0:
+                cached = load_cache_entry(server_addr, ref, entry)
+                if cached:
+                    wid = str(cached.get("wid") or "")
+                    open_id = str(cached.get("openId") or "")
+                    print(f"   💾 [缓存] 复用已保存身份（wid={mask(wid)}，openId={short_open_id(open_id)}）")
+                    try:
+                        info = verify_identity(wid, open_id)
+                        print(f"   ✅ [校验] 登录态有效（{info['nick']}）")
+                        _, logs, stats = process_user(wid, open_id, index)
+                        verified = True
+                        break
+                    except Exception as exc:
+                        msg = str(exc)
+                        print(f"   ♻️ [缓存] 身份校验失败：{brief(msg, 60)}，重新登录")
+                        drop_cache_entry(server_addr, ref)
+                        wid, open_id = "", ""
 
             if not wid:
-                wid, open_id = resolve_identity(server_entry)
-                cache = read_token_cache()
-                cache[ref] = {"wid": wid, "openId": open_id}
-                write_token_cache(cache)
-                print(f"  登录成功：wid={wid}，openId={short_open_id(open_id)}")
+                if attempt == 1:
+                    print("   ♻️ [登录] 重新登录后再试一次")
+                try:
+                    print("   🔐 [登录] 通过微盟登录换取身份")
+                    wid, open_id = resolve_identity(entry)
+                except Exception as exc:
+                    item["error"] = f"登录失败：{brief(exc)}"
+                    print(f"   ❌ [登录] {item['error']}")
+                    break
+                save_cache_entry(server_addr, ref, wid, open_id)
+                print(f"   ✅ [登录] 登录成功（wid={mask(wid)}，openId={short_open_id(open_id)}）")
+                try:
+                    info = verify_identity(wid, open_id)
+                    print(f"   ✅ [校验] 登录态有效（{info['nick']}）")
+                except Exception as exc:
+                    print(f"   ⚠️ [校验] 只读校验未通过：{brief(exc, 60)}（继续尝试任务）")
+                try:
+                    _, logs, stats = process_user(wid, open_id, index)
+                    verified = True
+                    break
+                except Exception as exc:
+                    if attempt == 0:
+                        print(f"   ♻️ [校验] 新身份执行失败：{brief(exc, 60)}，清理缓存后重登一次")
+                        drop_cache_entry(server_addr, ref)
+                        wid, open_id = "", ""
+                        continue
+                    item["error"] = f"执行失败：{brief(exc)}"
+                    print(f"   ❌ [账号] {item['error']}")
+                    break
+        else:
+            item["error"] = item["error"] or "多次重试后仍失败"
 
-            try:
-                logs = process_user(wid, open_id, index)
-            except Exception:
-                if used_cache:
-                    print("  [重登] 缓存身份失效，重新登录...")
-                    cache = read_token_cache()
-                    if ref in cache:
-                        del cache[ref]
-                        write_token_cache(cache)
-                    wid, open_id = resolve_identity(server_entry)
-                    cache = read_token_cache()
-                    cache[ref] = {"wid": wid, "openId": open_id}
-                    write_token_cache(cache)
-                    logs = process_user(wid, open_id, index)
-                else:
-                    raise
-        except Exception as exc:
-            logs = [
-                f"账号{index}（wid={wid}，openId={short_open_id(open_id) or '-'}）",
-                f"处理失败：{exc}",
-            ]
-        all_logs.append(logs)
-        print("\n".join(logs))
+        if not verified:
+            item["error"] = item["error"] or "多次重试后仍失败"
+            results.append(item)
+            hr()
+            continue
+
+        item["wid"] = str(wid)
+        item["openId"] = short_open_id(open_id)
+        item["success"] = True
+        item["completed"] = stats.get("completed", 0)
+        item["skipped"] = stats.get("skipped", 0)
+        item["energy"] = stats.get("energy", 0)
+        item["tomato"] = stats.get("tomato", 0)
+        item["stage"] = stats.get("stage", "-")
+
+        for line in logs:
+            print(f"   {line}")
+        print("   ✅ [完成] 该账号任务执行完成")
+        results.append(item)
+        hr()
         if index < len(servers):
-            time.sleep(random.uniform(3, 5))
+            print("   ⏳ 等待2秒后执行下一个账号...")
+            time.sleep(2)
 
-    report = render_report(all_logs)
-    safe_send("统一茄皇五期", report)
+    # 明细
+    print()
+    for item in results:
+        icon = "✅" if item["success"] else "❌"
+        print(f"{icon} 【账号 {item['index']} · {item['server']}】")
+        print(f"   🔐 [身份] wid={mask(item['wid']) or '-'} / {item['openId'] or '-'}")
+        print(f"   📋 [任务] 完成 {item['completed']} 个，跳过 {item['skipped']} 个")
+        print(f"   🍅 [状态] 能量 {item['energy']}，番茄 {item['tomato']}，{item['stage']}")
+        if not item["success"]:
+            print(f"   ⚠️ [失败] {item['error'] or '未知错误'}")
+
+    success_count = sum(1 for item in results if item["success"])
+    fail_count = len(results) - success_count
+
+    box_top("🏁 统一茄皇五期 执行汇总")
+    box_line("📊 执行结果", f"成功 {success_count} / 失败 {fail_count} / 共 {len(results)}")
+    box_line("🍅 番茄合计", sum(item["tomato"] for item in results))
+    box_line("🕒 结束时间", now_text())
+    box_bottom()
+
+    if NOTIFY_ENABLED:
+        safe_send("统一茄皇五期", build_notify(results))
+        print("   📮 [通知] 已提交青龙 notify" if send else "   ℹ️ [通知] 未找到青龙 notify.py")
+    else:
+        print("   ℹ️ [通知] QH_NOTIFY=0，已关闭通知")
+
+    return results
 
 
 if __name__ == "__main__":
