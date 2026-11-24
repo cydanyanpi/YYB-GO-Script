@@ -17,6 +17,10 @@
  * - YYB_API_KEY / YYB_PROTOCOL_TOKEN 可选，启用协议鉴权时配置
  * - RQSP_NOTIFY                      默认 1；0=关闭青龙 notify.py 汇总通知
  * - RQSP_GAME_ROUNDS                 默认 2；玩游戏任务未完成时最多打几局（1-3）
+ * - RQSP_LOTTERY                     默认 1；0=跳过每日免费抽奖
+ * - RQSP_LOTTERY_CHANCE_PATH         查询抽奖次数接口路径（需抓包，如 /activity/xxx/chance）
+ * - RQSP_LOTTERY_DRAW_PATH           执行抽奖接口路径（需抓包，如 /activity/xxx/draw）
+ * - RQSP_LOTTERY_DRAW_BODY           抽奖请求体 JSON（默认 {}）
  *
  * 缓存：脚本目录 token_caches/rqsp_token_cache.json，按 地址|标识 隔离，不设固定过期；
  *       每次运行先用 /auth/user/current 验证，有效直接复用；
@@ -31,7 +35,12 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const MINI_APP_ID = 'wx21b71db59d93bd6d';
-const API_BASE = 'https://foodhall-prod-api.nissinfoodium.com.cn/miniapp';
+const API_BASE = (process.env.RQSP_API_BASE || 'https://foodhall-prod-api.nissinfoodium.com.cn/miniapp').replace(/\/+$/, '');
+// 幸运九宫格抽奖（抓包自小程序，路径相对 /miniapp）
+const LOTTERY_INFO_PATH = '/activity/lottery/grid/info';
+const LOTTERY_TIMES_PATH = '/activity/lottery/grid/user/times';
+const LOTTERY_DRAW_PATH = '/activity/lottery/grid';
+const LOTTERY_AWARDS_PATH = '/activity/lottery/grid/awards';
 const PAGE_VERSION = '74';
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ' +
@@ -58,6 +67,44 @@ const AUTH_HINTS = [
 // --------------------------------------------------------------------------- //
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+const PRIZE_TYPE_CN = {
+  PHYSICAL_OBJECT: '实物奖',
+  PHYSICAL: '实物奖',
+  POINTS: '积分',
+  POINT: '积分',
+  COUPON: '优惠券',
+  CASH_COUPON: '代金券',
+  VIRTUAL: '虚拟奖品',
+  CARD: '会员卡',
+  RED_PACKET: '红包',
+  NO_PRIZE: '未中奖',
+};
+
+function prizeTypeText(type) {
+  const key = String(type || '').trim();
+  if (!key) return '';
+  return PRIZE_TYPE_CN[key] || key;
+}
+
+function isPhysicalPrize(type) {
+  const key = String(type || '').trim().toUpperCase();
+  return key === 'PHYSICAL_OBJECT' || key === 'PHYSICAL';
+}
+
+function formatAwardTime(value) {
+  if (value === null || value === undefined || value === '') return '';
+  const n = Number(value);
+  if (Number.isFinite(n) && n > 0) {
+    const ms = n > 1e12 ? n : n * 1000;
+    const d = new Date(ms);
+    if (!Number.isNaN(d.getTime())) {
+      const pad = (x) => String(x).padStart(2, '0');
+      return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+  }
+  return String(value).slice(0, 16);
 }
 
 function nowText() {
@@ -94,6 +141,11 @@ function boxLine(label, value) {
 
 function boxBottom() {
   console.log('╚' + '═'.repeat(BOX_WIDTH) + '╝');
+}
+
+function accountDivider() {
+  console.log('');
+  console.log('-'.repeat(48));
 }
 
 function accountFrame(idx, total, title, source) {
@@ -493,6 +545,7 @@ class Task {
     const config = await this.request({ apiPath: '/game/config' });
     const title = config?.shareTitle || config?.title || '欢乐消消乐';
     const target = pickScore(config);
+    const scoreCap = num(config?.shuzhi?.shangxian);
 
     const before = await this.findGameTask();
     if (before?.complete) {
@@ -514,8 +567,10 @@ class Task {
 
     for (let round = 1; round <= maxRounds; round++) {
       const startAt = Date.now();
+      const rawScore = target * round;
+      const roundScore = scoreCap > 0 ? Math.min(scoreCap, rawScore) : rawScore;
       try {
-        const r = await this.playOneRound(target);
+        const r = await this.playOneRound(roundScore);
         played += 1;
         logOk(`[游戏] 第 ${round} 局完成：成绩 ${r.score} 分，playId=${r.playId}（耗时 ${Math.round((Date.now() - startAt) / 1000)}s）`);
         if (r.endData !== undefined && r.endData !== null && typeof r.endData !== 'object') {
@@ -546,11 +601,142 @@ class Task {
 
     if (!completed) {
       logWarn(`[游戏] 打了 ${played} 局，任务仍显示未完成（可能是后台延迟或需更高成绩，可用 RQSP_GAME_ROUNDS 调整局数）`);
+      try {
+        const raw = await this.getTaskList();
+        const gameTask = (raw || []).find((item) => item?.ruleType === 'PLAY_GAME') || null;
+        if (gameTask) {
+          logInfo(`[游戏] 任务原始字段：${brief(JSON.stringify(gameTask), 160)}`);
+        } else {
+          logInfo('[游戏] 任务列表中未找到 PLAY_GAME 任务项');
+        }
+      } catch (e) {
+        logInfo(`[游戏] 读取任务字段失败：${truncText(e.message || e, 60)}`);
+      }
     }
     return completed
       ? `玩游戏任务已完成（${played} 局 × ${target} 分）`
       : `已打 ${played} 局 × ${target} 分，任务未完成`;
   }
+
+  // ---- 每日免费抽奖 ------------------------------------------------------ //
+  async doLottery() {
+    if (process.env.RQSP_LOTTERY === '0') {
+      logInfo('[抽奖] RQSP_LOTTERY=0，跳过');
+      return '已按配置跳过';
+    }
+
+    // ① 活动信息（拿 activityId / 免费次数上限 / 消耗积分）
+    let info = null;
+    try {
+      info = await this.request({ apiPath: LOTTERY_INFO_PATH });
+    } catch (e) {
+      if (isAuthError(e)) throw e;
+      logWarn(`[抽奖] 查询活动失败：${truncText(e.message || e, 80)}`);
+      return `活动查询失败（${truncText(e.message || e, 40)}）`;
+    }
+    const activityId = info?.id || info?.activityId;
+    if (!activityId) {
+      logWarn('[抽奖] 活动信息里没有 activityId，跳过');
+      return '活动未开启或未取到 activityId，跳过';
+    }
+    const freeDaily = num(info?.userFreeLimitDaily);
+    logInfo(`[抽奖] 活动：${info?.activityName || '幸运九宫格'}　每日免费 ${freeDaily || '未限制'} 次`);
+
+    // ② 今日剩余免费次数
+    let times = null;
+    try {
+      const raw = await this.request({ apiPath: LOTTERY_TIMES_PATH });
+      times = typeof raw === 'number' ? raw : num(raw?.data ?? raw);
+      logInfo(`[抽奖] 今日剩余免费次数：${times === null ? '未知' : times}`);
+    } catch (e) {
+      if (isAuthError(e)) throw e;
+      logWarn(`[抽奖] 查询次数失败：${truncText(e.message || e, 80)}`);
+      return `次数查询失败（${truncText(e.message || e, 40)}）`;
+    }
+    if (times !== null && times <= 0) {
+      logOk('[抽奖] 今日免费次数已用完');
+      return '今日免费次数已用完';
+    }
+
+    // ③ 执行免费抽奖
+    let prizeText = '';
+    try {
+      const draw = await this.request({
+        method: 'POST',
+        apiPath: LOTTERY_DRAW_PATH,
+        data: { activityId, lotteryType: 'FREE' },
+      });
+      const record = draw?.winningRecord || draw?.data?.winningRecord || {};
+      const name = record?.prizeName || record?.prizeTypeName || '';
+      const type = String(record?.prizeType || '');
+      const typeCn = prizeTypeText(type);
+      const noPrize = type === 'NO_PRIZE' || !name || name.includes('谢谢惠顾');
+
+      if (draw?.success === false) {
+        logWarn(`[抽奖] 未成功：${truncText(draw?.message || '接口未返回原因', 60)}`);
+        return `未成功（${truncText(draw?.message || '未知', 30)}）`;
+      }
+
+      if (noPrize) {
+        prizeText = name || '谢谢惠顾（未中奖）';
+        logInfo(`[抽奖] 抽奖完成：${prizeText}`);
+      } else if (isPhysicalPrize(type)) {
+        const endTime = info?.endTime ? formatAwardTime(info.endTime) : '';
+        prizeText = `${name}（实物奖）`;
+        logOk(`[抽奖] 抽奖完成：${prizeText}`);
+        logWarn(`[抽奖] 🎁 这是实物奖，请尽快到小程序「幸运九宫格 - 我的中奖记录」填写收货地址`);
+        if (endTime) logWarn(`[抽奖] 请在活动结束（${endTime}）前填写，逾期视为放弃`);
+        prizeText += endTime
+          ? `｜⚠️ 请到「我的中奖记录」填写收货地址（活动 ${endTime} 截止）`
+          : '｜⚠️ 请到「我的中奖记录」填写收货地址';
+      } else {
+        prizeText = typeCn ? `${name}（${typeCn}）` : name;
+        logOk(`[抽奖] 抽奖完成：${prizeText}`);
+      }
+    } catch (e) {
+      if (isAuthError(e)) throw e;
+      logWarn(`[抽奖] 抽奖失败：${truncText(e.message || e, 80)}`);
+      return `抽奖失败（${truncText(e.message || e, 40)}）`;
+    }
+
+    // ④ 复查剩余次数
+    try {
+      const rawAfter = await this.request({ apiPath: LOTTERY_TIMES_PATH });
+      const after = typeof rawAfter === 'number' ? rawAfter : num(rawAfter?.data ?? rawAfter);
+      if (after !== null) logInfo(`[抽奖] 抽奖后剩余次数：${after}`);
+    } catch (e) {
+      /* 复查失败不影响结果 */
+    }
+
+    return `获得 ${prizeText}`;
+  }
+
+  // ---- 我的中奖记录 ------------------------------------------------------ //
+  async getLotteryRecords(size = 3) {
+    try {
+      const data = await this.request({
+        apiPath: LOTTERY_AWARDS_PATH,
+        params: { pageNum: 1, pageSize: size },
+      });
+      const list = Array.isArray(data) ? data : (data?.list || data?.records || []);
+      if (!list.length) return '暂无记录';
+      return list
+        .slice(0, size)
+        .map((it) => {
+          const name = it.prizeName || it.awardName || it.name || '未知奖品';
+          const tCn = prizeTypeText(it.prizeType);
+          const t = it.createTime || it.awardTime || it.winTime || '';
+          const timeText = t ? formatAwardTime(t) : '';
+          const label = tCn ? `${name}（${tCn}）` : name;
+          return timeText ? `${label} ${timeText}` : label;
+        })
+        .join('；');
+    } catch (e) {
+      if (isAuthError(e)) throw e;
+      return `记录查询失败（${truncText(e.message || e, 30)}）`;
+    }
+  }
+
 }
 
 function pointsText(info) {
@@ -625,6 +811,8 @@ async function runOne(account, idx, total) {
       // ⑤ 签到 + 游戏任务
       const signMsg = await task.doSign();
       const gameMsg = await task.enterGame();
+      const lotteryMsg = await task.doLottery();
+      const recordMsg = await task.getLotteryRecords(2);
       await sleep(800);
 
       const afterSign = await task.getSignInInfo(true);
@@ -639,6 +827,8 @@ async function runOne(account, idx, total) {
           `👤 用户：${[user.nickname || user.name || '', maskPhone(user.mobile)].filter(Boolean).join(' ') || '未返回'}`,
           `📅 签到：${signMsg}`,
           `🎮 游戏：${gameMsg}`,
+          `🎁 抽奖：${lotteryMsg}`,
+          `🏆 记录：${recordMsg}`,
           `💰 积分：${pointsLine}`,
         ],
       };
@@ -742,8 +932,8 @@ sys.exit(2)
     if (!outcome.ok) failed += 1;
     results.push({ idx: i + 1, note: accounts[i].note, ...outcome });
 
+    accountDivider();
     if (i < accounts.length - 1) {
-      console.log('');
       await sleep(2000);
     }
   }
