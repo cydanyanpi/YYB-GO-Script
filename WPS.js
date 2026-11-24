@@ -9,25 +9,63 @@ const SERVERS = (process.env.YYB_SERVER || "")
     .split(/\r?\n/)
     .map(s => s.trim())
     .filter(Boolean);
-if (!SERVERS.length) {
-    console.error("未配置环境变量 YYB_SERVER，请设置后重试（格式：地址@微信账号标识，多行换行）");
-    process.exit(1);
-}
+const NOTIFY_ENABLED = String(process.env.WPS_NOTIFY || "1").trim() !== "0";
 function parseYybGoEntry(rawValue) {
-    const value = String(rawValue || "").trim();
-    if (!value) return { server: "", ref: "" };
-    const atIndex = value.indexOf("@");
-    if (atIndex === -1) {
-        console.log("YYB_SERVER 格式应为 地址@微信账号标识，当前值: " + value);
-        return { server: "", ref: "" };
+    let value = String(rawValue || "").trim();
+    if (!value) return { server: "", ref: "", note: "" };
+    let note = "";
+    const hashIndex = value.lastIndexOf("#");
+    if (hashIndex > value.lastIndexOf("@") && hashIndex !== -1) {
+        note = value.slice(hashIndex + 1).trim();
+        value = value.slice(0, hashIndex).trim();
     }
-    let server = value.slice(0, atIndex).trim();
+    const atIndex = value.lastIndexOf("@");
+    if (atIndex === -1) {
+        console.log("   ❌ [账号] 格式应为 地址@标识[#备注]，当前值: " + value);
+        return { server: "", ref: "", note: "" };
+    }
+    let server = value.slice(0, atIndex).trim().replace(/^https?:\/\//, "").replace(/\/+$/, "");
     const ref = value.slice(atIndex + 1).trim();
-    if (server.startsWith("http://")) server = server.slice(7);
-    else if (server.startsWith("https://")) server = server.slice(8);
-    server = server.replace(/\/+$/, "");
-    if (!server || !ref) return { server: "", ref: "" };
-    return { server, ref };
+    if (!server || !ref) return { server: "", ref: "", note: "" };
+    return { server, ref, note };
+}
+
+const BOX_WIDTH = 48;
+const BOX_INNER = 46;
+const _VARIATION = /[\uFE0F\uFE0E\u200D]/g;
+
+function displayWidth(text) {
+    return String(text).replace(_VARIATION, "").split("").reduce((n, ch) => n + (ch.codePointAt(0) > 0xFF ? 2 : 1), 0);
+}
+
+function padWidth(text, width) {
+    let value = String(text);
+    while (displayWidth(value) > width) value = value.slice(0, -1);
+    return value + " ".repeat(Math.max(0, width - displayWidth(value)));
+}
+
+function boxTop(title) { console.log("\n╔" + "═".repeat(BOX_WIDTH) + "╗"); console.log("║  " + padWidth(title, BOX_INNER) + "║"); }
+function boxLine(label, value) { console.log("║  " + padWidth(label + ": " + value, BOX_INNER) + "║"); }
+function boxBottom() { console.log("╚" + "═".repeat(BOX_WIDTH) + "╝"); }
+function accountFrame(index, total, title, source) {
+    console.log("\n┌" + "─".repeat(BOX_WIDTH) + "┐");
+    console.log("│  " + padWidth("🧩 账号 " + index + " / " + total + "　" + title, BOX_INNER) + "│");
+    console.log("│  " + padWidth("🔗 来源: " + source, BOX_INNER) + "│");
+    console.log("└" + "─".repeat(BOX_WIDTH) + "┘");
+}
+function hr() { console.log("\n" + "-".repeat(BOX_WIDTH)); }
+function toInt(value, fallback = 0) { const n = Number(value); return Number.isFinite(n) ? Math.trunc(n) : fallback; }
+function brief(value, limit = 90) { const text = String(value ?? "").replace(/\n/g, " "); return text.length <= limit ? text : text.slice(0, limit - 1) + "…"; }
+async function captureLogs(fn) {
+    const lines = [];
+    const original = console.log;
+    console.log = (...args) => {
+        const line = args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg))).join(" ");
+        original("   " + line);
+        lines.push(line);
+    };
+    try { await fn(); } finally { console.log = original; }
+    return lines;
 }
 async function getCode(server, appId = MINI_APP_ID) {
     const { server: parsedServer, ref } = parseYybGoEntry(server);
@@ -286,17 +324,34 @@ class Task {
         this.ref = _yyb.ref;
         this.openid = _yyb.ref;
     this.index = userIdx++;
-    const account = parseAccount(raw);
+    this.serverAddr = _yyb.server || "";
+    this.ref = _yyb.ref || "";
+    this.note = _yyb.note || "";
+    const cleanRaw = this.serverAddr && this.ref ? `${this.serverAddr}@${this.ref}` : raw;
+    const account = parseAccount(cleanRaw);
     this.openid = account.openid;
     this.cookies = parseCookie(account.cookie);
     this.secret = account.secret || "";
     this.uid = this.cookies.uid || "";
     this.clockConfig = {};
-    this.cacheKey = this.openid || this.cookies.uid || (account.cookie ? md5(account.cookie).slice(0, 16) : `account_${this.index}`);
+    this.cacheKey = this.serverAddr && this.ref ? `${this.serverAddr}|${this.ref}` : (this.openid || (account.cookie ? md5(account.cookie).slice(0, 16) : `account_${this.index}`));
+    this.loginSource = ""; this.signMsg = "-"; this.nickname = "-"; this.userName = "-"; this.lotteryMsg = "-";
   }
 
   getCached() {
-    return readCache()[this.cacheKey] || {};
+    const cache = readCache();
+    if (cache[this.cacheKey]) return cache[this.cacheKey];
+    const legacyKeys = [this.ref, `${this.serverAddr}@${this.ref}`, this.openid].filter(Boolean);
+    for (const key of legacyKeys) {
+      if (cache[key] && (cache[key].cookie || cache[key].secret)) {
+        cache[this.cacheKey] = { ...cache[key], updatedAt: new Date().toISOString() };
+        delete cache[key];
+        writeCache(cache);
+        console.log("   🗂️ [缓存] 已将旧缓存键迁移为「地址|标识」");
+        return cache[this.cacheKey];
+      }
+    }
+    return {};
   }
 
   saveCache(extra = {}) {
@@ -357,7 +412,10 @@ class Task {
 
   async ensureLogin() {
     this.loadCache();
-    if (this.cookies.kso_sid && this.cookies.wps_sid && this.secret) return;
+    if (this.cookies.kso_sid && this.cookies.wps_sid && this.secret) {
+      this.loginSource = this.loginSource || "缓存";
+      return;
+    }
     await this.login();
   }
 
@@ -376,6 +434,7 @@ class Task {
       console.log(`账号[${this.index}] WPS登录态失效，重新登录`);
       this.removeLogin();
       await this.login();
+      this.loginSource = "重新登录";
       const retry = await wpsRequest(method, url, {
         ...options,
         cookies: this.cookies,
@@ -408,7 +467,8 @@ class Task {
     const data = assertOk(await this.request("POST", "https://account.wps.cn/p/auth/check"), "查询用户信息");
     this.uid = data.userid || data.id || this.uid || this.cookies.uid || "";
     this.saveCache({ nickname: data.nickname || data.username || "" });
-    console.log(`账号[${this.index}] 用户: ${mask(data.nickname || data.username || this.uid)}`);
+    this.nickname = data.nickname || data.username || this.uid || "-";
+    console.log(`账号[${this.index}] 用户: ${mask(this.nickname)}`);
   }
 
   async sign() {
@@ -417,10 +477,12 @@ class Task {
     if (res.result === "ok") {
       const data = res.data || {};
       console.log(`账号[${this.index}] 签到成功: 连续${data.continuous_days ?? data.continuousDays ?? "未知"}天`);
+      this.signMsg = `签到成功，连续${data.continuous_days ?? data.continuousDays ?? "未知"}天`;
       return;
     }
     if (res.msg === "already clocked in today") {
       console.log(`账号[${this.index}] 今日已签到`);
+      this.signMsg = "今日已签到";
       return;
     }
     throw new Error(`签到失败: ${res.msg || JSON.stringify(res)}`);
@@ -584,45 +646,166 @@ class Task {
     const result = res.data;
     if (result?.result === "ok" && result.data?.lottery_v2?.success) {
       const reward = result.data.lottery_v2;
-      console.log(`账号[${this.index}] 抽奖[${index}]成功: ${reward.reward_name || reward.reward_type || JSON.stringify(reward).slice(0, 120)}`);
+      const rewardText = reward.reward_name || reward.reward_type || JSON.stringify(reward).slice(0, 120);
+      console.log(`   🎁 [抽奖] 第 ${index} 次成功：${rewardText}`);
+      if (!this._lotteryRewards) this._lotteryRewards = [];
+      this._lotteryRewards.push(String(rewardText));
       return true;
     }
     const detail = result?.data?.lottery_v2?.error_code ? `错误码${result.data.lottery_v2.error_code}` : result?.msg || JSON.stringify(result);
-    console.log(`账号[${this.index}] 抽奖[${index}]失败: ${detail}`);
+    console.log(`   ⚠️ [抽奖] 第 ${index} 次失败：${brief(detail, 60)}`);
     return false;
   }
 
   async lottery() {
-    const count = await this.lotteryTimes();
-    const limit = Math.min(count, Number(process.env.wps_lottery_limit || 5));
+    this._lotteryRewards = [];
+    let count = 0;
+    try {
+      count = await this.lotteryTimes();
+    } catch (e) {
+      console.log(`   ⚠️ [抽奖] 查询次数失败：${brief(e.message || e, 50)}`);
+    }
+    const limit = Math.min(Number(count) || 0, Number(process.env.wps_lottery_limit || 5));
+    console.log(`   🎁 [抽奖] 今日可抽 ${count} 次（本次最多 ${limit} 次）`);
+    let done = 0;
     for (let i = 1; i <= limit; i++) {
       const ok = await this.tryLotteryOnce(i);
       if (!ok) break;
-      await await sleep(1000, 1800);
+      done += 1;
+      await sleep(1000, 1800);
     }
+    if (limit === 0) this.lotteryMsg = "今日无抽奖次数";
+    else if (done === 0) this.lotteryMsg = "未抽到奖品（首次即失败）";
+    else this.lotteryMsg = `抽 ${done} 次：${this._lotteryRewards.join(" / ")}`;
   }
 
   async run() {
-    console.log(`\n账号[${this.index}] ${mask(this.openid || this.cacheKey)}`);
-    await this.ensureLogin();
-    await this.loadClockConfig();
-    await this.userInfo();
-    await this.clockInfo();
-    await this.sign();
-    await this.browseTasks();
-    await this.lottery();
+    const title = `标识 ${this.ref || this.openid || "-"}` + (this.note ? `（${this.note}）` : "");
+    accountFrame(this.index, SERVERS.length, title, this.server || this.cacheKey);
+    this.logs = [];
+    try {
+      this.logs = await captureLogs(async () => {
+        const hadCache = !!this.getCached().cookie;
+        console.log(hadCache ? "💾 [缓存] 复用已保存的登录 Cookie" : "🆕 [登录] 缓存为空，准备登录");
+        await this.ensureLogin();
+        await this.loadClockConfig();
+        await this.userInfo();
+        console.log("✅ [校验] 登录凭证校验通过（用户信息接口）");
+        console.log(`🔐 [登录] 登录成功（${mask(this.nickname)}，来源${this.loginSource || "新登录"}）`);
+        await this.clockInfo();
+        await this.sign();
+        await this.browseTasks();
+        await this.lottery();
+      });
+      this.success = true;
+      console.log("   ✅ [完成] 该账号任务执行完成");
+    } catch (e) {
+      this.success = false;
+      this.error = brief(e && e.message ? e.message : e);
+      console.log(`   ❌ [账号] 任务执行失败: ${this.error}`);
+    }
+    return this;
   }
 }
 
-!(async () => {
-  
-  if (!SERVERS.length) return;
+async function sendQingLongNotify(title, content) {
+  const candidates = ["/ql/data/scripts/notify.js", "/ql/scripts/notify.js", path.join(__dirname, "notify.js"), path.join(__dirname, "SendNotify.js")];
+  for (const file of candidates) {
+    try {
+      if (!fs.existsSync(file)) continue;
+      const mod = require(file);
+      const fn = (typeof mod === "function" && mod) || mod.sendNotify || mod.send;
+      if (typeof fn === "function") { await fn(title, content); return true; }
+    } catch {}
+  }
+  return false;
+}
+
+function buildNotify(results) {
+  const ok = results.filter((r) => r.success).length;
+  const lines = ["🖥️ WPS 打卡任务结果", "━".repeat(20), `🏁 总结：${ok} 成功 / ${results.length - ok} 失败`, `🕒 时间：${new Date().toLocaleString("zh-CN")}`, "━".repeat(20)];
+  for (const r of results) {
+    lines.push("");
+    lines.push(`${r.success ? "✅" : "❌"} 账号${r.index} ${mask(r.ref || r.openid || "-")}`);
+    lines.push(`🔐 登录：${r.loginSource || "-"}`);
+    lines.push(`👤 用户：${r.nickname || "-"}`);
+    lines.push(`📝 签到：${r.signMsg || "-"}`);
+    lines.push(`🎁 抽奖：${r.lotteryMsg || "-"}`);
+    if (!r.success) lines.push(`⚠️ 原因：${r.error || "未知错误"}`);
+    lines.push("━".repeat(20));
+  }
+  return lines.join("\n");
+}
+
+(async () => {
+  if (!SERVERS.length) {
+    console.log("❌ 未配置环境变量 YYB_SERVER（格式：地址@微信账号标识[#备注]，多账号换行分隔）");
+    return;
+  }
+  const valid = SERVERS.filter((item) => item.includes("@"));
+  if (!valid.length) {
+    console.log("❌ YYB_SERVER 无有效账号（格式：地址@标识[#备注]）");
+    return;
+  }
+  SERVERS.length = 0;
+  SERVERS.push(...valid);
+  userIdx = 1;
+
+  boxTop("🖥️ WPS 每日打卡");
+  boxLine("🕒 启动时间", new Date().toLocaleString("zh-CN"));
+  boxLine("🔢 账号数量", `${SERVERS.length} 个`);
+  boxLine("💾 缓存", "wps_token_cache.json");
+  boxLine("🌐 网络", "直连");
+  boxBottom();
+
+  const results = [];
   for (const account of SERVERS) {
     try {
-      await new Task(account).run();
+      const task = new Task(account);
+      results.push(await task.run());
     } catch (e) {
-      console.log(`账号执行失败: ${e.message || e}`);
+      const entry = parseYybGoEntry(account);
+      console.log(`   ❌ [主程序] ${brief(e && e.message ? e.message : e)}`);
+      results.push({ index: userIdx++, ref: entry.ref, openid: entry.ref, success: false, loginSource: "", nickname: "-", signMsg: "-", error: brief(e && e.message ? e.message : e) });
     }
+    hr();
+    if (results.length < SERVERS.length) {
+      console.log("   ⏳ 等待2秒后执行下一个账号...");
+      await sleep(2000);
+    }
+  }
+
+  console.log("");
+  for (const r of results) {
+    console.log(`${r.success ? "✅" : "❌"} 【账号 ${r.index} · 标识 ${r.ref || r.openid || "-"}】`);
+    console.log(`   🔐 [登录] ${r.loginSource || "-"}`);
+    console.log(`   👤 [用户] ${r.nickname || "-"}`);
+    console.log(`   📝 [签到] ${r.signMsg || "-"}`);
+    console.log(`   🎁 [抽奖] ${r.lotteryMsg || "-"}`);
+    if (!r.success) console.log(`   ⚠️ [失败] ${r.error || "未知错误"}`);
+  }
+
+  const ok = results.filter((r) => r.success).length;
+  boxTop("🏁 WPS 执行汇总");
+  boxLine("📊 执行结果", `成功 ${ok} / 失败 ${results.length - ok} / 共 ${results.length}`);
+  boxLine("🕒 结束时间", new Date().toLocaleString("zh-CN"));
+  boxBottom();
+
+  if (NOTIFY_ENABLED) {
+    const content = buildNotify(results);
+    const sent = await sendQingLongNotify("🖥️ WPS 打卡任务完成", content);
+    console.log(sent ? "   📮 [通知] 已调用青龙 notify" : "   ℹ️ [通知] 未找到青龙 notify 脚本");
+    const token = process.env.PLUSPLUS_TOKEN || "";
+    if (token) {
+      try {
+        await axios.post("http://www.pushplus.plus/send", { token, title: "🖥️ WPS 打卡任务完成", content, template: "txt" }, { timeout: 15000, proxy: false });
+        console.log("   📮 [通知] PushPlus 已推送");
+      } catch (e) {
+        console.log(`   ⚠️ [通知] PushPlus 推送失败: ${brief(e.message)}`);
+      }
+    }
+  } else {
+    console.log("   ℹ️ [通知] WPS_NOTIFY=0，已关闭通知");
   }
 })()
   .catch((e) => console.log(`脚本异常: ${e.message || e}`))
