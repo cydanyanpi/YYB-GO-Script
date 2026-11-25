@@ -1,7 +1,7 @@
 // name: 飞鹤星妈会
 // cron: 8 15,3 * * *
 // 环境变量：FHXMH_GAME=0 关闭闯关；FHXMH_GAME_WAIT_MIN/MAX 随机等待秒（默认30~60）；FHXMH_GAME_LEVEL 指定关卡；
-// FHXMH_GAME_SCORE 固定分数（不设则随机）；FHXMH_GAME_SCORE_MIN/MAX 随机区间（默认300~800）；FHXMH_GAME_PLAYS 默认20；
+// FHXMH_GAME_SCORE 固定分数（不设则随机）；FHXMH_GAME_SCORE_MIN/MAX 随机区间（默认280~320）；FHXMH_GAME_PLAYS 固定局数（不设则5~10随机）；
 // FHXMH_GAME_ACTIVITY_GUID 活动 GUID（默认 jntkxkaa）；FHXMH_NOTIFY=0 关闭青龙/PushPlus 通知
 // 说明：闯关无法真实操作小游戏，脚本按目标分模拟对局并提交成绩（AES 加密与 H5 一致）；分数越高排名越靠前，但异常分值会被后台判定异常并封禁，建议小号先试
 const axios = require("axios");
@@ -198,12 +198,14 @@ const RRX_PCS = process.env.FHXMH_RRX_PCS || "7c9a359609ec215d"; // H5 AES key/i
 const GAME_LEVEL_WANT = Number(process.env.FHXMH_GAME_LEVEL || 0); // 0 = 自动取可玩关卡
 const GAME_WAIT_MIN = Math.max(5, Math.min(300, Number(process.env.FHXMH_GAME_WAIT_MIN || 30))); // 每局随机等待下限
 const GAME_WAIT_MAX = Math.max(GAME_WAIT_MIN, Math.min(300, Number(process.env.FHXMH_GAME_WAIT_MAX || 60))); // 上限
-const GAME_SCORE = Number(process.env.FHXMH_GAME_SCORE || 0); // 0 = targetScore×10（分数越高排名越靠前，可用 FHXMH_GAME_SCORE 直接指定）
+const GAME_SCORE = Number(process.env.FHXMH_GAME_SCORE || 0); // 0 = 每局在 GAME_SCORE_MIN~MAX 间随机（可用 FHXMH_GAME_SCORE 固定指定）
 const GAME_DEBUG = String(process.env.FHXMH_DEBUG ?? "0") === "1";
-const GAME_SCORE_MIN = Math.max(0, Number(process.env.FHXMH_GAME_SCORE_MIN || 300)); // 随机下限，不低于 300
-const GAME_SCORE_MAX = Math.max(GAME_SCORE_MIN, Number(process.env.FHXMH_GAME_SCORE_MAX || 400)); // 随机上限，默认 400
+const GAME_SCORE_MIN = Math.max(0, Number(process.env.FHXMH_GAME_SCORE_MIN || 280)); // 随机下限，默认 280
+const GAME_SCORE_MAX = Math.max(GAME_SCORE_MIN, Number(process.env.FHXMH_GAME_SCORE_MAX || 320)); // 随机上限，默认 320
 const GAME_TOP_SKIP = Math.max(1, Number(process.env.FHXMH_GAME_TOP_SKIP || 5)); // 排名进入前 N 名就不再玩
-const GAME_PLAYS = Math.max(1, Math.min(20, Number(process.env.FHXMH_GAME_PLAYS || 20))); // 默认一次跑满 20 局
+const GAME_PLAYS = Math.max(0, Math.min(20, Number(process.env.FHXMH_GAME_PLAYS || 0))); // 0 = 每次每个账号随机 5~10 局
+const GAME_PLAYS_MIN = Math.max(1, Math.min(20, Number(process.env.FHXMH_GAME_PLAYS_MIN || 5)));
+const GAME_PLAYS_MAX = Math.max(GAME_PLAYS_MIN, Math.min(20, Number(process.env.FHXMH_GAME_PLAYS_MAX || 10)));
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781 MiniProgramEnv/Windows WindowsWechat/WMPF";
 const RRX_INFO = (process.env.FHXMH_RRX_INFO || "https://resinfo.rrx.cn").replace(/\/+$/, "");
@@ -480,13 +482,16 @@ class FeiheMom {
             const played = Number(maxData.playMaxLevel || 0);
             if (Number.isFinite(played) && played >= 100) return { ok: true, skipped: true, text: "100 关已全部通关" };
             let level = GAME_LEVEL_WANT > 0 ? GAME_LEVEL_WANT : Math.max(1, played + 1);
-            console.log(`   🎮 [游戏] 已进入闯关（rrx ${auth.guid.slice(0, 8)}…），从第 ${level} 关开始，本账号今天最多 20 局`);
+            const planPlays = GAME_PLAYS > 0
+                ? GAME_PLAYS
+                : GAME_PLAYS_MIN + Math.floor(Math.random() * (GAME_PLAYS_MAX - GAME_PLAYS_MIN + 1));
+            console.log(`   🎮 [游戏] 已进入闯关（rrx ${auth.guid.slice(0, 8)}…），从第 ${level} 关开始，本次计划 ${planPlays} 局`);
             if (maxData.checkIntegralJoin) console.log("   ℹ️ [游戏] 接口标记需积分校验，按活动规则继续尝试");
             console.log("   ⚠️ [游戏] 脚本为模拟对局提交成绩，活动规则写明异常账号会封禁，风险自担");
 
             const parts = [];
             let passCount = 0, totalAfter = 0;
-            for (let n = 1; n <= GAME_PLAYS; n++) {
+            for (let n = 1; n <= planPlays; n++) {
                 // rrx JWT 有效期很短，多局时定期刷新，避免后半程 401
                 if (n > 1 && (n - 1) % 4 === 0) {
                     try { auth = await this.rrxAuth(); } catch (e) { console.log(`   ⚠️ [游戏] JWT 刷新失败（${brief(e.message, 40)}），继续用旧凭证`); }
@@ -506,7 +511,7 @@ class FeiheMom {
                     break;
                 }
             }
-            const summary = `计划 ${GAME_PLAYS} 局，成功 ${passCount} 局${totalAfter ? `，总分 ${totalAfter}` : ""}`;
+            const summary = `计划 ${planPlays} 局，成功 ${passCount} 局${totalAfter ? `，总分 ${totalAfter}` : ""}`;
             return { ok: true, text: `${summary}｜${parts.join("；")}` };
         } catch (e) {
             const msg = e && e.message ? e.message : String(e);
@@ -743,6 +748,8 @@ function deltaText(before, after) {
     boxLine("🕒 启动时间", new Date().toLocaleString("zh-CN"));
     boxLine("🔢 账号数量", `${SERVERS.length} 个`);
     boxLine("💾 缓存", "fhxmh_token_cache.json");
+    boxLine("🎮 分数", GAME_ON ? (GAME_SCORE > 0 ? `固定 ${GAME_SCORE}` : `${GAME_SCORE_MIN}~${GAME_SCORE_MAX} 随机/局`) : "已关闭");
+    boxLine("🎮 局数", GAME_ON ? (GAME_PLAYS > 0 ? `固定 ${GAME_PLAYS} 局/账号` : `${GAME_PLAYS_MIN}~${GAME_PLAYS_MAX} 局随机/账号`) : "已关闭");
     boxLine("🌐 网络", process.env.FHXMH_PROXY_API ? "代理" : "直连");
     boxBottom();
 
