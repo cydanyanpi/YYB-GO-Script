@@ -192,14 +192,30 @@ def _find_value(obj, keys):
     return None
 
 
+def _parse_json_text(value):
+    """部分接口把 data 再序列化成字符串，这里拆一层"""
+    if isinstance(value, str):
+        text = value.strip()
+        if text[:1] in ("{", "["):
+            try:
+                return json.loads(text)
+            except Exception:
+                return value
+    return value
+
+
 def find_drops(payload):
     """返回剩余水滴；找不到返回 None"""
+    if isinstance(payload, str):
+        payload = _parse_json_text(payload)
     if not isinstance(payload, dict):
         return None
-    forest = payload.get("data", payload)
+    forest = _parse_json_text(payload.get("data", payload))
     found = _find_value(forest, DROP_KEYS)
-    if found is None and isinstance(forest, (dict, list)):
+    if found is None:
         found = _find_value(payload, DROP_KEYS)
+        if found is None:
+            found = _find_value(_parse_json_text(payload.get("data")), DROP_KEYS)
     return found
 
 
@@ -673,6 +689,12 @@ class WnnTask:
             return
         self.drops = drops
         self.drops_known = True
+        if drops == 0:
+            try:
+                raw_text = json.dumps(data, ensure_ascii=False)
+            except Exception:
+                raw_text = str(data)
+            log(f"   🔍 [核查] 水滴为 0，getZgForest 原始返回：{brief(raw_text, 300)}")
         times = drops // 10
         if times <= 0:
             log(f"   ⚠️ [浇水] 水滴不足（{drops}g），跳过")
