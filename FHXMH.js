@@ -201,7 +201,8 @@ const GAME_WAIT_MAX = Math.max(GAME_WAIT_MIN, Math.min(300, Number(process.env.F
 const GAME_SCORE = Number(process.env.FHXMH_GAME_SCORE || 0); // 0 = targetScore×10（分数越高排名越靠前，可用 FHXMH_GAME_SCORE 直接指定）
 const GAME_DEBUG = String(process.env.FHXMH_DEBUG ?? "0") === "1";
 const GAME_SCORE_MIN = Math.max(0, Number(process.env.FHXMH_GAME_SCORE_MIN || 300)); // 随机下限，不低于 300
-const GAME_SCORE_MAX = Math.max(GAME_SCORE_MIN, Number(process.env.FHXMH_GAME_SCORE_MAX || 800)); // 随机上限
+const GAME_SCORE_MAX = Math.max(GAME_SCORE_MIN, Number(process.env.FHXMH_GAME_SCORE_MAX || 400)); // 随机上限，默认 400
+const GAME_TOP_SKIP = Math.max(1, Number(process.env.FHXMH_GAME_TOP_SKIP || 5)); // 排名进入前 N 名就不再玩
 const GAME_PLAYS = Math.max(1, Math.min(20, Number(process.env.FHXMH_GAME_PLAYS || 20))); // 默认一次跑满 20 局
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781 MiniProgramEnv/Windows WindowsWechat/WMPF";
@@ -434,6 +435,29 @@ class FeiheMom {
         return `channel=${RRX_CHANNEL}&mallGuid=${RRX_MALL}&wsiteGuid=${RRX_SITE}`;
     }
 
+    /** 排行榜：myself.rankNum 即当前名次；上游偶发 503，重试 3 次 */
+    async getRankInfo(auth) {
+        const url = `${RRX_GAME_BASE}/getRankList?${this.rrxQuery()}&activityGuid=${RRX_ACT}&activityType=702`;
+        for (let i = 0; i < 3; i++) {
+            const res = await axios.get(url, { headers: auth.headers, proxy: false, validateStatus: () => true, timeout: 20000 });
+            const body = res.data || {};
+            if (res.status === 200 && body.result === 0) {
+                const d = body.data || {};
+                const me = d.myself || {};
+                return {
+                    rank: Number(me.rankNum || 0),
+                    totalScore: Number(me.totalScore || 0),
+                    playCount: Number(me.playCount || 0),
+                    isCheat: String(me.isCheat || "0"),
+                    total: Array.isArray(d.list) ? d.list.length : 0,
+                };
+            }
+            if (i < 2) await sleep(3000);
+        }
+        console.log("   ⚠️ [游戏] 排行榜查询失败，按未上榜处理");
+        return { rank: 0, totalScore: 0, playCount: 0, isCheat: "0", total: 0 };
+    }
+
     /** 鹤小飞超级大闯关：取 JWT → 查可玩关卡 → 开局 → 提交成绩 → 领奖机会 */
     async playGame(profile) {
         if (!GAME_ON) {
@@ -446,6 +470,13 @@ class FeiheMom {
             const maxRes = await axios.get(`${RRX_GAME_BASE}/getPlayMaxLevel?${q}&activityGuid=${RRX_ACT}`, { headers: auth.headers, proxy: false, validateStatus: () => true, timeout: 25000 });
             const maxData = maxRes.data?.data || {};
             if (maxRes.data?.result !== 0) throw new Error(`查询关卡失败：${brief(maxRes.data?.msg || `HTTP ${maxRes.status}`, 60)}`);
+            const rank = await this.getRankInfo(auth);
+            if (rank.rank > 0) {
+                console.log(`   🏅 [游戏] 当前排名第 ${rank.rank}${rank.totalScore ? `，总分 ${rank.totalScore}` : ""}，已玩 ${rank.playCount} 局`);
+            }
+            if (rank.rank > 0 && rank.rank <= GAME_TOP_SKIP) {
+                return { ok: true, skipped: true, text: `已在前 ${GAME_TOP_SKIP} 名（第 ${rank.rank}），不再提交` };
+            }
             const played = Number(maxData.playMaxLevel || 0);
             if (Number.isFinite(played) && played >= 100) return { ok: true, skipped: true, text: "100 关已全部通关" };
             let level = GAME_LEVEL_WANT > 0 ? GAME_LEVEL_WANT : Math.max(1, played + 1);
@@ -467,10 +498,13 @@ class FeiheMom {
                 }
                 parts.push(one.text);
                 totalAfter = one.totalAfter || totalAfter;
-                if (one.pass) {
-                    passCount++;
-                    level = one.nextLevel > level ? one.nextLevel : level + 1;
-                } else break;
+                if (!one.pass) break;
+                passCount++;
+                level = one.nextLevel > level ? one.nextLevel : level + 1;
+                if (one.rank > 0 && one.rank <= GAME_TOP_SKIP) {
+                    parts.push(`已升至第 ${one.rank} 名，停止后续局数`);
+                    break;
+                }
             }
             const summary = `计划 ${GAME_PLAYS} 局，成功 ${passCount} 局${totalAfter ? `，总分 ${totalAfter}` : ""}`;
             return { ok: true, text: `${summary}｜${parts.join("；")}` };
@@ -493,8 +527,11 @@ class FeiheMom {
         }
         const need = Number(sd.targetScore || 60);
         const floor = Math.max(need, GAME_SCORE_MIN);
-        const ceil = Math.max(floor, GAME_SCORE_MAX);
-        const target = GAME_SCORE > 0 ? Math.max(GAME_SCORE, floor) : floor + Math.floor(Math.random() * (ceil - floor + 1));
+        if (floor > 400) return { ok: false, error: `第 ${level} 关目标分 ${need} 超过 400 上限，按配置跳过` };
+        const ceil = Math.min(400, Math.max(floor, GAME_SCORE_MAX));
+        const target = GAME_SCORE > 0
+            ? Math.min(400, Math.max(GAME_SCORE, floor))
+            : floor + Math.floor(Math.random() * (ceil - floor + 1));
         const totalBefore = Number(sd.myRecord?.totalScore || 0);
         console.log(`   🎮 [游戏] 第 ${level} 关开局，目标 ${need} 分，本局提交 ${target}，累计 ${totalBefore}`);
         const waitSec = GAME_WAIT_MIN + Math.floor(Math.random() * (GAME_WAIT_MAX - GAME_WAIT_MIN + 1));
@@ -546,6 +583,7 @@ class FeiheMom {
             pass,
             totalAfter,
             nextLevel: Number(d.currentLevel || 0),
+            rank: Number(d.ranking || 0),
             text: pass
                 ? `第${level}关通关（${Number(d.lastScore || target)}分）${delta > 0 ? `，总分 ${totalBefore}→${totalAfter}（+${delta}）` : `，总分 ${totalAfter}`}${rankText}`
                 : `第${level}关未通关（${Number(d.lastScore || target)}/${need}分）${rankText}`,
