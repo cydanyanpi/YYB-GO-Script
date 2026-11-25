@@ -23,9 +23,6 @@ import random
 import hashlib
 import time
 from datetime import datetime
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import unpad
-import binascii
 from typing import List, Dict, Any, Optional, Tuple
 
 # 强制全局禁用所有系统代理环境变量
@@ -61,18 +58,13 @@ if env_YYB_SERVER:
     raw_lines = env_YYB_SERVER.splitlines()
     SERVERS = [line.strip() for line in raw_lines if line.strip()]
 
-# 无有效地址直接退出
-if len(SERVERS) == 0:
-    print("❌ 未配置环境变量 YYB_SERVER")
-    print("格式：yyb-go:8000@账号ID或OpenID，多账号换行分隔")
-    print("示例：yyb-go:8000@1")
-    sys.exit(1)
-
-    print(f"✅ [系统] 读取到 {len(SERVERS)} 个 YYB Go 账号")
-print("-" * 60 + "\n")
+# 账号校验放到 main() 里做，避免模块级打印破坏日志版式
 
 # PushPlus 通知Token（环境变量，可选）
-PLUSPLUS_TOKEN = os.getenv("PLUSPLUS_TOKEN", "")
+PLUSPLUS_TOKEN = (os.getenv("PLUSPLUS_TOKEN") or os.getenv("PUSHPLUS_TOKEN")
+                  or os.getenv("PUSH_PLUS_TOKEN") or "").strip()
+# 通知总开关：JTC_NOTIFY=0 关闭青龙 notify.py + PushPlus
+NOTIFY_ENABLED = os.getenv("JTC_NOTIFY", "1").strip() != "0"
 
 # 品赞代理配置（环境变量，可选）
 PROXY_API = os.getenv("PROXY_API", "")
@@ -117,59 +109,114 @@ def sleep(ms: int) -> asyncio.Future:
 def random_int(min_val: int, max_val: int) -> int:
     return random.randint(min_val, max_val)
 
+
+def to_number(value, default=-1):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
 def get_ua() -> str:
     return random.choice(USER_AGENT_LIST)
 
+def _display_width(text):
+    width = 0
+    for ch in str(text):
+        code = ord(ch)
+        if code in (0xfe0f, 0xfe0e, 0x200d):
+            continue
+        width += 2 if code > 0xff else 1
+    return width
+
+
 def _pad(text, width):
-    """按显示宽度补空格（中文占2宽度）"""
     text = str(text)
-    w = 0
-    for ch in text:
-        w += 2 if ord(ch) > 127 else 1
-    return text + " " * max(0, width - w)
+    while _display_width(text) > width:
+        text = text[:-1]
+    return text + " " * max(0, width - _display_width(text))
+
+_LOCATION_CACHE: Optional[Tuple[float, float]] = None
+
+
+def brief_error(value, limit=60):
+    text = str(value or "").replace("\n", " ")
+    return text[: limit - 1] + "…" if len(text) > limit else text
+
 
 def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def log_title():
-    print()
-    print("╔" + "=" * 50 + "╗")
-    print("║  " + _pad("🅿️ 捷停车 每日任务", 46) + "║")
-    print("║  " + _pad(f"🕒 启动时间: {now_text()}", 46) + "║")
-    print("║  " + _pad(f"🔢 账号数量: {len(SERVERS)}", 46) + "║")
-    print("╚" + "=" * 50 + "╝")
+def mask(value):
+    value = str(value or "")
+    if len(value) <= 4:
+        return "***"
+    if len(value) <= 10:
+        return f"{value[:2]}***{value[-2:]}"
+    return f"{value[:5]}***{value[-3:]}"
 
-def log_account_header(index, total, server):
+BOX_WIDTH = 48
+BOX_INNER = 46
+
+def box_top(title):
     print()
-    print("┌" + "-" * 50 + "┐")
-    print("│  " + _pad(f"🧩 账号 {index} / {total}", 46) + "│")
-    _, ref = parse_yyb_go_entry(server)
-    print("│  " + _pad(f"🔑 标识: {ref or server}", 46) + "│")
-    print("└" + "-" * 50 + "┘")
+    print("╔" + "═" * BOX_WIDTH + "╗")
+    print("║  " + _pad(title, BOX_INNER) + "║")
+
+def box_line(label, value):
+    print("║  " + _pad(f"{label}: {value}", BOX_INNER) + "║")
+
+def box_bottom():
+    print("╚" + "═" * BOX_WIDTH + "╝")
+
+def account_frame(index, total, title, source):
+    print()
+    print("┌" + "─" * BOX_WIDTH + "┐")
+    print("│  " + _pad(f"🧩 账号 {index} / {total}　{title}", BOX_INNER) + "│")
+    print("│  " + _pad(f"🔗 来源: {source}", BOX_INNER) + "│")
+    print("└" + "─" * BOX_WIDTH + "┘")
+
+def hr():
+    print()
+    print("-" * BOX_WIDTH)
+
+def log_title():
+    box_top("🅿️ 捷停车 每日任务")
+    box_line("🕒 启动时间", now_text())
+    box_line("🔢 账号数量", f"{len(SERVERS)} 个")
+    box_line("💾 缓存", "token_caches/jtc_token_cache.json")
+    box_line("🌐 代理", "品赞代理" if PROXY_API else "直连")
+    box_bottom()
 
 def log_footer(success_count, fail_count, total_reward):
-    print()
-    print("╔" + "=" * 50 + "╗")
-    print("║  " + _pad("🏁 捷停车任务执行完成", 46) + "║")
-    print("║  " + _pad(f"✅ 成功: {success_count}", 46) + "║")
-    print("║  " + _pad(f"❌ 失败: {fail_count}", 46) + "║")
-    print("║  " + _pad(f"💰 今日总获得: {total_reward}捷停币", 46) + "║")
-    print("║  " + _pad(f"🕒 结束时间: {now_text()}", 46) + "║")
-    print("╚" + "=" * 50 + "╝")
+    box_top("🏁 捷停车 执行汇总")
+    box_line("📊 执行结果", f"成功 {success_count} / 失败 {fail_count} / 共 {len(SERVERS)}")
+    box_line("🎯 任务奖励", f"{total_reward} 捷停币")
+    box_line("🕒 结束时间", now_text())
+    box_bottom()
 
 def build_direct_transport() -> AsyncHTTPTransport:
     return AsyncHTTPTransport(verify=False)
 
-def parse_yyb_go_entry(raw_value: str) -> Tuple[str, str]:
+def parse_entry(raw_value: str) -> Tuple[str, str, str]:
+    """解析 地址@标识[#备注] → (地址, 标识, 备注)"""
+    import re
     value = str(raw_value or "").strip()
-    if not value:
-        return "", ""
-    at_index = value.rfind("@")
-    if at_index == -1:
-        return value, ""
-    server = value[:at_index].strip()
-    ref = value[at_index + 1:].strip()
-    server = server.removeprefix("http://").removeprefix("https://").rstrip("/")
+    if not value or "@" not in value:
+        return "", "", ""
+    note = ""
+    hash_pos = value.rfind("#")
+    at_pos = value.rfind("@")
+    if hash_pos > at_pos:
+        note = value[hash_pos + 1:].strip()
+        value = value[:hash_pos].strip()
+    at_pos = value.rfind("@")
+    server = re.sub(r"^https?://", "", value[:at_pos].strip()).rstrip("/")
+    ref = value[at_pos + 1:].strip()
+    return server, ref, note
+
+
+def parse_yyb_go_entry(raw_value: str) -> Tuple[str, str]:
+    server, ref, _ = parse_entry(raw_value)
     return server, ref
 
 
@@ -197,9 +244,87 @@ def write_token_cache(cache: Dict[str, Any]) -> None:
         print(f"⚠️ [缓存] 写入失败: {exc}")
 
 
+def ckey(server: str, ref: str) -> str:
+    return f"{server}|{ref}"
+
+
+def _entry_token(value) -> str:
+    if isinstance(value, dict):
+        return str(value.get("token") or "").strip()
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+def _cache_matches(key, server: str, ref: str) -> bool:
+    """判断缓存键是否属于该账号（含旧版裸标识/地址@标识/地址@标识#备注）"""
+    key = str(key or "").strip()
+    if key in (f"{server}|{ref}", ref, f"{server}@{ref}"):
+        return True
+    if "|" in key:
+        left, right = key.rsplit("|", 1)
+        return left.strip() == server and right.strip() == ref
+    if "@" in key:
+        tail = key.split("@", 1)[1].split("#", 1)[0].strip()
+        return tail == ref
+    return False
+
+
+def load_cache_entry(server: str, ref: str, raw: str) -> Optional[Dict[str, Any]]:
+    """按「地址|标识」取缓存；同账号的旧键按 updatedAt 取最新一条，其余清理"""
+    cache = read_token_cache()
+    key = ckey(server, ref)
+    candidates = []
+    for old_key, value in cache.items():
+        if not _cache_matches(old_key, server, ref):
+            continue
+        token = _entry_token(value)
+        if not token:
+            continue
+        updated = str(value.get("updatedAt", "")) if isinstance(value, dict) else ""
+        candidates.append((updated, old_key, token))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    updated, best_key, token = candidates[0]
+    if best_key != key or len(candidates) > 1:
+        cache[key] = {"token": token, "updatedAt": updated or now_text()}
+        for _, old_key, _ in candidates:
+            if old_key != key:
+                cache.pop(old_key, None)
+        write_token_cache(cache)
+        print("   🗂️ [缓存] 已将旧缓存键迁移为「地址|标识」")
+    entry = cache.get(key)
+    if isinstance(entry, dict) and entry.get("token"):
+        return entry
+    return {"token": token, "updatedAt": updated or now_text()}
+
+
+def save_cache_entry(server: str, ref: str, token: str) -> None:
+    cache = read_token_cache()
+    cache[ckey(server, ref)] = {"token": token, "updatedAt": now_text()}
+    write_token_cache(cache)
+
+
+def drop_cache_entry(server: str, ref: str) -> None:
+    cache = read_token_cache()
+    for old_key in list(cache.keys()):
+        if _cache_matches(old_key, server, ref):
+            cache.pop(old_key, None)
+    write_token_cache(cache)
+
+
+AUTH_PATTERN = None
+
 def is_auth_fail_msg(msg: Any) -> bool:
+    global AUTH_PATTERN
     import re
-    return bool(re.search(r'登录|未登录|授权|token|失效|过期|登录态|请重新|身份|凭证|unauthor', str(msg), re.IGNORECASE))
+    if AUTH_PATTERN is None:
+        AUTH_PATTERN = re.compile(
+            r'登录已失效|登录已过期|登录态失效|登录态过期|请重新登录|请先登录|未登录'
+            r'|token\s*(失效|过期|无效)|授权失效|授权过期|身份验证失败|凭证失效'
+            r'|unauthorized|-401|\b401\b|\b403\b', re.IGNORECASE)
+    return bool(AUTH_PATTERN.search(str(msg)))
 
 
 async def get_code_via_yyb(server_entry: str, appid: str) -> Optional[str]:
@@ -217,12 +342,24 @@ async def get_code_via_yyb(server_entry: str, appid: str) -> Optional[str]:
             response = await client.post(url, json={"ref": ref, "app_id": appid})
             res = response.json()
 
-        code = (((res.get("data") or {}).get("result") or {}).get("code"))
-        if res.get("code") != 0 or not code:
+        payload = res.get("data") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        result_obj = (payload or {}).get("result")
+        if isinstance(result_obj, str):
+            try:
+                result_obj = json.loads(result_obj)
+            except Exception:
+                result_obj = {}
+        code = (result_obj or {}).get("code")
+        if to_number(res.get("code")) != 0 or not code:
             print(f"❌ [取码] [{server_entry}] 获取code失败 | 返回异常: {str(res)[:200]}")
             return None
 
-        print(f"✅ [取码] [{server}] 获取code成功")
+        print("   ✅ [取码] code 获取成功")
         return code
     except json.JSONDecodeError:
         print(f"❌ [取码] [{server_entry}] 获取code失败 | 响应不是JSON格式")
@@ -544,7 +681,8 @@ class JtcBot:
             verify=False
         )
 
-        print(f"🔌 [代理] [{self.server}] 客户端已重建 | 当前模式: {mode}")
+        if mode == "代理":
+            print(f"   🔌 [代理] 客户端已重建 | 当前模式: 代理")
 
     def _get_base_headers(self) -> Dict[str, Any]:
         headers = {
@@ -566,39 +704,48 @@ class JtcBot:
 
     # 通用请求包装器（自动处理代理错误）
     async def _safe_request(self, method: str, url: str, **kwargs) -> httpx.Response:
-        """安全请求：自动捕获代理错误并重建代理重试"""
-        for retry in range(2):  # 最多重试2次（1次原代理，1次重建后）
+        """安全请求：代理异常时重建代理，再降级直连，最多 3 次"""
+        headers = dict(kwargs.get("headers") or {})
+        if self.token and not any(k.lower() == "authorization" for k in headers):
+            headers["Authorization"] = f"Bearer {self.token}"
+        if headers:
+            kwargs["headers"] = headers
+        last_error = None
+        for attempt in range(3):
             try:
-                response = await self.client.request(method, url, **kwargs)
-                return response
-            except Exception as e:
-                if self.proxy_manager and self.proxy_manager.is_proxy_error(e):
-                    print(f"⚠️ [请求] [{self.server}] 请求失败 | 代理错误: {str(e)}")
-                    if retry == 0:
-                        # 第一次失败：重建代理
-                        await self.proxy_manager.rebuild()
-                        await self._rebuild_client()
-                        continue
-                    else:
-                        # 第二次失败：降级为直连
-                        print(f"⚠️ [请求] [{self.server}] 代理重试失败，切换直连重试")
-                        self.proxy_manager.proxy_info = None
-                        await self._rebuild_client()
-                        continue
-                else:
-                    # 非代理错误，直接抛出
-                    raise e
-
-        # 所有重试都失败
-        raise Exception("请求失败，所有重试次数已耗尽")
+                return await self.client.request(method, url, **kwargs)
+            except Exception as exc:
+                last_error = exc
+                is_proxy = self.proxy_manager and self.proxy_manager.is_proxy_error(exc)
+                if not is_proxy:
+                    raise
+                if attempt == 0 and self.proxy_manager and self.proxy_manager.proxy_info:
+                    print(f"   ⚠️ [请求] 代理异常：{brief_error(exc)}")
+                    await self.proxy_manager.rebuild()
+                    await self._rebuild_client()
+                    continue
+                if attempt == 1 and self.proxy_manager and self.proxy_manager.proxy_info:
+                    print("   ⚠️ [请求] 代理仍异常，切换直连重试")
+                    self.proxy_manager.proxy_info = None
+                    await self._rebuild_client()
+                    continue
+                raise
+        raise last_error or Exception("请求失败")
 
     async def get_code(self) -> Optional[str]:
-        """从本地服务获取code（增加3次重试）"""
-        return await get_code_via_yyb(self.server, APPID)
+        """从本地 YYB 服务获取 code，失败重试一次"""
+        for attempt in range(2):
+            code = await get_code_via_yyb(self.server, APPID)
+            if code:
+                return code
+            if attempt == 0:
+                print("   🔁 [取码] 失败，2 秒后重试")
+                await sleep(2000)
+        return None
 
     async def get_token_by_code(self, code: str) -> Optional[str]:
         """通过code换取token（适配最新obj响应格式）"""
-        print(f"🔑 [登录] [{self.server}] 正在换取token...")
+        print(f"   🔑 [登录] 正在换取token...")
 
         timestamp = int(time.time() * 1000)
         token_url = f"{TOKEN_BASE_URL}?t={timestamp}"
@@ -625,11 +772,10 @@ class JtcBot:
             "appId": APPID
         }
 
+        mode = "代理" if (self.proxy_manager and self.proxy_manager.proxy_info) else "直连"
         try:
-            transport = build_proxy_transport(self.proxy_manager.proxy_info) if self.proxy_manager.proxy_info else build_direct_transport()
-            mode = "代理" if self.proxy_manager.proxy_info else "直连"
+            transport = build_proxy_transport(self.proxy_manager.proxy_info) if self.proxy_manager and self.proxy_manager.proxy_info else build_direct_transport()
 
-            print(f"🌐 [登录] [{self.server}] 使用{mode}发起token请求 | URL: {token_url}")
             async with httpx.AsyncClient(
                 transport=transport,
                 headers=headers,
@@ -639,8 +785,6 @@ class JtcBot:
             ) as client:
                 response = await client.post(token_url, json=payload)
 
-            print(f"📝 [登录] [{self.server}] token接口响应 | 状态码: {response.status_code}")
-
             if response.status_code != 200:
                 raise Exception(f"HTTP错误: {response.status_code}")
 
@@ -648,20 +792,20 @@ class JtcBot:
             # 适配最新响应格式（resultCode=0表示成功，token在obj字段）
             if res.get("resultCode") == "0" and res.get("obj") and res["obj"].get("token"):
                 self.token = res["obj"]["token"]
-                print(f"✅ [登录] [{self.server}] 获取token成功 | 模式: {mode}")
+                print(f"   ✅ [登录] 获取token成功 | 模式: {mode}")
                 return self.token
             # 兼容旧格式
             elif (res.get("success") and res.get("data") and res["data"].get("token")):
                 self.token = res["data"]["token"]
-                print(f"✅ [登录] [{self.server}] 获取token成功（旧格式）| 模式: {mode}")
+                print(f"   ✅ [登录] 获取token成功（旧格式）| 模式: {mode}")
                 return self.token
             else:
                 raise Exception(f"业务错误: {res.get('message', '未知错误')}")
         except Exception as e:
-            print(f"⚠️ [登录] [{self.server}] {mode}获取token失败 | 原因: {str(e)}")
+            print(f"   ⚠️ [登录] {mode}获取token失败 | 原因: {str(e)}")
 
             if self.proxy_manager.proxy_info and ENABLE_DIRECT_FALLBACK:
-                print(f"🌐 [登录] [{self.server}] 切换直连重试...")
+                print(f"   🌐 [登录] 切换直连重试...")
                 try:
                     async with httpx.AsyncClient(
                         headers=headers,
@@ -672,21 +816,19 @@ class JtcBot:
                     ) as client:
                         response = await client.post(token_url, json=payload)
 
-                    print(f"📝 [登录] [{self.server}] 直连响应 | 状态码: {response.status_code}")
-
                     res = response.json()
                     if res.get("resultCode") == "0" and res.get("obj") and res["obj"].get("token"):
                         self.token = res["obj"]["token"]
-                        print(f"✅ [登录] [{self.server}] 直连获取token成功")
+                        print(f"   ✅ [登录] 直连获取token成功")
                         return self.token
                     elif (res.get("success") and res.get("data") and res["data"].get("token")):
                         self.token = res["data"]["token"]
-                        print(f"✅ [登录] [{self.server}] 直连获取token成功（旧格式）")
+                        print(f"   ✅ [登录] 直连获取token成功（旧格式）")
                         return self.token
                     else:
                         raise Exception(f"直连业务错误: {res.get('message', '未知错误')}")
                 except Exception as e2:
-                    print(f"❌ [登录] [{self.server}] 直连获取token失败 | 原因: {str(e2)}")
+                    print(f"   ❌ [登录] 直连获取token失败 | 原因: {str(e2)}")
 
         return None
 
@@ -700,11 +842,16 @@ class JtcBot:
             exp = decoded.get("exp")
             return exp
         except Exception as e:
-            print(f"❌ [登录] [{self.server}] JWT解析失败 | 原因: {str(e)}")
+            print(f"   ❌ [登录] JWT解析失败 | 原因: {str(e)}")
             return None
 
     async def get_location_info(self):
-        """获取经纬度坐标信息"""
+        """获取经纬度坐标信息（同一次运行内复用）"""
+        global _LOCATION_CACHE
+        if _LOCATION_CACHE:
+            self.longitude, self.latitude = _LOCATION_CACHE
+            print(f"   📍 [定位] 复用坐标 | 经度: {self.longitude:.6f} | 纬度: {self.latitude:.6f}")
+            return True
         try:
             async with httpx.AsyncClient(timeout=15.0, transport=build_direct_transport(), verify=False) as client:
                 response = await client.get("https://ipinfo.io/json")
@@ -719,14 +866,16 @@ class JtcBot:
                 self.longitude = base_lon + random.randint(0, 9999999999999) / 10**16
                 self.latitude = base_lat + random.randint(0, 999999999999999) / 10**18
 
-                print(f"✅ [定位] [{self.server}] 经纬度已补全 | 经度: {self.longitude:.6f} | 纬度: {self.latitude:.6f}")
+                _LOCATION_CACHE = (self.longitude, self.latitude)
+                print(f"   📍 [定位] 经纬度已补全 | 经度: {self.longitude:.6f} | 纬度: {self.latitude:.6f}")
                 return True
             else:
                 raise Exception("无法解析经纬度")
         except Exception as e:
-            print(f"ℹ️ [定位] [{self.server}] 使用默认北京坐标 | 原因: {str(e)}")
+            print(f"   ℹ️ [定位] 使用默认北京坐标 | 原因: {str(e)}")
             self.longitude = 116.413384
             self.latitude = 39.910925
+            _LOCATION_CACHE = (self.longitude, self.latitude)
             return True
 
     async def send_data_report(self, event_name="ShowGoToClaim", task_info=None, extra_props=None):
@@ -764,15 +913,20 @@ class JtcBot:
             return False
 
     def check_response(self, response_data):
-        """检查响应是否正常（适配最新resultCode格式）"""
-        if response_data.get("resultCode") != "0" and response_data.get("code") != "0":
+        """检查响应是否正常（resultCode / code 可能是字符串或数字）"""
+        if not isinstance(response_data, dict):
+            self._last_error = "响应不是JSON对象"
+            return False
+        ok_code = to_number(response_data.get("resultCode"), -999) == 0 \
+            or to_number(response_data.get("code"), -999) == 0
+        if not ok_code:
             error_msg = response_data.get("message") or "未知错误"
             self._last_error = error_msg
             # 特殊处理："已达到最大领取次数"视为成功
             if "已达到最大领取次数" in str(error_msg):
-                print(f"ℹ️ [请求] [{self.server}] {error_msg}")
+                print(f"   ℹ️ [请求] {error_msg}")
                 return True
-            print(f"❌ [请求] [{self.server}] 请求失败 | 原因: {error_msg}")
+            print(f"   ❌ [请求] 请求失败 | 原因: {error_msg}")
             return False
         return True
 
@@ -793,6 +947,7 @@ class JtcBot:
         return default
 
     def format_phone(self, phone):
+        phone = str(phone or "未知").strip() or "未知"
         if len(phone) == 11:
             return f"{phone[:3]}****{phone[-4:]}"
         return phone
@@ -805,18 +960,21 @@ class JtcBot:
                 "/core-gateway/user/query/attention/info",
                 json={"h5Source": "WX_XCX_JTC", "openId": self.open_id}
             )
+            if response.status_code in (401, 403):
+                self._last_error = f"HTTP {response.status_code}"
+                return None
             response_data = response.json()
 
             if self.check_response(response_data):
                 return response_data.get("obj", {})
             return None
         except Exception as e:
-            print(f"❌ [用户] [{self.server}] 获取用户信息失败 | 原因: {str(e)}")
+            print(f"   ❌ [用户] 获取用户信息失败 | 原因: {str(e)}")
             return None
 
     async def perform_sign_in(self):
         """执行签到操作（使用安全请求）"""
-        print(f"📝 [签到] [{self.server}] 开始执行签到...")
+        print(f"   📝 [签到] 开始执行签到...")
 
         try:
             # 签到任务查询
@@ -852,20 +1010,21 @@ class JtcBot:
             response_data = response.json()
 
             message = response_data.get("message") or ""
-            if "今日已签到" in str(message):
-                print(f"ℹ️ [签到] [{self.server}] 今日已签到")
-                return True
-            elif self.check_response(response_data):
+            text = str(message)
+            if any(word in text for word in ("今日已签到", "已签到", "重复签到", "已达到最大领取次数")):
+                self._last_error = ""
+                print(f"   ℹ️ [签到] 今日已签到")
+                return True, "今日已签到", False
+            if self.check_response(response_data):
                 reward = self.safe_get_reward(response_data.get("data"), 0)
-                if reward > 0:
-                    print(f"✅ [签到] [{self.server}] 签到成功 | 获得{reward}捷停币")
-                return True
-            else:
-                print(f"❌ [签到] [{self.server}] 签到失败 | {message}")
-                return False
-        except Exception as e:
-            print(f"❌ [签到] [{self.server}] 签到异常 | 原因: {str(e)}")
-            return False
+                msg = f"签到成功（+{reward} 捷停币）" if reward > 0 else "签到成功"
+                print(f"   ✅ [签到] {msg}")
+                return True, msg, False
+            print(f"   ❌ [签到] 签到失败 | {message}")
+            return False, f"签到失败：{message}", is_auth_fail_msg(message)
+        except Exception as exc:
+            print(f"   ❌ [签到] 签到异常 | 原因: {exc}")
+            return False, f"签到异常：{exc}", is_auth_fail_msg(exc)
 
     async def get_task_list(self):
         """获取任务列表（使用安全请求）"""
@@ -893,18 +1052,17 @@ class JtcBot:
 
             if self.check_response(response_data):
                 task_data = response_data.get("data", [])
-                print(f"✅ [任务] [{self.server}] 获取到{len(task_data)}个任务")
-
                 for task in task_data:
                     task_no = task.get("taskNo")
-                    browse_seconds = task.get("browseSeconds", 10)
-                    self.task_browse_seconds[task_no] = browse_seconds
-                    print(f"  - {task.get('showTitle')} | 编号: {task_no} | 状态: {task.get('taskStatus')} | 停留: {browse_seconds}秒")
-
+                    self.task_browse_seconds[task_no] = task.get("browseSeconds", 10)
+                pending_receive = sum(1 for t in task_data if t.get("taskStatus") == "RECEIVE")
+                pending_do = sum(1 for t in task_data if t.get("taskStatus") == "GOTO")
+                skipped = sum(1 for t in task_data if t.get("taskNo") in SKIP_TASKS)
+                print(f"   📋 [任务] 共 {len(task_data)} 个｜待领取 {pending_receive}｜待完成 {pending_do}｜跳过 {skipped}")
                 return task_data
             return []
         except Exception as e:
-            print(f"❌ [任务] [{self.server}] 获取任务列表失败 | 原因: {str(e)}")
+            print(f"   ❌ [任务] 获取任务列表失败 | 原因: {str(e)}")
             return []
 
     async def receive_task_reward(self, task_no, task_info=None):
@@ -935,11 +1093,11 @@ class JtcBot:
             if self.check_response(response_data):
                 reward = self.safe_get_reward(response_data.get("data", 0))
                 if reward > 0:
-                    print(f"✅ [奖励] [{self.server}] 领取【{show_title}】奖励 | +{reward}捷停币")
+                    print(f"   ✅ [奖励] 领取【{show_title}】奖励 | +{reward}捷停币")
                 return reward
             return 0
         except Exception as e:
-            print(f"❌ [奖励] [{self.server}] 领取【{show_title}】奖励失败 | 原因: {str(e)}")
+            print(f"   ❌ [奖励] 领取【{show_title}】奖励失败 | 原因: {str(e)}")
             return 0
 
     async def simulate_task_action(self, task_no, task_info=None):
@@ -951,7 +1109,7 @@ class JtcBot:
         stay_seconds = max(self.task_browse_seconds.get(task_no, 10) - 2, 5)
 
         if task_no == "T01":  # 浏览找优惠
-            print(f"⏳ [浏览] [{self.server}] 进入【找优惠】页面，停留{stay_seconds}秒...")
+            print(f"   ⏳ [浏览] 进入【找优惠】页面，停留{stay_seconds}秒...")
             await self.send_data_report("PageView")
             await sleep(1000)
             await self.send_data_report("FindDiscountClick")
@@ -962,7 +1120,7 @@ class JtcBot:
             await sleep(500)
 
         elif task_no == "T47":  # 浏览车位优选（已更新为最新编号）
-            print(f"⏳ [浏览] [{self.server}] 进入【车位优选】页面，停留{stay_seconds}秒...")
+            print(f"   ⏳ [浏览] 进入【车位优选】页面，停留{stay_seconds}秒...")
             await self.send_data_report("PageView")
             await sleep(1000)
             await self.send_data_report("ParkingSpaceClick")
@@ -980,10 +1138,10 @@ class JtcBot:
         show_title = task_info.get("showTitle", "") if task_info else ""
 
         if task_info and task_info.get("taskStatus") == "DOWN":
-            print(f"ℹ️ [任务] [{self.server}] 【{show_title}】已完成，跳过执行")
+            print(f"   ℹ️ [任务] 【{show_title}】已完成，跳过执行")
             return True
 
-        print(f"🔄 [任务] [{self.server}] 正在完成【{show_title}】")
+        print(f"   🔄 [任务] 正在完成【{show_title}】")
 
         try:
             await self.simulate_task_action(task_no, task_info)
@@ -1018,13 +1176,13 @@ class JtcBot:
 
                 reward = self.safe_get_reward(response_data.get("data", 0))
                 if reward > 0:
-                    print(f"✅ [任务] [{self.server}] 完成【{show_title}】| +{reward}捷停币")
+                    print(f"   ✅ [任务] 完成【{show_title}】| +{reward}捷停币")
                 return True
             else:
-                print(f"❌ [任务] [{self.server}] 完成【{show_title}】失败")
+                print(f"   ❌ [任务] 完成【{show_title}】失败")
                 return False
         except Exception as e:
-            print(f"❌ [任务] [{self.server}] 完成【{show_title}】异常 | 原因: {str(e)}")
+            print(f"   ❌ [任务] 完成【{show_title}】异常 | 原因: {str(e)}")
             return False
 
     async def get_balance(self):
@@ -1041,95 +1199,123 @@ class JtcBot:
                 return response_data.get("data", {})
             return {}
         except Exception as e:
-            print(f"❌ [余额] [{self.server}] 获取余额失败 | 原因: {str(e)}")
+            print(f"   ❌ [余额] 获取余额失败 | 原因: {str(e)}")
             return {}
 
     async def run(self) -> Dict[str, Any]:
-        """运行主流程（优化：已完成任务直接领取奖励）"""
+        """运行主流程：缓存校验 → 登录 → 签到 → 任务 → 余额"""
         result = {
             "server": self.server,
             "success": False,
-            "proxy_status": "直连" if not self.proxy_manager.proxy_info else "专属代理",
+            "login_source": "",
+            "proxy_status": "直连" if not (self.proxy_manager and self.proxy_manager.proxy_info) else "专属代理",
             "phone": "未知",
             "sign_msg": "",
             "task_count": 0,
             "total_reward": 0,
-            "balance": 0,
+            "balance": "未知",
             "deduct_amount": 0,
             "error": ""
         }
 
-        print(f"\n{'='*40}")
-        print(f"🚀 [{self.server}] 开始执行任务")
-        print(f"{'='*40}")
+        server, ref, _ = parse_entry(self.server)
+        cache_invalidated = False
 
         try:
-            # 启动延迟
             await sleep(random_int(2000, 5000))
 
-            _, ref = parse_yyb_go_entry(self.server)
-            cache = read_token_cache()
-            cached = cache.get(ref) or {}
-            self.token = cached.get("token", "")
-            used_cache = bool(self.token)
+            entry = load_cache_entry(server, ref, self.server)
+            self.token = entry.get("token", "") if entry else ""
             if self.token:
-                print(f"💾 [缓存] [{self.server}] 使用缓存token: {self.token[:12]}...")
+                print(f"   💾 [缓存] 复用已保存的 token（{mask(self.token)}）")
 
             for relogin_attempt in range(2):
-                if relogin_attempt == 1 or not self.token:
-                    if relogin_attempt == 1:
-                        print(f"🔄 [重登] [{self.server}] token失效，重新登录...")
-                        cache = read_token_cache()
-                        if ref in cache:
-                            del cache[ref]
-                            write_token_cache(cache)
+                # ---------- ① 缓存：JWT + 用户信息（只读）作为开跑前校验 ----------
+                if relogin_attempt == 0 and self.token:
+                    self.parse_jwt()
+                    if not self.user_id or not self.open_id:
+                        print("   ♻️ [缓存] token 结构异常（JWT 解析失败），清理缓存后重新登录")
+                        drop_cache_entry(server, ref)
                         self.token = ""
-                    # 1. 获取code
+                        cache_invalidated = True
+                    else:
+                        user_info = await self.get_user_info()
+                        if user_info is not None:
+                            user_info = user_info or {}
+                            result["login_source"] = "缓存"
+                            result["phone"] = self.format_phone(user_info.get("telephone", "未知"))
+                            print("   ✅ [校验] 登录凭证校验通过（用户信息接口）")
+                        elif is_auth_fail_msg(self._last_error):
+                            print(f"   ♻️ [缓存] 登录凭证失效（{self._last_error}），清理缓存后重新登录")
+                            drop_cache_entry(server, ref)
+                            self.token = ""
+                            cache_invalidated = True
+                        else:
+                            print(f"   ❌ [用户] 缓存 token 校验失败，保留缓存不删除：{self._last_error}")
+                            result["error"] = f"缓存 token 校验失败（{self._last_error}）"
+                            return result
+
+                # ---------- ② 登录 ----------
+                if not self.token:
+                    if relogin_attempt == 1:
+                        print("   ♻️ [登录] 重新登录后再试一次")
                     code = await self.get_code()
                     if not code:
-                        result["error"] = "获取code失败"
+                        result["error"] = "取码失败（检查 YYB 服务地址与账号标识）"
                         return result
-
-                    # 2. 获取token
                     token = await self.get_token_by_code(code)
                     if not token:
-                        result["error"] = "获取token失败"
+                        result["error"] = "获取 token 失败"
                         return result
                     self.token = token
+                    save_cache_entry(server, ref, self.token)
+                    result["login_source"] = "缓存失效重登" if cache_invalidated else "新登录"
 
-                    cache = read_token_cache()
-                    cache[ref] = {"token": self.token}
-                    write_token_cache(cache)
-
-                # 3. 解析JWT
-                self.parse_jwt()
-                if not self.user_id or not self.open_id:
-                    result["error"] = "JWT解析失败"
-                    if relogin_attempt == 0 and used_cache:
-                        print(f"🔄 [重登] [{self.server}] JWT解析失败，清除缓存重新登录...")
-                        self.token = ""
-                        continue
-                    return result
-
-                # 4. 获取经纬度
-                await self.get_location_info()
-
-                # 5. 获取用户信息（鉴权失败检测点）
-                user_info = await self.get_user_info()
-                if user_info is None and relogin_attempt == 0 and used_cache and is_auth_fail_msg(self._last_error):
-                    print(f"🔄 [重登] [{self.server}] 用户信息鉴权失败({self._last_error})，重新登录...")
-                    self.token = ""
-                    continue
-                if user_info:
+                    self.parse_jwt()
+                    if not self.user_id or not self.open_id:
+                        result["error"] = "JWT 解析失败（token 无法解出用户信息）"
+                        print("   ❌ [登录] JWT 解析失败")
+                        return result
+                    user_info = await self.get_user_info()
+                    if user_info is not None:
+                        user_info = user_info or {}
+                    if user_info is None:
+                        if is_auth_fail_msg(self._last_error) and relogin_attempt == 0:
+                            print("   ♻️ [登录] 新 token 校验未通过，清理缓存后重登一次")
+                            drop_cache_entry(server, ref)
+                            self.token = ""
+                            continue
+                        result["error"] = f"登录后用户信息查询失败（{self._last_error}）"
+                        print(f"   ❌ [用户] {result['error']}")
+                        return result
                     result["phone"] = self.format_phone(user_info.get("telephone", "未知"))
-                    print(f"👤 [用户] [{self.server}] 用户: {result['phone']}")
+                    print("   ✅ [校验] 登录凭证校验通过（用户信息接口）")
 
-                # 6. 执行签到
-                sign_success = await self.perform_sign_in()
-                result["sign_msg"] = "签到成功" if sign_success else "今日已签到"
+                if cache_invalidated and result["login_source"] == "缓存":
+                    result["login_source"] = "缓存失效重登"
+                result["login_source"] = result["login_source"] or "缓存"
+                print(f"   👤 [用户] {result['phone']}")
+
+                # ---------- ③ 余额（登录行下紧跟币值） ----------
+                await self.get_location_info()
+                balance_info = await self.get_balance()
+                balance_before = balance_info.get("accountAmt", 0) if balance_info else 0
+                result["balance"] = balance_before
+                result["deduct_amount"] = balance_info.get("deductAmount", 0) if balance_info else 0
+                print(f"   💰 [余额] 当前 {balance_before} 捷停币｜可抵扣 {result['deduct_amount']} 元")
+
+                # ---------- ④ 签到 ----------
+                sign_ok, sign_msg, sign_auth = await self.perform_sign_in()
+                result["sign_msg"] = sign_msg
+                if not sign_ok and sign_auth and result["login_source"] == "缓存" and relogin_attempt == 0:
+                    print(f"   ♻️ [签到] 鉴权失败（{sign_msg}），清理缓存后重登重跑")
+                    drop_cache_entry(server, ref)
+                    self.token = ""
+                    cache_invalidated = True
+                    continue
                 await sleep(1000)
 
-                # 7. 处理任务
+                # ---------- ⑤ 任务 ----------
                 task_data = await self.get_task_list()
                 receivable_tasks = []
                 incomplete_tasks = []
@@ -1141,103 +1327,178 @@ class JtcBot:
                         task_status = task.get("taskStatus")
                         show_title = task.get("showTitle", "")
                         task_info_map[task_no] = task
-
                         if task_no in SKIP_TASKS:
-                            print(f"⏭️ [任务] [{self.server}] 跳过任务: {show_title}")
+                            print(f"   ⏭️ [任务] 跳过：{show_title}")
                             continue
-
                         if task_status == "RECEIVE":
                             receivable_tasks.append((task_no, show_title))
                         elif task_status == "GOTO":
                             incomplete_tasks.append((task_no, show_title))
 
-                # 强制执行核心任务（即使不在任务列表中）
-                print(f"\n🔧 [任务] [{self.server}] 检查强制核心任务...")
+                print(f"   🔧 [任务] 检查强制核心任务...")
                 for task_no, show_title in FORCE_EXECUTE_TASKS:
                     if task_no not in task_info_map and task_no not in SKIP_TASKS:
-                        print(f"➕ [任务] [{self.server}] 添加强制任务: {show_title}")
+                        print(f"   ➕ [任务] 添加强制任务：{show_title}")
                         incomplete_tasks.append((task_no, show_title))
                         task_info_map[task_no] = {"taskNo": task_no, "showTitle": show_title, "taskStatus": "GOTO"}
 
-                # 领取可领取的任务奖励
                 for task_no, show_title in receivable_tasks:
                     reward = await self.receive_task_reward(task_no, task_info_map.get(task_no))
                     result["total_reward"] += reward
                     await sleep(1000)
 
-                # 完成未完成的任务
                 for task_no, show_title in incomplete_tasks:
                     success = await self.complete_task(task_no, task_info_map.get(task_no))
                     if success:
                         result["task_count"] += 1
                         await sleep(1000)
-                        # 领取新完成的任务奖励
                         await sleep(3000)
                         reward = await self.receive_task_reward(task_no, task_info_map.get(task_no))
                         result["total_reward"] += reward
 
-                # 8. 获取最终余额
+                # ---------- ⑥ 复查余额 ----------
                 balance_info = await self.get_balance()
                 if balance_info:
-                    result["balance"] = balance_info.get("accountAmt", 0)
+                    balance_after = balance_info.get("accountAmt", 0)
+                    result["balance"] = f"{balance_before} → {balance_after}"
                     result["deduct_amount"] = balance_info.get("deductAmount", 0)
-                    print(f"💰 [余额] [{self.server}] 当前余额: {result['balance']}捷停币 | 可抵扣: {result['deduct_amount']}元")
+                    print(f"   💰 [余额] {balance_before} → {balance_after} 捷停币")
 
-                result["success"] = True
-                # 已删除：共获得0捷停币 相关输出
-                print(f"✅ [完成] [{self.server}] 任务执行完成")
-                break
+                result["success"] = bool(sign_ok)
+                if sign_ok:
+                    print("   ✅ [完成] 该账号任务执行完成")
+                else:
+                    result["error"] = result["error"] or sign_msg
+                    print(f"   ⚠️ [完成] {sign_msg}")
+                return result
 
-        except Exception as e:
-            result["error"] = str(e)
-            print(f"❌ [异常] [{self.server}] 执行异常 | 原因: {str(e)}")
+        except Exception as exc:
+            result["error"] = str(exc)
+            print(f"   ❌ [异常] 执行异常 | 原因: {exc}")
 
         return result
 
+# ===================== 通知 =====================
+def send_qinglong_notify(title: str, content: str) -> bool:
+    import importlib.util
+    for path in (
+        "/ql/data/scripts/notify.py",
+        "/ql/scripts/notify.py",
+        "/ql/data/notify.py",
+        os.path.join(SCRIPT_DIR, "notify.py"),
+    ):
+        if not os.path.exists(path):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("ql_notify", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            fn = getattr(mod, "send", None) or getattr(mod, "sendNotify", None)
+            if fn:
+                fn(title, content)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def build_notify(results):
+    ok = sum(1 for r in results if r.get("success"))
+    lines = [f"【捷停车】每日任务", f"成功 {ok} / 失败 {len(results) - ok} / 共 {len(results)}", ""]
+    for r in results:
+        flag = "✅" if r.get("success") else "❌"
+        lines.append(f"{flag} {r.get('server')}（{r.get('phone')}）")
+        lines.append(f"   登录：{r.get('login_source') or '-'}")
+        lines.append(f"   签到：{r.get('sign_msg') or '-'}")
+        lines.append(f"   任务：处理 {r.get('task_count')} 个，今日 +{r.get('total_reward')} 捷停币")
+        lines.append(f"   余额：{r.get('balance')} 捷停币，可抵扣 {r.get('deduct_amount')} 元")
+        if not r.get("success"):
+            lines.append(f"   失败：{r.get('error') or '-'}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 # ===================== 主程序 =====================
 async def main():
+    if not SERVERS:
+        print("❌ 未配置环境变量 YYB_SERVER")
+        print("格式：YYB Go 服务地址@微信账号标识[#备注]，多账号换行分隔")
+        return []
+    valid = [item for item in SERVERS if "@" in item]
+    invalid = [item for item in SERVERS if "@" not in item]
+    if not valid:
+        print("❌ YYB_SERVER 无有效账号（格式：地址@标识[#备注]）")
+        return []
+    for line in invalid:
+        print(f"   ❌ [账号] 格式应为 地址@标识[#备注]，已跳过：{brief_error(line)}")
+
+    SERVERS[:] = valid
     log_title()
 
     results = []
     for index, server in enumerate(SERVERS):
-        log_account_header(index + 1, len(SERVERS), server)
+        server_addr, ref, note = parse_entry(server)
+        title = f"标识 {ref}" + (f"（{note}）" if note else "")
+        source = f"{server_addr}@{ref}" + (f"#{note}" if note else "")
+        account_frame(index + 1, len(SERVERS), title, source)
 
-        # 为每个账号创建独立的代理管理器
-        proxy_manager = ProxyManager(server)
-        if ENABLE_PER_ACCOUNT_PROXY and PROXY_API:
-            await proxy_manager.get_proxy()
-            await sleep(PROXY_FETCH_INTERVAL)
+        try:
+            proxy_manager = ProxyManager(server)
+            if ENABLE_PER_ACCOUNT_PROXY and PROXY_API:
+                await proxy_manager.get_proxy()
+                await sleep(PROXY_FETCH_INTERVAL)
 
-        async with JtcBot(server, proxy_manager) as bot:
-            result = await bot.run()
-            results.append(result)
+            async with JtcBot(server, proxy_manager) as bot:
+                result = await bot.run()
+                results.append(result)
+        except Exception as exc:
+            print(f"   ❌ [执行] 账号 {index + 1} 未捕获异常：{exc}")
+            results.append({
+                "server": server, "success": False, "login_source": "", "phone": "未知",
+                "proxy_status": "-", "sign_msg": "", "task_count": 0, "total_reward": 0,
+                "balance": "未知", "deduct_amount": 0, "error": f"异常 {exc}"
+            })
 
+        hr()
         if index < len(SERVERS) - 1:
-            print(f"\n⏳ 等待2秒后执行下一个账号...")
+            print("   ⏳ 等待2秒后执行下一个账号...")
             await sleep(2000)
 
-    # 汇总结果
-    notify_content = " 捷停车每日任务执行结果\n"
-    notify_content += f"\n📅 执行时间: {now_text()}"
-    notify_content += f"\n📋 执行任务: 每日签到、浏览找优惠(T01)、浏览车位优选(T47)\n"
-
-    for res in results:
-        notify_content += f"\n {res['server']} ({res['phone']})\n"
-        notify_content += f"- 代理状态：{res['proxy_status']}\n"
-        notify_content += f"- 执行状态：{'成功' if res['success'] else '失败'}\n"
-        if res['success']:
-            notify_content += f"- 签到结果：{res['sign_msg']}\n"
-            notify_content += f"- 当前余额：{res['balance']}捷停币\n"
-            notify_content += f"- 可抵扣金额：{res['deduct_amount']}元\n"
+    # 明细在前，汇总框在后
+    print()
+    for idx, res in enumerate(results, 1):
+        ref = parse_entry(res.get("server", ""))[1] or res.get("server")
+        title = f"账号 {idx} · 标识 {ref}"
+        if res.get("success"):
+            print(f"✅ 【{title} · {res.get('phone')}】")
+            print(f"   🔐 [登录] {res.get('login_source') or '-'}")
+            print(f"   📅 [签到] {res.get('sign_msg') or '-'}")
+            print(f"   🎯 [任务] 处理 {res.get('task_count')} 个，今日 +{res.get('total_reward')} 捷停币")
+            print(f"   💰 [余额] {res.get('balance')} 捷停币｜可抵扣 {res.get('deduct_amount')} 元")
         else:
-            notify_content += f"- 失败原因：{res['error']}\n"
+            print(f"❌ 【{title}】")
+            print(f"   🔐 [登录] {res.get('login_source') or '-'}")
+            print(f"   📅 [签到] {res.get('sign_msg') or '-'}")
+            print(f"   💰 [余额] {res.get('balance')} 捷停币")
+            print(f"   ⚠️ [失败] {res.get('error') or '未知错误'}")
 
-    await send_plusplus_notification("捷停车每日任务完成", notify_content)
-
-    success_count = sum(1 for r in results if r['success'])
+    success_count = sum(1 for r in results if r.get("success"))
     fail_count = len(results) - success_count
-    total_reward = sum(r['total_reward'] for r in results if r['success'])
+    total_reward = sum(r.get("total_reward", 0) for r in results if r.get("success"))
     log_footer(success_count, fail_count, total_reward)
+
+    if NOTIFY_ENABLED:
+        content = build_notify(results)
+        if send_qinglong_notify("捷停车每日任务完成", content):
+            print("   📮 [通知] 已调用青龙 notify.py")
+        else:
+            print("   ℹ️ [通知] 未找到青龙 notify.py")
+        if PLUSPLUS_TOKEN:
+            await send_plusplus_notification("捷停车每日任务完成", content)
+    else:
+        print("   ℹ️ [通知] JTC_NOTIFY=0，已关闭通知")
+
+    return results
 
 if __name__ == "__main__":
     try:
