@@ -504,15 +504,18 @@ class WnnTask:
         msg = str((data or {}).get("msg") or "")
         if code == CODE_OK:
             log("   🌱 [森林] 种树成功，重新读取水滴")
-            status, data = self.call("getZgForest")
-            drops = self.read_drops(data)
-            if drops is not None:
-                self.drops = drops
-                self.drops_known = True
-                log(f"   💧 [水滴] 当前 {drops}g")
-                return True
-            debug_dump("种树后仍未解析出水滴", data)
-            log("   ⚠️ [森林] 种树成功但未读到水滴")
+            for _ in range(3):
+                time.sleep(1)
+                _, data = self.call("getZgForest")
+                drops = self.read_drops(data)
+                if drops is not None:
+                    self.drops = drops
+                    self.drops_known = True
+                    extra = "（新树暂无水滴，等任务补）" if drops == 0 else ""
+                    log(f"   💧 [水滴] 当前 {drops}g{extra}")
+                    return True
+                debug_dump("种树后未解析出水滴", data)
+            log("   ℹ️ [森林] 种树成功，水滴暂未返回，继续执行后续任务")
             return False
         if is_auth_fail(data):
             log(f"   ❌ [森林] 种树失败：{msg or 'token 失效'}")
