@@ -1,8 +1,19 @@
 // name: 飞鹤星妈会
 // cron: 8 15,3 * * *
-// 环境变量：FHXMH_GAME=0 关闭闯关；FHXMH_GAME_WAIT_MIN/MAX 随机等待秒（默认30~60）；FHXMH_GAME_LEVEL 指定关卡；
-// FHXMH_GAME_SCORE 固定分数（不设则随机）；FHXMH_GAME_SCORE_MIN/MAX 随机区间（默认280~320）；FHXMH_GAME_PLAYS 固定局数（不设则5~10随机）；
-// FHXMH_GAME_ACTIVITY_GUID 活动 GUID（默认 jntkxkaa）；FHXMH_NOTIFY=0 关闭青龙/PushPlus 通知
+// 环境变量（游戏配置）：
+//   FHXMH_GAME=1/0                 闯关开关，默认 1 开启；0/false/off 关闭（关闭后仍巡检排行榜，只读不提交）
+//   FHXMH_GAME_DATES               仅在这些日期闯关，例如 2026-11-26 或 2026-11-26~2026-11-30；未命中只检测排名
+//   FHXMH_GAME_SCORE_RANGE         每局分数区间，一个变量即可，例如 300-400
+//   FHXMH_GAME_PLAYS_RANGE         每次每账号局数区间，例如 5-10
+//   FHXMH_GAME_WAIT_RANGE          每局等待秒数区间，例如 30-60
+//   FHXMH_GAME_SCORE_MIN/MAX       兼容旧写法；未设置 RANGE 时生效
+//   FHXMH_GAME_PLAYS_MIN/MAX       兼容旧写法；未设置 RANGE 时生效
+//   FHXMH_GAME_WAIT_MIN/MAX        兼容旧写法；未设置 RANGE 时生效
+//   FHXMH_GAME_SCORE               可选，设置后固定分数，覆盖随机区间
+//   FHXMH_GAME_PLAYS               可选，设置后固定局数，覆盖随机局数
+//   FHXMH_GAME_LEVEL               可选，指定起始关卡；0 = 自动
+//   FHXMH_GAME_ACTIVITY_GUID       活动 GUID，默认 jntkxkaa
+//   FHXMH_NOTIFY=0                 关闭青龙/PushPlus 通知
 // 说明：闯关无法真实操作小游戏，脚本按目标分模拟对局并提交成绩（AES 加密与 H5 一致）；分数越高排名越靠前，但异常分值会被后台判定异常并封禁，建议小号先试
 const axios = require("axios");
 const fs = require("fs");
@@ -187,7 +198,111 @@ async function request(options) {
 
 // ====================== 业务逻辑 ======================
 const API_BASE = (process.env.FHXMH_API_BASE || "https://momclub.feihe.com/capis").replace(/\/+$/, "");
-const GAME_ON = String(process.env.FHXMH_GAME ?? "1") !== "0";
+function envNumber(name, fallback) {
+    const raw = process.env[name];
+    if (raw === undefined || raw === null || String(raw).trim() === "") return fallback;
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : fallback;
+}
+
+function parseRangeText(text) {
+    const match = String(text || "").match(/^\s*(-?\d+(?:\.\d+)?)\s*(?:-|~|～|至|到)\s*(-?\d+(?:\.\d+)?)\s*$/);
+    if (!match) return null;
+    return [Number(match[1]), Number(match[2])];
+}
+
+function readRange(rangeName, minName, maxName, defaultMin, defaultMax, limitMin, limitMax) {
+    let lo = defaultMin;
+    let hi = defaultMax;
+    const rangeValue = process.env[rangeName];
+    if (rangeValue !== undefined && rangeValue !== null && String(rangeValue).trim() !== "") {
+        const parsed = parseRangeText(rangeValue);
+        if (parsed) [lo, hi] = parsed;
+    } else {
+        lo = envNumber(minName, defaultMin);
+        hi = envNumber(maxName, defaultMax);
+    }
+    lo = Math.min(lo, hi);
+    hi = Math.max(lo, hi);
+    const low = Math.max(limitMin, Math.min(limitMax, lo));
+    const high = Math.max(low, Math.min(limitMax, hi));
+    return [low, high];
+}
+
+/** 取北京时间日期（避免青龙容器 UTC 时区把日期算错） */
+function cstDateString(date = new Date()) {
+    try {
+        const parts = new Intl.DateTimeFormat("en-CA", {
+            timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+        }).formatToParts(date);
+        const map = {};
+        for (const p of parts) if (p.type !== "literal") map[p.type] = p.value;
+        return `${map.year}-${map.month}-${map.day}`;
+    } catch (e) {
+        return new Date(date.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+    }
+}
+
+function normalizeDateText(text) {
+    const m = String(text || "").trim().match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/);
+    if (!m) return null;
+    const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
+    const dt = new Date(Date.UTC(y, mo - 1, d));
+    if (!Number.isFinite(dt.getTime()) || dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return null;
+    return `${y}-${String(mo).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
+
+/** 支持单日、多日、日期区间，例如 2026-11-26 或 2026-11-26~2026-11-30 */
+function parseGameDateRule(spec, today) {
+    const raw = String(spec || "").trim();
+    if (!raw) return { ok: true, matched: true, invalid: [] };
+    const todayText = normalizeDateText(today);
+    if (!todayText) return { ok: false, matched: false, invalid: [], error: "无法获取当前日期" };
+    const tokens = raw.split(/[,，;；\n\r]+/).map(s => s.trim()).filter(Boolean);
+    const invalid = [];
+    const valid = [];
+    let matched = false;
+    for (const token of tokens) {
+        const rangeMatch = token.match(/^(\d{4}[-/.]\d{1,2}[-/.]\d{1,2})\s*(?:~|～|至|到|—|–|--|-)\s*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2})$/);
+        if (rangeMatch) {
+            let start = normalizeDateText(rangeMatch[1]);
+            let end = normalizeDateText(rangeMatch[2]);
+            if (!start || !end) {
+                invalid.push(token);
+                continue;
+            }
+            if (start > end) [start, end] = [end, start];
+            valid.push(`${start}~${end}`);
+            if (todayText >= start && todayText <= end) matched = true;
+            continue;
+        }
+        const day = normalizeDateText(token);
+        if (!day) {
+            invalid.push(token);
+            continue;
+        }
+        valid.push(day);
+        if (day === todayText) matched = true;
+    }
+    if (!valid.length) return { ok: false, matched: false, invalid, error: "日期格式无法识别" };
+    return { ok: true, matched, invalid, valid, today: todayText };
+}
+
+const GAME_ON = !["0", "false", "off", "no"].includes(
+    String(process.env.FHXMH_GAME ?? "1").trim().toLowerCase()
+);
+const GAME_DATE_SPEC = String(process.env.FHXMH_GAME_DATES ?? process.env.FHXMH_GAME_DATE ?? "").trim();
+const GAME_DATE_TODAY = cstDateString();
+const GAME_DATE_RULE = parseGameDateRule(GAME_DATE_SPEC, GAME_DATE_TODAY);
+const GAME_DATE_MATCHED = !GAME_DATE_SPEC || GAME_DATE_RULE.matched;
+const GAME_ACTIVE = GAME_ON && GAME_DATE_RULE.ok && GAME_DATE_MATCHED;
+const GAME_SKIP_REASON = !GAME_ON
+    ? "游戏已关闭"
+    : !GAME_DATE_RULE.ok
+        ? `游戏日期配置无效（${GAME_DATE_RULE.error}）`
+        : GAME_DATE_SPEC && !GAME_DATE_MATCHED
+            ? `今天 ${GAME_DATE_TODAY} 不在游戏日期内`
+            : "";
 // 鹤小飞超级大闯关真实链路：momclub token -> ca.rrx.cn 换取 rrx JWT -> resactiviy 闯关接口
 const RRX_CA = (process.env.FHXMH_RRX_CA || "https://ca.rrx.cn").replace(/\/+$/, "");
 const RRX_SITE = process.env.FHXMH_RRX_SITE || "tv23ty";
@@ -196,16 +311,19 @@ const RRX_ACT = process.env.FHXMH_GAME_ACTIVITY_GUID || "jntkxkaa";
 const RRX_CHANNEL = process.env.FHXMH_RRX_CHANNEL || "2";
 const RRX_PCS = process.env.FHXMH_RRX_PCS || "7c9a359609ec215d"; // H5 AES key/iv（window.RRX_WSITE_INFO.pcs）
 const GAME_LEVEL_WANT = Number(process.env.FHXMH_GAME_LEVEL || 0); // 0 = 自动取可玩关卡
-const GAME_WAIT_MIN = Math.max(5, Math.min(300, Number(process.env.FHXMH_GAME_WAIT_MIN || 30))); // 每局随机等待下限
-const GAME_WAIT_MAX = Math.max(GAME_WAIT_MIN, Math.min(300, Number(process.env.FHXMH_GAME_WAIT_MAX || 60))); // 上限
+const [GAME_WAIT_MIN, GAME_WAIT_MAX] = readRange(
+    "FHXMH_GAME_WAIT_RANGE", "FHXMH_GAME_WAIT_MIN", "FHXMH_GAME_WAIT_MAX", 30, 60, 5, 300
+); // 每局随机等待，默认 30~60 秒
 const GAME_SCORE = Number(process.env.FHXMH_GAME_SCORE || 0); // 0 = 每局在 GAME_SCORE_MIN~MAX 间随机（可用 FHXMH_GAME_SCORE 固定指定）
 const GAME_DEBUG = String(process.env.FHXMH_DEBUG ?? "0") === "1";
-const GAME_SCORE_MIN = Math.max(0, Number(process.env.FHXMH_GAME_SCORE_MIN || 280)); // 随机下限，默认 280
-const GAME_SCORE_MAX = Math.max(GAME_SCORE_MIN, Number(process.env.FHXMH_GAME_SCORE_MAX || 320)); // 随机上限，默认 320
+const [GAME_SCORE_MIN, GAME_SCORE_MAX] = readRange(
+    "FHXMH_GAME_SCORE_RANGE", "FHXMH_GAME_SCORE_MIN", "FHXMH_GAME_SCORE_MAX", 280, 320, 0, 400
+); // 每局分数，默认 280~320
 const GAME_TOP_SKIP = Math.max(1, Number(process.env.FHXMH_GAME_TOP_SKIP || 5)); // 排名进入前 N 名就不再玩
 const GAME_PLAYS = Math.max(0, Math.min(20, Number(process.env.FHXMH_GAME_PLAYS || 0))); // 0 = 每次每个账号随机 5~10 局
-const GAME_PLAYS_MIN = Math.max(1, Math.min(20, Number(process.env.FHXMH_GAME_PLAYS_MIN || 5)));
-const GAME_PLAYS_MAX = Math.max(GAME_PLAYS_MIN, Math.min(20, Number(process.env.FHXMH_GAME_PLAYS_MAX || 10)));
+const [GAME_PLAYS_MIN, GAME_PLAYS_MAX] = readRange(
+    "FHXMH_GAME_PLAYS_RANGE", "FHXMH_GAME_PLAYS_MIN", "FHXMH_GAME_PLAYS_MAX", 5, 10, 1, 20
+); // 每次每账号局数，默认 5~10
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781 MiniProgramEnv/Windows WindowsWechat/WMPF";
 const RRX_INFO = (process.env.FHXMH_RRX_INFO || "https://resinfo.rrx.cn").replace(/\/+$/, "");
@@ -462,9 +580,24 @@ class FeiheMom {
 
     /** 鹤小飞超级大闯关：取 JWT → 查可玩关卡 → 开局 → 提交成绩 → 领奖机会 */
     async playGame(profile) {
-        if (!GAME_ON) {
-            console.log("   ℹ️ [游戏] FHXMH_GAME=0，已跳过");
-            return { ok: true, skipped: true, text: "已关闭（FHXMH_GAME=0）" };
+        if (!GAME_ACTIVE) {
+            // 游戏关闭或未到指定日期时仍然巡检排行榜，只读不提交成绩；日志统一由主流程输出
+            const skipReason = GAME_SKIP_REASON || "游戏未开启";
+            try {
+                const auth = await this.rrxAuth();
+                const rank = await this.getRankInfo(auth);
+                if (rank.rank > 0) {
+                    return {
+                        ok: true,
+                        skipped: true,
+                        text: `${skipReason}，仅检测排名：第 ${rank.rank} 名${rank.totalScore ? `，总分 ${rank.totalScore}` : ""}，已玩 ${rank.playCount} 局`,
+                    };
+                }
+                return { ok: true, skipped: true, text: `${skipReason}，仅检测排名：当前未上榜` };
+            } catch (e) {
+                const msg = e && e.message ? e.message : String(e);
+                return { ok: true, skipped: true, text: `${skipReason}，排名检测失败（${brief(msg, 60)}）` };
+            }
         }
         try {
             let auth = await this.rrxAuth();
@@ -669,7 +802,8 @@ async function runAccount(entry, index) {
             result.gameText = game.skipped && /当前无游戏任务/.test(game.text || "") ? "" : (game.text || "");
             result.gameOk = game.ok !== false;
             if (result.gameText) {
-                console.log(`   ${game.skipped ? "ℹ️" : result.gameOk ? "✅" : "❌"} [游戏] ${result.gameText}`);
+                const icon = game.skipped && !GAME_ACTIVE ? "🏅" : game.skipped ? "ℹ️" : result.gameOk ? "✅" : "❌";
+                console.log(`   ${icon} [游戏] ${result.gameText}`);
             }
             if (game.ok !== false) {
                 const after = await runner.profile();
@@ -748,8 +882,12 @@ function deltaText(before, after) {
     boxLine("🕒 启动时间", new Date().toLocaleString("zh-CN"));
     boxLine("🔢 账号数量", `${SERVERS.length} 个`);
     boxLine("💾 缓存", "fhxmh_token_cache.json");
-    boxLine("🎮 分数", GAME_ON ? (GAME_SCORE > 0 ? `固定 ${GAME_SCORE}` : `${GAME_SCORE_MIN}~${GAME_SCORE_MAX} 随机/局`) : "已关闭");
-    boxLine("🎮 局数", GAME_ON ? (GAME_PLAYS > 0 ? `固定 ${GAME_PLAYS} 局/账号` : `${GAME_PLAYS_MIN}~${GAME_PLAYS_MAX} 局随机/账号`) : "已关闭");
+    boxLine("🎮 开关", GAME_ACTIVE ? "开启" : !GAME_ON ? "关闭（仍检测排名）" : !GAME_DATE_RULE.ok ? "日期配置无效（仅检测排名）" : "未到指定日期（仅检测排名）");
+    boxLine("📅 日期", GAME_DATE_SPEC || "不限制");
+    boxLine("📅 今日", GAME_DATE_TODAY);
+    boxLine("🎮 分数", GAME_ACTIVE ? (GAME_SCORE > 0 ? `固定 ${GAME_SCORE}` : `${GAME_SCORE_MIN}~${GAME_SCORE_MAX} 随机/局`) : "未开启");
+    boxLine("🎮 局数", GAME_ACTIVE ? (GAME_PLAYS > 0 ? `固定 ${GAME_PLAYS} 局/账号` : `${GAME_PLAYS_MIN}~${GAME_PLAYS_MAX} 局随机/账号`) : "未开启");
+    boxLine("⏳ 等待", GAME_ACTIVE ? `${GAME_WAIT_MIN}~${GAME_WAIT_MAX}s 随机/局` : "未开启");
     boxLine("🌐 网络", process.env.FHXMH_PROXY_API ? "代理" : "直连");
     boxBottom();
 
