@@ -47,7 +47,7 @@ let frinds = [];
 let totalAccountsfrinds = [];
 let msg = '';
 let ok = '';
-let exploreRecords = {};   // 探险收获记录: {账号备注: [皮肤名, ...]}
+let exploreRecords = {};   // 探险收获记录: {账号备注: [积分/饲料/皮肤名, ...]}
 
 // ===================== JSON 文件读写 =====================
 function readTokenFile() {
@@ -67,6 +67,38 @@ function writeTokenFile(tokenData) {
         fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokenData, null, 2), 'utf8');
     } catch (e) {
         console.log('写入 token 文件失败:', e);
+    }
+}
+
+/** 北京时间日期，用于按天保存探险记录 */
+function cstDateString() {
+    return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+/** 北京时间显示，避免青龙容器本身是 UTC+8 时重复加 8 小时 */
+function cstDateTimeString() {
+    return new Date().toLocaleString('zh-CN', {
+        timeZone: 'Asia/Shanghai',
+        hour12: false
+    });
+}
+
+function formatExploreItems(items) {
+    const counts = {};
+    for (const item of items || []) {
+        const name = String(item || '未知');
+        counts[name] = (counts[name] || 0) + 1;
+    }
+    return Object.keys(counts).map(name => counts[name] > 1 ? `${name}×${counts[name]}` : name).join('、');
+}
+
+function saveExploreRecords() {
+    try {
+        const store = readTokenFile();
+        store.explore = { date: cstDateString(), accounts: exploreRecords };
+        writeTokenFile(store);
+    } catch (e) {
+        console.log('保存探险记录失败:', e.message);
     }
 }
 
@@ -212,6 +244,16 @@ async function Envs() {
     const tokenStore = readTokenFile();
     if (!tokenStore.accounts) tokenStore.accounts = {};
 
+    // 探险记录按北京时间跨运行保留，今天已探险完也能看到当天收获
+    const exploreDate = cstDateString();
+    if (tokenStore.explore && tokenStore.explore.date === exploreDate && tokenStore.explore.accounts) {
+        exploreRecords = tokenStore.explore.accounts;
+    } else {
+        exploreRecords = {};
+        tokenStore.explore = { date: exploreDate, accounts: {} };
+        writeTokenFile(tokenStore);
+    }
+
     for (const entry of SERVERS) {
         const { server, ref, remark } = parseYybGoEntry(entry);
         if (!server || !ref) {
@@ -241,7 +283,7 @@ async function Envs() {
     console.log(`目前实现功能：日常签到、摸马儿、喂马、偷饲料、分享马儿、喂饲料、互助点赞、完善个人信息、探险（随机皮肤+自动穿戴）`);
     console.log(`\n═══════════════════════════════════════════`);
     console.log(`🐎 战马能量星球 | 共 ${zmnlxqArr.length} 个账号`);
-    console.log(`🕐 执行时间(UTC+8)：${new Date(new Date().getTime() + 8*3600000).toLocaleString()}`);
+    console.log(`🕐 执行时间(UTC+8)：${cstDateTimeString()}`);
     console.log(`═══════════════════════════════════════════\n`);
 
     let totalOk = 0;
@@ -320,6 +362,17 @@ async function Envs() {
                 }
                 await $.wait(3000);
             }
+            await $.wait(1000);
+            const exploreDetails = await getTodayExploreDetails();
+            if (exploreDetails.length) {
+                console.log(`│  📦 今日探险明细（${exploreDetails.length}次）`);
+                exploreDetails.forEach((detail, idx) => {
+                    console.log(`│     ${idx + 1}. ${detail}`);
+                });
+            } else {
+                const exploreItems = exploreRecords[remark] || [];
+                console.log(`│  📦 今日探险明细：${exploreItems.length ? formatExploreItems(exploreItems) + `（共${exploreItems.length}件）` : '暂无记录'}`);
+            }
             console.log(`└─ ✅ 任务完成\n`);
             totalOk++;
         } else {
@@ -356,17 +409,28 @@ async function Envs() {
 
     console.log(`┌─ 📊 执行总结`);
     console.log(`│  ✅ 成功 ${totalOk}/${zmnlxqArr.length}`);
-    console.log(`└─ 完成时间: ${new Date(new Date().getTime() + 8*3600000).toLocaleString()}`);
+    console.log(`└─ 完成时间: ${cstDateTimeString()}`);
 
-    // 探险收获清单
-    const exploreKeys = Object.keys(exploreRecords);
-    if (exploreKeys.length) {
-        console.log(`\n┌─ 🎲 今日探险收获`);
-        for (const acc of exploreKeys) {
-            console.log(`│  ${acc}：${exploreRecords[acc].join('、')}`);
+    // 探险明细汇总：优先取消息列表里的“探险获得”，并带数值
+    console.log(`\n┌─ 🎲 今日探险明细`);
+    let exploreTotal = 0;
+    for (let i = 0; i < zmnlxqArr.length; i++) {
+        const remark = zmnlxqArr[i].remark || `账号${i+1}`;
+        zmnlxq = zmnlxqArr[i].safe;
+        zmnlxqSkey = zmnlxqArr[i].skey;
+        const details = await getTodayExploreDetails();
+        if (details.length) {
+            console.log(`│  ${remark}：${details.join('、')}`);
+            exploreTotal += details.length;
+        } else if ((exploreRecords[remark] || []).length) {
+            const localItems = exploreRecords[remark];
+            console.log(`│  ${remark}：${formatExploreItems(localItems)}`);
+            exploreTotal += localItems.length;
+        } else {
+            console.log(`│  ${remark}：暂无记录`);
         }
-        console.log(`└─ 共 ${exploreKeys.reduce((s, k) => s + exploreRecords[k].length, 0)} 件`);
     }
+    console.log(`└─ 共 ${exploreTotal} 次`);
 
     if (msg) console.log(msg);
 })()
@@ -659,6 +723,63 @@ function getmoyimo(timeout = 2000) {
     });
 }
 
+function formatExploreMessage(msgval) {
+    const parts = (msgval || []).slice(1)
+        .map(v => String(v?.txt ?? '').trim())
+        .filter(Boolean);
+    if (!parts.length) return '未知';
+    // “探险获得 / 430g / 饲料” -> “饲料 430g”
+    if (parts.length >= 2 && /^\d+(\.\d+)?(?:g|G)?$/.test(parts[0])) {
+        return `${parts.slice(1).join('')} ${parts[0]}`;
+    }
+    return parts.join(' ');
+}
+
+function gethorsemsglist(page = 1, timeout = 3000) {
+    return new Promise((resolve) => {
+        $.get({
+            url: `${BASE_URL}/gethorsemsglist?safe=${zmnlxq}&page=${page}`,
+            headers: getCommonHeaders(),
+            timeout
+        }, (err, resp, data) => {
+            try {
+                const result = JSON.parse(data);
+                resolve(result.status == 1 ? result : null);
+            } catch (e) { resolve(null); }
+        });
+    });
+}
+
+/** 从消息列表读取当天“探险获得”明细，已探险满 3 次也能补出历史 */
+async function getTodayExploreDetails() {
+    const today = cstDateString();
+    const details = [];
+    const seen = new Set();
+    let previousFirstKey = '';
+    for (let page = 1; page <= 5; page++) {
+        const result = await gethorsemsglist(page);
+        if (!result || !Array.isArray(result.data)) break;
+        const firstKey = JSON.stringify([result.data[0]?.msgtm, result.data[0]?.msgval]);
+        if (page > 1 && firstKey === previousFirstKey) break; // 接口不支持 page 时避免重复
+        previousFirstKey = firstKey;
+        for (const item of result.data) {
+            const time = String(item?.msgtm || '');
+            if (!time.startsWith(today)) continue;
+            const msgval = item?.msgval || [];
+            if (!String(msgval[0]?.txt || '').includes('探险')) continue;
+            const key = JSON.stringify([time, msgval]);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            details.push(formatExploreMessage(msgval));
+        }
+        const oldest = String(result.data[result.data.length - 1]?.msgtm || '').slice(0, 10);
+        if (oldest && oldest < today) break;
+        const pageSize = Number(result.pageSize) || 50;
+        if (result.data.length < pageSize) break;
+    }
+    return details;
+}
+
 function tanxian(timeout = 2000) {
     return new Promise((resolve) => {
         $.get({
@@ -678,6 +799,7 @@ function tanxian(timeout = 2000) {
                     const curRemark = zmnlxqArr.find(a => a.safe === zmnlxq)?.remark || '未命名';
                     if (!exploreRecords[curRemark]) exploreRecords[curRemark] = [];
                     exploreRecords[curRemark].push(result.winname || `装备${eqid}`);
+                    saveExploreRecords();
                 } else {
                     msgText = result.msg || '探险失败';
                     console.log(`      ${msgText}`);
