@@ -4,7 +4,7 @@
 # cron: 10 8,20 * * *
 """
 OPPO 商城 微信小程序 签到 + 浏览任务脚本
-版本: 2.1.0
+版本: 2.1.2
 YYB Go 取码服务（YYB_SERVER，格式：地址@微信账号标识，多账号换行分隔）
 品赞代理（PROXY_API，业务请求代理优先，失败直连兜底）
 PushPlus 推送（PLUSPLUS_TOKEN）
@@ -893,9 +893,167 @@ class OppoMiniClient:
         pts = cfg.get("pointsNum")
         return str(pts) if pts is not None else "?"
 
+    def today_sign_points(self) -> Optional[int]:
+        """从签到详情的 baseAwards 里取今天已到账的积分。"""
+        self.last_error = ""
+        detail = self.sign_detail()
+        if not detail or self.last_error:
+            return None
+        awards = detail.get("baseAwards")
+        if not isinstance(awards, list):
+            return None
+        today = time.strftime("%Y-%m-%d")
+        for item in awards:
+            if str(item.get("signTime") or "")[:10] != today:
+                continue
+            if int(item.get("status") or 0) != 1:
+                return 0
+            if int(item.get("awardType") or 1) != 1:
+                return 0
+            try:
+                return int(item.get("awardValue") or 0)
+            except Exception:
+                return 0
+        return None
+
+    def today_task_points(self, stats: dict) -> Optional[int]:
+        """统计当天已领取的每日任务积分。
+
+        任务列表里的 taskStatus=3 表示已领取，taskCycle=0 表示每日任务；
+        本轮刚领取的任务用 receiveAward 返回的实际积分数，避免列表状态延迟导致漏记。
+        """
+        self.last_error = ""
+        tasks = self.task_list()
+        if self.auth_expired or self.last_error:
+            return None
+        claimed = {tid: int(pts or 0) for tid, pts in (stats.get("claimed") or [])}
+        total = 0
+        counted_ids = set()
+        for task in tasks:
+            if int(task.get("taskStatus") or 0) != TASK_STATUS_DONE:
+                continue
+            if int(task.get("taskCycle") or 0) != 0:
+                continue
+            task_id = str(task.get("taskId") or "")
+            if task_id and task_id in claimed:
+                total += claimed[task_id]
+                counted_ids.add(task_id)
+                continue
+            try:
+                total += int((task.get("awardAttachConfig") or {}).get("pointsNum") or 0)
+            except Exception:
+                pass
+        for task_id, pts in claimed.items():
+            if task_id not in counted_ids:
+                total += pts
+        return total
+
+    def daily_credit_ledger(self) -> Optional[dict]:
+        """读取积分明细，统计当天获得/消耗。
+
+        myoppo.heytap.com 的积分明细只认 NEWOPPOSID（即登录返回的 aesSessionId），
+        不需要额外签名；按时间倒序分页，读到昨天就停止。
+        """
+        if not self.aes_key:
+            return None
+        today = time.strftime("%Y-%m-%d")
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://myoppo.heytap.com",
+            "Referer": "https://myoppo.heytap.com/myoppo-member-fusion/creditDetail",
+            "User-Agent": UA,
+            "s_channel": "program_wx",
+            "source_type": "503",
+        }
+        records = []
+        seen = set()
+        amount = None
+        last_ts = None
+        try:
+            for page in range(1, 6):
+                body = {
+                    "loadSize": 20,
+                    "timestamp": int(time.time() * 1000),
+                    "filterType": "ALL",
+                }
+                if last_ts:
+                    body["lastRecordTimeStamp"] = last_ts
+                resp = request_with_proxy(
+                    "POST",
+                    "https://myoppo.heytap.com/cn/oapi/credit-web/v3/creditsRecord",
+                    json=body,
+                    headers=headers,
+                    cookies={"NEWOPPOSID": self.aes_key},
+                    proxies=self.proxies,
+                    server=self.server,
+                    timeout=BROWSE_TIMEOUT,
+                )
+                data = resp.json()
+                if int(data.get("code") or 0) != 200:
+                    return None
+                payload = data.get("data") or {}
+                if amount is None and payload.get("amount") is not None:
+                    amount = int(payload.get("amount") or 0)
+                page_records = []
+                for group in payload.get("groups") or []:
+                    for item in group.get("creditsList") or []:
+                        key = (item.get("bizOrder") or
+                               (item.get("createTimeTimestamp"), item.get("amount"),
+                                item.get("recordType"), item.get("description")))
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        page_records.append(item)
+                        records.append(item)
+                if not page_records:
+                    break
+                last_ts = page_records[-1].get("createTimeTimestamp")
+                if str(page_records[-1].get("createTime") or "")[:10] < today:
+                    break
+                if not records and page == 1:
+                    break
+        except Exception as exc:
+            self.last_error = str(exc)
+            return None
+
+        groups = {}
+        earned = 0
+        spent = 0
+        for item in records:
+            if str(item.get("createTime") or "")[:10] != today:
+                continue
+            try:
+                amt = int(item.get("amount") or 0)
+            except Exception:
+                continue
+            change = -amt if str(item.get("recordType")) == "sub" else amt
+            if change >= 0:
+                earned += change
+            else:
+                spent += change
+            label = str(item.get("description") or "其他").strip() or "其他"
+            group = groups.setdefault(label, {"count": 0, "score": 0})
+            group["count"] += 1
+            group["score"] += change
+
+        breakdown = [
+            f"{label} {value['score']:+d} ×{value['count']}"
+            for label, value in sorted(groups.items(), key=lambda kv: (-kv[1]["score"], kv[0]))
+        ]
+        return {
+            "ok": True,
+            "amount": amount,
+            "earned": earned,
+            "spent": spent,
+            "net": earned + spent,
+            "count": sum(v["count"] for v in groups.values()),
+            "breakdown": breakdown,
+        }
+
     def do_browse_tasks(self, simulate_wait: bool = True) -> dict:
         stats = {"done": 0, "awarded": 0, "skipped": 0, "failed": 0, "points": 0,
-                 "details": [], "manual_hint": False}
+                 "details": [], "manual_hint": False, "claimed": []}
         tasks = self.task_list()
         if not tasks:
             log("   ⚠️ [任务] 任务列表为空")
@@ -951,6 +1109,7 @@ class OppoMiniClient:
             if ok:
                 stats["awarded"] += 1
                 stats["points"] += pts
+                stats["claimed"].append((task_id, pts))
                 if pts:
                     stats["details"].append(f"{name} +{pts}")
                     log(f"   🎁 [任务] {name} 领奖成功（+{pts}）")
@@ -1019,6 +1178,14 @@ def run_account(server: str, sign_act_id: str, task_act_id: str,
         "sign": "",
         "tasks": "",
         "points_delta": 0,
+        "today_points": None,
+        "today_sign_points": None,
+        "today_task_points": None,
+        "today_earned": None,
+        "today_spent": None,
+        "today_count": None,
+        "today_breakdown": [],
+        "today_source": "",
         "error": "",
         "proxyStatus": "未使用代理",
         "proxyIp": "-",
@@ -1120,6 +1287,30 @@ def run_account(server: str, sign_act_id: str, task_act_id: str,
                                f"（+{stats['points']}）· 跳过 {stats['skipped']} · 失败 {stats['failed']}")
             if stats.get("manual_hint"):
                 log("   ℹ️ [任务] 非浏览任务需人工完成")
+
+            # ---------- ④-1 当天已到账积分：优先积分流水，失败退回签到+每日任务 ----------
+            ledger = client.daily_credit_ledger()
+            if ledger and ledger.get("ok"):
+                result["today_points"] = ledger["net"]
+                result["today_earned"] = ledger["earned"]
+                result["today_spent"] = ledger["spent"]
+                result["today_count"] = ledger["count"]
+                result["today_breakdown"] = ledger["breakdown"]
+                result["today_source"] = "积分流水"
+                log(f"   📥 [今日] 获得 +{ledger['earned']} / 消耗 {ledger['spent']}"
+                    f"（{ledger['count']} 笔，积分流水）")
+                for item in ledger["breakdown"][:8]:
+                    log(f"      · {item}")
+            else:
+                today_sign = client.today_sign_points()
+                today_task = client.today_task_points(stats)
+                if today_sign is not None and today_task is not None:
+                    result["today_sign_points"] = today_sign
+                    result["today_task_points"] = today_task
+                    result["today_points"] = today_sign + today_task
+                    result["today_source"] = "签到+任务汇总"
+                    log(f"   📥 [今日] 获得 +{today_sign + today_task}"
+                        f"（签到 +{today_sign} · 任务 +{today_task}）")
 
             # ---------- ⑤ 执行中凭证失效 → 清缓存重登重跑一次 ----------
             if client.auth_expired and attempt == 0:
@@ -1234,6 +1425,10 @@ def main():
                 "points_before": None, "points_after": None,
                 "sign_points": 0, "task_points": 0, "sign": "", "tasks": "",
                 "points_delta": 0, "proxyStatus": "-", "proxyIp": "-",
+                "today_points": None, "today_sign_points": None,
+                "today_task_points": None, "today_earned": None,
+                "today_spent": None, "today_count": None,
+                "today_breakdown": [], "today_source": "",
             }
             log(f"   ❌ [异常] 该账号执行异常：{exc}")
         results.append(res)
@@ -1259,22 +1454,59 @@ def main():
             log(f"   📋 [任务] {res.get('tasks') or '无任务数据'}")
             log(f"   💰 [积分] {points_text(res.get('points_before'))} → "
                 f"{points_text(res.get('points_after'))}（{int(res.get('points_delta') or 0):+d}）")
+            if isinstance(res.get("today_points"), (int, float)):
+                if res.get("today_source") == "积分流水":
+                    log(f"   📥 [今日] 获得 +{int(res.get('today_earned') or 0)} / "
+                        f"消耗 {int(res.get('today_spent') or 0)}"
+                        f"（{int(res.get('today_count') or 0)} 笔，积分流水）")
+                    for item in (res.get("today_breakdown") or [])[:8]:
+                        log(f"      · {item}")
+                else:
+                    log(f"   📥 [今日] 获得 +{int(res.get('today_points'))}"
+                        f"（签到 +{int(res.get('today_sign_points') or 0)}"
+                        f" · 任务 +{int(res.get('today_task_points') or 0)}）")
         if not res.get("success"):
             log(f"   ⚠️ [失败] {res.get('error') or '未知原因'}")
 
     ok_count = sum(1 for r in results if r.get("success"))
     fail_count = len(results) - ok_count
     total_delta = sum(int(r.get("points_delta") or 0) for r in results if r.get("success"))
+    daily_values = [int(r.get("today_points")) for r in results
+                    if r.get("success") and isinstance(r.get("today_points"), (int, float))]
+    total_today = sum(daily_values) if daily_values else None
+    earned_values = [int(r.get("today_earned")) if isinstance(r.get("today_earned"), (int, float))
+                     else int(r.get("today_points") or 0)
+                     for r in results
+                     if r.get("success") and isinstance(r.get("today_points"), (int, float))]
+    total_earned = sum(earned_values) if earned_values else None
+    total_spent = sum(int(r.get("today_spent") or 0) for r in results
+                      if r.get("success") and isinstance(r.get("today_spent"), (int, float)))
+    total_count = sum(int(r.get("today_count") or 0) for r in results
+                      if r.get("success") and isinstance(r.get("today_count"), (int, float)))
 
     box_top("🏁 OPPO 商城 执行汇总")
     box_line("✅ 成功账号", f"{ok_count} / {len(results)}")
     box_line("❌ 失败账号", f"{fail_count} / {len(results)}")
-    box_line("💰 今日总新增", f"{total_delta} 积分")
+    if total_today is not None:
+        box_line("📥 今日总获得", f"{total_earned or 0} 积分")
+        if total_spent:
+            box_line("📉 今日总消耗", f"{total_spent} 积分")
+        box_line("📈 今日净增", f"{total_today} 积分")
+        if total_count:
+            box_line("🧾 今日笔数", f"{total_count} 笔")
+        box_line("💰 本次新增", f"{total_delta} 积分")
+    else:
+        box_line("💰 本次总新增", f"{total_delta} 积分")
     box_line("🕒 结束时间", now_text())
     box_bottom()
 
     # ---------- 通知 ----------
     lines = ["### OPPO 商城 签到任务"]
+    if total_today is not None:
+        lines.append(f"> 📥 今日总获得：**+{total_earned or 0}** 积分")
+        if total_spent:
+            lines.append(f"> 📉 今日总消耗：**{total_spent}** 积分")
+        lines.append(f"> 📈 今日净增：**{total_today}** 积分")
     for r in results:
         flag = "✅" if r.get("success") else "❌"
         lines.append(f"\n#### {flag} 账号 {r['index']} · {r.get('source', '-')}")
@@ -1285,6 +1517,17 @@ def main():
             lines.append(f"- 任务：{r.get('tasks') or '无任务数据'}")
             lines.append(f"- 积分：{points_text(r.get('points_before'))} → "
                          f"{points_text(r.get('points_after'))}（{int(r.get('points_delta') or 0):+d}）")
+            if isinstance(r.get("today_points"), (int, float)):
+                if r.get("today_source") == "积分流水":
+                    lines.append(f"- 今日：获得 +{int(r.get('today_earned') or 0)} / "
+                                 f"消耗 {int(r.get('today_spent') or 0)}"
+                                 f"（{int(r.get('today_count') or 0)} 笔，积分流水）")
+                    for item in (r.get("today_breakdown") or [])[:8]:
+                        lines.append(f"  - {item}")
+                else:
+                    lines.append(f"- 今日获得：+{int(r.get('today_points'))}"
+                                 f"（签到 +{int(r.get('today_sign_points') or 0)}"
+                                 f" / 任务 +{int(r.get('today_task_points') or 0)}）")
         if not r.get("success"):
             lines.append(f"- 失败原因：{r.get('error') or '未知'}")
     content = "\n".join(lines)
