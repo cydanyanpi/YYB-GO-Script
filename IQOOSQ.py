@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # name: iQOO社区
+# version: v1.0.2
 # cron: 20 8,20 * * *
 
 """
@@ -45,6 +46,7 @@ import requests
 
 
 APP_NAME = "iQOO社区小程序"
+VERSION = "v1.0.2"
 
 MINI_APP_ID = "wxcf4266fbc9463132"
 PAGE_VERSION = "256"
@@ -217,11 +219,14 @@ def read_cache_entry(ck, ref):
     entry = cache.get(ck)
     if isinstance(entry, dict) and entry.get("accessToken"):
         return entry
-    # 兼容旧版仅按 ref 存的缓存：读到就迁移到新键
-    legacy = cache.get(ref)
-    if isinstance(legacy, dict) and legacy.get("accessToken"):
+    # 兼容旧缓存：旧键可能没有协议头，或仅按 ref 存；按标识匹配后迁移到新键
+    candidates = [k for k, v in cache.items()
+                  if k != ck and isinstance(v, dict) and v.get("accessToken")
+                  and (k == ref or str(k).rsplit("|", 1)[-1] == str(ref))]
+    if candidates:
+        legacy = cache.get(candidates[0])
         cache[ck] = legacy
-        cache.pop(ref, None)
+        cache.pop(candidates[0], None)
         write_token_cache(cache)
         return legacy
     return {}
@@ -405,7 +410,34 @@ def send_pushplus(title, content):
 
 
 def build_notify(results):
+    daily_total = sum(
+        int(res.get("dailyDelta"))
+        for res in results
+        if isinstance(res.get("dailyDelta"), (int, float))
+    )
+    earned_total = sum(
+        int(res.get("todayEarned"))
+        for res in results
+        if isinstance(res.get("todayEarned"), (int, float))
+    )
+    spent_total = sum(
+        int(res.get("todaySpent"))
+        for res in results
+        if isinstance(res.get("todaySpent"), (int, float))
+    )
+    count_total = sum(
+        int(res.get("todayCount"))
+        for res in results
+        if isinstance(res.get("todayCount"), (int, float))
+    )
     lines = ["### iQOO社区 每日任务"]
+    if count_total:
+        lines.append(f"> 📈 今日获得：**+{earned_total}** 酷币（{count_total} 笔）")
+        if spent_total:
+            lines.append(f"> 📉 今日消耗：**{spent_total}** 酷币")
+        lines.append(f"> 📊 今日净增：**{daily_total:+d}** 酷币")
+    elif any(isinstance(res.get("dailyDelta"), (int, float)) for res in results):
+        lines.append(f"> 📈 今日合计：**{daily_total:+d}** 酷币（余额净增）")
     for res in results:
         flag = "✅" if res.get("success") else "❌"
         lines.append(f"\n#### {flag} 账号 {res['index']} · {res['source']}")
@@ -417,7 +449,16 @@ def build_notify(results):
             lines.append(f"- 签到：{res.get('signMsg') or '无结果'}")
             lines.append(f"- 抽奖：{res.get('drawMsg') or '无结果'}")
             lines.append(f"- 积分：{fmt_points(res.get('before'))} → "
-                         f"{fmt_points(res.get('after'))}（{int(res.get('delta') or 0):+d}）")
+                         f"{fmt_points(res.get('after'))}（本次 {int(res.get('delta') or 0):+d}）")
+            if isinstance(res.get("todayEarned"), (int, float)):
+                lines.append(f"- 今日：获得 +{int(res.get('todayEarned'))} / "
+                             f"消耗 {int(res.get('todaySpent') or 0)}"
+                             f"（{int(res.get('todayCount') or 0)} 笔，{res.get('scoreSource') or '余额基线'}）")
+                for item in (res.get("scoreBreakdown") or [])[:8]:
+                    lines.append(f"  - {item}")
+            elif res.get("dailyDelta") is not None:
+                lines.append(f"- 今日净增：{int(res.get('dailyDelta')):+d}"
+                             f"（起始 {res.get('dailyStart')}）")
         if not res.get("success"):
             lines.append(f"- 失败原因：{res.get('error') or '未知'}")
     return "\n".join(lines)
@@ -462,8 +503,10 @@ def parse_entry(raw):
         log(f"   ❌ [配置] YYB_SERVER 格式应为 地址@微信账号标识，当前值：{raw}")
         return "", "", note
     server, ref = value.rsplit("@", 1)
-    # 用正则剥协议头，避免 lstrip 按字符集误删 https 的 s
-    server = re.sub(r"^https?://", "", server.strip(), flags=re.IGNORECASE).rstrip("/")
+    server = server.strip().rstrip("/")
+    # 保留显式协议，未写协议时默认 http，避免 HTTPS 服务被强制降级
+    if not re.match(r"^https?://", server, re.I):
+        server = "http://" + server
     ref = ref.strip()
     if not server or not ref:
         log(f"   ❌ [配置] YYB_SERVER 缺少地址或账号标识，当前值：{raw}")
@@ -481,7 +524,7 @@ def get_code(entry):
     if not server or not ref:
         return None
 
-    url = f"http://{server}/wxapp/getCode"
+    url = f"{server.rstrip('/')}/wxapp/getCode"
 
     try:
         response = direct_session().post(
@@ -498,7 +541,12 @@ def get_code(entry):
             except Exception:
                 result = {}
         code = (result or {}).get("code")
-        if data.get("code") != 0 or not code:
+        # YYB 可能把 code 返回成字符串 "0"，统一按整数判断
+        try:
+            code_num = int(str(data.get("code")))
+        except (TypeError, ValueError):
+            code_num = -1
+        if code_num != 0 or not code:
             log(f"   ❌ [取码] 取码失败：{json_preview(data)}")
             return None
 
@@ -532,6 +580,17 @@ class Task:
         self.login_source = ""
         self.before = None
         self.after = None
+        self.daily_date = ""
+        self.daily_start = None
+        self.daily_delta = None
+        self.daily_source = ""
+        self.last_balance = None
+        self.last_balance_date = ""
+        self.today_earned = None
+        self.today_spent = None
+        self.today_count = None
+        self.today_breakdown = []
+        self.today_ledger_ok = False
         self.sign_ok = False
         self.task_ok = False
         self.draw_ok = False
@@ -549,6 +608,13 @@ class Task:
             "before": None,
             "after": None,
             "delta": 0,
+            "dailyStart": None,
+            "dailyDelta": None,
+            "dailyDate": "",
+            "todayEarned": None,
+            "todaySpent": None,
+            "todayCount": None,
+            "scoreSource": "",
             "signMsg": "-",
             "drawMsg": "-",
             "tasksMsg": "-",
@@ -641,6 +707,14 @@ class Task:
         result["userName"] = mask_name(self.user_name()) or "-"
         result["before"] = self.before
         result["after"] = self.after
+        result["dailyStart"] = self.daily_start
+        result["dailyDelta"] = self.daily_delta
+        result["dailyDate"] = self.daily_date
+        result["todayEarned"] = self.today_earned
+        result["todaySpent"] = self.today_spent
+        result["todayCount"] = self.today_count
+        result["scoreSource"] = "积分明细" if self.today_ledger_ok else "余额基线"
+        result["scoreBreakdown"] = list(self.today_breakdown)
         if isinstance(self.before, (int, float)) and isinstance(self.after, (int, float)):
             result["delta"] = int(self.after - self.before)
         return result
@@ -663,8 +737,56 @@ class Task:
 
     def report_user(self):
         self.before = self.current_points()
+        self.ensure_daily_baseline()
         log(f"   👤 [用户] {mask_name(self.user_name()) or '-'}")
         log(f"   💰 [积分] 当前 {fmt_points(self.before)} 酷币")
+
+    def ensure_daily_baseline(self):
+        """确定当天起始余额。
+
+        优先复用当天已记录的基线；跨天时优先用上一次运行的收盘余额，
+        这样即使当天第一次运行发生在手动签到/做任务之后，也能统计出当天净增。
+        只有没有任何历史收盘数据时，才退回“以当前余额为起点”。
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+        entry = read_cache_entry(self.ck, self.ref)
+        self.daily_source = ""
+
+        start = None
+        if self.daily_date == today and isinstance(self.daily_start, (int, float)):
+            start = int(self.daily_start)
+            self.daily_source = "今日已有基线"
+        elif entry.get("dailyDate") == today and isinstance(entry.get("dailyStart"), (int, float)):
+            start = int(entry.get("dailyStart"))
+            self.daily_date = today
+            self.daily_source = "今日已有基线"
+        else:
+            prev = None
+            prev_date = ""
+            if (isinstance(self.last_balance, (int, float))
+                    and self.last_balance_date and self.last_balance_date < today):
+                prev = int(self.last_balance)
+                prev_date = self.last_balance_date
+            elif (isinstance(entry.get("lastBalance"), (int, float))
+                  and entry.get("lastBalanceDate")
+                  and str(entry.get("lastBalanceDate")) < today):
+                prev = int(entry.get("lastBalance"))
+                prev_date = str(entry.get("lastBalanceDate"))
+            if prev is not None:
+                start = prev
+                self.daily_source = f"上次收盘 {prev_date}"
+            elif isinstance(self.before, (int, float)):
+                start = int(self.before)
+                self.daily_source = "无历史收盘，以本次为起点"
+
+        if start is not None:
+            self.daily_date = today
+            self.daily_start = start
+            if isinstance(self.before, (int, float)):
+                self.daily_delta = int(self.before - start)
+            self.save_cached_token()
+            if self.daily_source == "无历史收盘，以本次为起点":
+                log("   ℹ️ [今日] 暂无历史收盘余额，稍后优先用官方积分流水校准")
 
     def refresh_points(self):
         try:
@@ -676,10 +798,117 @@ class Task:
             return
 
         self.after = self.current_points()
+        if isinstance(self.after, (int, float)):
+            self.last_balance = int(self.after)
+            self.last_balance_date = datetime.now().strftime("%Y-%m-%d")
+            self.save_cached_token(update_last=True)
+
+        # 优先用官方积分流水统计当天：不依赖历史缓存，首次运行也能算准
+        ledger = self.fetch_today_score_ledger()
+        if ledger.get("ok"):
+            self.today_ledger_ok = True
+            self.today_earned = ledger["earned"]
+            self.today_spent = ledger["spent"]
+            self.today_count = ledger["count"]
+            self.today_breakdown = ledger["breakdown"]
+            self.daily_delta = ledger["net"]
+            self.daily_date = datetime.now().strftime("%Y-%m-%d")
+            self.daily_source = "积分明细"
+            if isinstance(self.after, (int, float)):
+                self.daily_start = int(self.after - ledger["net"])
+            log(f"   📥 [今日] 获得 +{ledger['earned']} / 消耗 {ledger['spent']}"
+                f"（{ledger['count']} 笔，官方积分流水）")
+            for line in ledger["breakdown"][:8]:
+                log(f"      · {line}")
+            if len(ledger["breakdown"]) > 8:
+                log(f"      · 其余 {len(ledger['breakdown']) - 8} 类略")
+        elif isinstance(self.daily_start, (int, float)) and isinstance(self.after, (int, float)):
+            self.daily_delta = int(self.after - self.daily_start)
+
         if isinstance(self.before, (int, float)) and isinstance(self.after, (int, float)):
-            log(f"   💰 [积分] {self.before} → {self.after}（{int(self.after - self.before):+d}）")
+            log(f"   💰 [积分] {self.before} → {self.after}（本次 {int(self.after - self.before):+d}）")
         else:
             log(f"   💰 [积分] 当前 {fmt_points(self.after)} 酷币")
+        if self.daily_delta is not None:
+            log(f"   📈 [今日] 净增 {self.daily_delta:+d}（起始 {self.daily_start} → 当前 {self.after}）")
+
+    def fetch_today_score_ledger(self):
+        """读取 v3/user.score.recode 当天流水，统计获得、消耗和分类明细。"""
+        empty = {"ok": False, "earned": 0, "spent": 0, "net": 0, "count": 0, "breakdown": []}
+        if not self.user_id:
+            log("   ⚠️ [明细] 缺少 userId，跳过当天流水")
+            return empty
+
+        today = datetime.now().strftime("%m-%d")
+        items = []
+        seen_older = False
+        total = None
+        try:
+            for page in range(1, 7):
+                result = self.request("v3/user.score.recode", {
+                    "page": page,
+                    "perPage": 20,
+                    "userId": self.user_id,
+                }, {"method": "GET"})
+                data = result.get("Data") or {}
+                page_items = data.get("list") or []
+                if total is None:
+                    total = int(data.get("total") or 0)
+                if not page_items:
+                    break
+                for item in page_items:
+                    created = str(item.get("created_at") or "")
+                    if created.startswith(today):
+                        items.append(item)
+                    elif items:
+                        seen_older = True
+                        break
+                if seen_older:
+                    break
+                if page == 1 and not items:
+                    break
+                if total and page * 20 >= total:
+                    break
+        except Exception as exc:
+            log(f"   ⚠️ [明细] 获取当天积分流水失败，改用余额基线（{exc}）")
+            return empty
+
+        groups = {}
+        earned = 0
+        spent = 0
+        for item in items:
+            if item.get("is_valid") is False:
+                continue
+            change = to_number(item.get("this_score"))
+            if change is None:
+                old = to_number(item.get("old_score"))
+                new = to_number(item.get("new_score"))
+                change = (new - old) if old is not None and new is not None else 0
+            change = int(change)
+            if change >= 0:
+                earned += change
+            else:
+                spent += change
+            reason = (item.get("get_reason")
+                      or ((item.get("score_rule") or {}).get("access"))
+                      or "其他")
+            reason = str(reason).replace("抽奖获取酷币：", "抽奖 ").strip()
+            group = groups.setdefault(reason, {"count": 0, "score": 0})
+            group["count"] += 1
+            group["score"] += change
+
+        breakdown = []
+        for reason, group in sorted(groups.items(), key=lambda kv: (-kv[1]["score"], kv[0])):
+            score = group["score"]
+            breakdown.append(f"{reason} {score:+d} ×{group['count']}")
+        return {
+            "ok": True,
+            "earned": earned,
+            "spent": spent,
+            "net": earned + spent,
+            "count": len(items),
+            "breakdown": breakdown,
+        }
 
     def run_daily_tasks(self):
         daily_tasks = self.fetch_daily_tasks()
@@ -766,16 +995,22 @@ class Task:
         else:
             log("   ℹ️ [任务] 没有需要执行的待办任务")
 
-    def save_cached_token(self):
+    def save_cached_token(self, update_last=False):
         if not self.token:
             return
-        save_cache_entry(self.ck, {
+        entry = {
             "accessToken": self.token,
             "refreshToken": self.refresh_token,
             "userId": self.user_id,
             "userInfo": self.user_info,
             "visitor": self.visitor,
-        })
+            "dailyDate": self.daily_date,
+            "dailyStart": self.daily_start,
+        }
+        if isinstance(self.last_balance, (int, float)):
+            entry["lastBalance"] = self.last_balance
+            entry["lastBalanceDate"] = self.last_balance_date
+        save_cache_entry(self.ck, entry)
 
     def remove_cached_token(self):
         drop_cache_entry(self.ck)
@@ -792,6 +1027,12 @@ class Task:
         self.user_id = data.get("userId") or data.get("uid") or user_info.get("userId") or user_info.get("uid") or ""
         self.user_info = user_info
         self.visitor = data.get("visitor") or self.visitor
+        self.daily_date = data.get("dailyDate") or self.daily_date
+        if isinstance(data.get("dailyStart"), (int, float)):
+            self.daily_start = int(data.get("dailyStart"))
+        if isinstance(data.get("lastBalance"), (int, float)):
+            self.last_balance = int(data.get("lastBalance"))
+            self.last_balance_date = data.get("lastBalanceDate") or self.last_balance_date
 
     def query_string(self, data=None):
         data = data or {}
@@ -1057,7 +1298,7 @@ class Task:
 # ==================== 主入口 ====================
 
 def main():
-    box_top("📱 iQOO社区 每日任务")
+    box_top(f"📱 iQOO社区 每日任务 {VERSION}")
     box_line("🕒 启动时间", now_text())
     box_line("🔢 账号数量", f"{len(SERVERS)} 个")
     box_line("💾 缓存", "token_caches/iqoo_token_cache.json")
@@ -1117,17 +1358,53 @@ def main():
             log(f"   📅 [签到] {res.get('signMsg') or '-'}")
             log(f"   🎰 [抽奖] {res.get('drawMsg') or '-'}")
             log(f"   💰 [积分] {fmt_points(res.get('before'))} → "
-                f"{fmt_points(res.get('after'))}（{int(res.get('delta') or 0):+d}）")
+                f"{fmt_points(res.get('after'))}（本次 {int(res.get('delta') or 0):+d}）")
+            if isinstance(res.get("todayEarned"), (int, float)):
+                log(f"   📥 [今日] 获得 +{int(res.get('todayEarned'))} / "
+                    f"消耗 {int(res.get('todaySpent') or 0)}"
+                    f"（{int(res.get('todayCount') or 0)} 笔，{res.get('scoreSource')}）")
+                for item in (res.get("scoreBreakdown") or [])[:8]:
+                    log(f"      · {item}")
+            if res.get("dailyDelta") is not None:
+                log(f"   📈 [今日] 净增 {int(res.get('dailyDelta')):+d}（起始 {res.get('dailyStart')}）")
         if not res.get("success"):
             log(f"   ⚠️ [失败] {res.get('error') or '未知原因'}")
 
     ok_count = sum(1 for r in results if r.get("success"))
     fail_count = len(results) - ok_count
     total_delta = sum(int(r.get("delta") or 0) for r in results if r.get("success"))
+    total_daily = sum(
+        int(r.get("dailyDelta"))
+        for r in results
+        if isinstance(r.get("dailyDelta"), (int, float))
+    )
+    has_daily = any(isinstance(r.get("dailyDelta"), (int, float)) for r in results)
+    total_earned = sum(
+        int(r.get("todayEarned"))
+        for r in results
+        if isinstance(r.get("todayEarned"), (int, float))
+    )
+    total_spent = sum(
+        int(r.get("todaySpent"))
+        for r in results
+        if isinstance(r.get("todaySpent"), (int, float))
+    )
+    total_count = sum(
+        int(r.get("todayCount"))
+        for r in results
+        if isinstance(r.get("todayCount"), (int, float))
+    )
 
     box_top("🏁 iQOO社区 执行汇总")
     box_line("📊 执行结果", f"成功 {ok_count} / 失败 {fail_count} / 共 {len(results)}")
-    box_line("💰 积分变化", f"+{total_delta}")
+    box_line("💰 本次变化", f"{total_delta:+d}")
+    if total_count:
+        box_line("📥 今日获得", f"+{total_earned} 酷币（{total_count} 笔）")
+        if total_spent:
+            box_line("📉 今日消耗", f"{total_spent} 酷币")
+        box_line("📈 今日净增", f"{total_daily:+d} 酷币")
+    elif has_daily:
+        box_line("📈 今日净增", f"{total_daily:+d} 酷币")
     box_bottom()
 
     content = build_notify(results)
